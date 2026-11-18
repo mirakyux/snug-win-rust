@@ -1,8 +1,9 @@
 //! 自动更新，移植自 C# 版 `SnugWin.Windows.Support.AppUpdateService`。
 //!
 //! 流程与 C# 一致：
-//! 1. `GET https://api.github.com/repos/nicocart/snug-win/releases/latest`，
-//!    解出 tag 与附件；API 不行就退到 releases/latest 的**重定向最终地址**里抠 tag；
+//! 1. `GET https://api.github.com/repos/{owner}/{name}/releases/latest`（仓库来自
+//!    [`ReleaseRepo`]），解出 tag 与附件；API 不行就退到 releases/latest 的
+//!    **重定向最终地址**里抠 tag；
 //! 2. 按当前包形态拼出资产名（`Snug-v{ver}-win-x64-{selfcontained|frameworkdependent}.zip`，
 //!    上游 C# 的 `SnugWin-v…` 布局只作参考：Rust 版是并行重写版，用自己的发行名），
 //!    顺带找 `checksums.txt`；
@@ -10,13 +11,19 @@
 //! 4. 解压到 staging 的 `payload/`，确认里面有 [`TARGET_EXE`]（`snug.exe`）；
 //! 5. 写一个 `apply-update.ps1`：等本进程退出 → 覆盖文件 → 重新拉起 → 删临时目录。
 //!
+//! **更新源可配置**：仓库坐标由编译期 `SNUG_RELEASES_REPO=owner/name` 决定
+//! （见 [`DEFAULT_RELEASES_REPO`]），API/网页/下载地址全部由 [`ReleaseRepo`] 拼；
+//! 没配置时 [`AppUpdateService::is_configured`] 为 `false`，`check_for_update()`
+//! 直接返回 [`UpdateError::NotConfigured`]，**一个请求都不发**。
+//!
 //! 网络、解压、文件系统都经 trait 注入，单测只跑纯逻辑（版本比较、资产匹配、
 //! 校验和、脚本转义、错误分支），**不会真的下载或替换任何文件**。
 //!
 //! 与 C# 的差别：
 //! - 解压用系统自带 `tar.exe`（Win10 1803+ 起是 bsdtar，认 zip），省掉一个 zip crate；
 //! - SHA-256 自己实现（见 [`sha256`]），不引入加密库，保证单 exe 零依赖；
-//! - 当前版本编译期取 `CARGO_PKG_VERSION`。
+//! - 当前版本编译期取 `CARGO_PKG_VERSION`；
+//! - 发布仓库不写死：C# 里 URL 是常量，这里全部由 `owner/name` 推导。
 //!
 //! 手动验证（真机）：
 //! 1. 把版本号改小后启动，应提示有新版本；
@@ -31,10 +38,12 @@ use snug_core::update::{
     UpdateReleaseInfo,
 };
 
-/// GitHub "latest release" API。
-pub const LATEST_API_URL: &str = "https://api.github.com/repos/nicocart/snug-win/releases/latest";
-/// 兜底用的网页地址（靠重定向拿 tag）。
-pub const LATEST_WEB_URL: &str = "https://github.com/nicocart/snug-win/releases/latest";
+/// 编译期配置的发布仓库（`owner/name`）。
+///
+/// 用法：`SNUG_RELEASES_REPO=owner/name cargo build --release`。
+/// 没配置时更新器不会去猜仓库，也不会发任何请求——[`UpdateError::NotConfigured`] 直接返回。
+/// 这样换首发仓库、或 fork 后自建发布，都只改环境变量，不用改源码。
+pub const DEFAULT_RELEASES_REPO: Option<&str> = option_env!("SNUG_RELEASES_REPO");
 /// 校验和文件名。
 pub const CHECKSUMS_ASSET: &str = "checksums.txt";
 /// 更新包里必须有的可执行文件。
@@ -65,6 +74,60 @@ pub const STAGING_PREFIX: &str = "SnugWin-Update";
 pub fn release_asset_name(tag_or_version: &str, kind: ReleasePackageKind) -> String {
     let version = normalize(tag_or_version);
     format!("{ASSET_PREFIX}{version}-win-x64-{}.zip", kind.suffix())
+}
+
+/// 发布仓库坐标（`owner/name`）。更新源里的所有地址都由它拼出来，模块内不再散落 URL。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRepo {
+    pub owner: String,
+    pub name: String,
+}
+
+impl ReleaseRepo {
+    /// 解析 `owner/name`；空串、缺斜杠、多斜杠、含非法字符都返回 `None`。
+    pub fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        let (owner, name) = spec.split_once('/')?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        let valid = |part: &str| {
+            part.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        };
+        if !valid(owner) || !valid(name) {
+            return None;
+        }
+        Some(Self { owner: owner.to_string(), name: name.to_string() })
+    }
+
+    /// 取编译期配置的仓库（[`DEFAULT_RELEASES_REPO`]）；没配置或格式不对都是 `None`。
+    pub fn from_default() -> Option<Self> {
+        Self::parse(DEFAULT_RELEASES_REPO?)
+    }
+
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    /// GitHub "latest release" API。
+    pub fn api_url(&self) -> String {
+        format!("https://api.github.com/repos/{}/releases/latest", self.slug())
+    }
+
+    /// 兜底用的网页地址（靠重定向拿 tag）。
+    pub fn web_url(&self) -> String {
+        format!("https://github.com/{}/releases/latest", self.slug())
+    }
+
+    /// 某个 tag 的发布页（API 没给 html_url 时兜底）。
+    pub fn tag_url(&self, tag: &str) -> String {
+        format!("https://github.com/{}/releases/tag/{tag}", self.slug())
+    }
+
+    /// 某个 tag 的下载目录；兜底时据此拼资产下载地址。
+    pub fn download_base(&self, tag: &str) -> String {
+        format!("https://github.com/{}/releases/download/{tag}", self.slug())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +349,8 @@ pub struct PreparedUpdate {
 /// 更新流程里的失败原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
+    /// 没配置发布仓库（编译期 `SNUG_RELEASES_REPO` 或显式传入）。此时**不发任何请求**。
+    NotConfigured,
     /// 网络或 HTTP 层失败。
     Network(String),
     /// API 与兜底都拿不到发布信息。
@@ -303,6 +368,9 @@ pub enum UpdateError {
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotConfigured => f.write_str(
+                "未配置更新源：请在编译期设置 SNUG_RELEASES_REPO=owner/name（例如 acme/snug-rs）。",
+            ),
             Self::Network(message) => write!(f, "网络请求失败：{message}"),
             Self::NoRelease => f.write_str("无法获取最新版本信息，请检查网络连接或稍后再试。"),
             Self::MissingPackage { asset } => {
@@ -334,11 +402,11 @@ pub fn tag_from_release_url(url: &str) -> Option<String> {
 }
 
 /// 兜底时拼出来的发布信息（不联网，方便单测）。
-pub fn fallback_release(url: &str) -> Option<UpdateReleaseInfo> {
-    let final_url = if url.trim().is_empty() { LATEST_WEB_URL } else { url };
-    let tag = tag_from_release_url(final_url)?;
+pub fn fallback_release(repo: &ReleaseRepo, url: &str) -> Option<UpdateReleaseInfo> {
+    let final_url = if url.trim().is_empty() { repo.web_url() } else { url.to_string() };
+    let tag = tag_from_release_url(&final_url)?;
     let version = normalize(&tag);
-    let base = format!("https://github.com/nicocart/snug-win/releases/download/{tag}");
+    let base = repo.download_base(&tag);
     let self_zip = release_asset_name(&tag, ReleasePackageKind::SelfContained);
     let fdd_zip = release_asset_name(&tag, ReleasePackageKind::FrameworkDependent);
     Some(UpdateReleaseInfo {
@@ -363,6 +431,7 @@ pub fn build_check_result(
     release: &UpdateReleaseInfo,
     current_version: &str,
     package_kind: ReleasePackageKind,
+    repo: &ReleaseRepo,
 ) -> UpdateCheckResult {
     let preferred = release_asset_name(&release.tag_name, package_kind);
     let package = release
@@ -374,11 +443,14 @@ pub fn build_check_result(
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(CHECKSUMS_ASSET));
 
+    // html_url 为空时按 tag 拼一个；tag 优先用原始 tag_name，缺了才退回 v{version}。
+    let tag = if release.tag_name.trim().is_empty() {
+        format!("v{}", release.normalized_version)
+    } else {
+        release.tag_name.clone()
+    };
     let release_url = if release.html_url.trim().is_empty() {
-        format!(
-            "https://github.com/nicocart/snug-win/releases/tag/v{}",
-            release.normalized_version
-        )
+        repo.tag_url(&tag)
     } else {
         release.html_url.clone()
     };
@@ -586,6 +658,8 @@ pub struct AppUpdateService<H: HttpClient, E: PackageExtractor = TarExtractor> {
     extractor: E,
     current_version: String,
     package_kind: ReleasePackageKind,
+    /// 发布仓库；`None` 表示没配置，检查更新会直接报 [`UpdateError::NotConfigured`]。
+    repo: Option<ReleaseRepo>,
     /// 当前程序所在目录（覆盖目标）。
     app_dir: PathBuf,
     /// 临时目录根。
@@ -593,13 +667,15 @@ pub struct AppUpdateService<H: HttpClient, E: PackageExtractor = TarExtractor> {
 }
 
 impl<H: HttpClient> AppUpdateService<H, TarExtractor> {
-    /// 生产用构造：版本取 [`APP_VERSION`]，包形态按 Rust 版当自包含。
+    /// 生产用构造：版本取 [`APP_VERSION`]，包形态按 Rust 版当自包含，
+    /// 仓库取编译期 `SNUG_RELEASES_REPO`（没配就是 `None`，更新功能明确不可用）。
     pub fn new(http: H, app_dir: impl Into<PathBuf>, temp_root: impl Into<PathBuf>) -> Self {
         Self {
             http,
             extractor: TarExtractor,
             current_version: APP_VERSION.to_string(),
             package_kind: ReleasePackageKind::SelfContained,
+            repo: ReleaseRepo::from_default(),
             app_dir: app_dir.into(),
             temp_root: temp_root.into(),
         }
@@ -612,6 +688,7 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
         extractor: E,
         current_version: impl Into<String>,
         package_kind: ReleasePackageKind,
+        repo: Option<ReleaseRepo>,
         app_dir: impl Into<PathBuf>,
         temp_root: impl Into<PathBuf>,
     ) -> Self {
@@ -620,6 +697,7 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
             extractor,
             current_version: current_version.into(),
             package_kind,
+            repo,
             app_dir: app_dir.into(),
             temp_root: temp_root.into(),
         }
@@ -629,10 +707,34 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
         &self.current_version
     }
 
+    /// 更新源是否可用（决定设置界面要不要显示“检查更新”）。
+    pub fn is_configured(&self) -> bool {
+        self.repo.is_some()
+    }
+
+    pub fn repo(&self) -> Option<&ReleaseRepo> {
+        self.repo.as_ref()
+    }
+
+    /// 运行期覆盖更新源（`owner/name`）；传 `None` 关掉更新功能。
+    pub fn set_repo_spec(&mut self, spec: Option<&str>) -> Result<(), UpdateError> {
+        self.repo = match spec {
+            Some(spec) => Some(ReleaseRepo::parse(spec).ok_or(UpdateError::NotConfigured)?),
+            None => None,
+        };
+        Ok(())
+    }
+
     /// 检查更新（C# `CheckForUpdateAsync`）。
+    ///
+    /// 没配置仓库时立刻返回 [`UpdateError::NotConfigured`]，**一个请求都不发**。
     pub fn check_for_update(&self) -> Result<UpdateCheckResult, UpdateError> {
+        let Some(repo) = self.repo.as_ref() else {
+            return Err(UpdateError::NotConfigured);
+        };
+
         let mut release = None;
-        match self.http.get(LATEST_API_URL) {
+        match self.http.get(&repo.api_url()) {
             Ok(response) if response.is_success() => {
                 release = parse_latest_release(&response.text());
             }
@@ -644,15 +746,12 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
         let release = match release {
             Some(release) => release,
             None => {
-                let response = self
-                    .http
-                    .get(LATEST_WEB_URL)
-                    .map_err(UpdateError::Network)?;
-                fallback_release(&response.final_url).ok_or(UpdateError::NoRelease)?
+                let response = self.http.get(&repo.web_url()).map_err(UpdateError::Network)?;
+                fallback_release(repo, &response.final_url).ok_or(UpdateError::NoRelease)?
             }
         };
 
-        Ok(build_check_result(&release, &self.current_version, self.package_kind))
+        Ok(build_check_result(&release, &self.current_version, self.package_kind, repo))
     }
 
     /// 下载、校验、解压（C# `DownloadAndPrepareAsync`）。
@@ -773,11 +872,52 @@ pub fn launch_apply_script(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
+    /// 测试用发布仓库：所有 URL 都由它拼，别在测试里再写死域名。
+    fn test_repo() -> ReleaseRepo {
+        ReleaseRepo::parse("acme/snug").expect("合法的 owner/name")
+    }
+
     // ----- 纯逻辑 -----
+
+    #[test]
+    fn release_repo_parses_and_builds_every_url() {
+        let repo = test_repo();
+        assert_eq!(repo.slug(), "acme/snug");
+        assert_eq!(
+            repo.api_url(),
+            "https://api.github.com/repos/acme/snug/releases/latest"
+        );
+        assert_eq!(repo.web_url(), "https://github.com/acme/snug/releases/latest");
+        assert_eq!(repo.tag_url("1.2.0"), "https://github.com/acme/snug/releases/tag/1.2.0");
+        assert_eq!(
+            repo.download_base("v1.2.0"),
+            "https://github.com/acme/snug/releases/download/v1.2.0"
+        );
+        // 前后空白可以容忍。
+        assert_eq!(ReleaseRepo::parse("  acme/snug  "), Some(repo));
+    }
+
+    #[test]
+    fn release_repo_rejects_malformed_specs() {
+        for spec in ["", "acme", "acme/", "/snug", "a/b/c", "ac me/snug", "acme/sn ug"] {
+            assert_eq!(ReleaseRepo::parse(spec), None, "不该接受 {spec:?}");
+        }
+    }
+
+    #[test]
+    fn default_repo_comes_from_the_build_time_env() {
+        // 测试构建通常没设 SNUG_RELEASES_REPO：生产构造必须如实报告“未配置”，
+        // 而不是偷偷用一个写死的仓库。
+        let service = AppUpdateService::new(FakeHttp::new(), ".", ".");
+        assert_eq!(
+            service.is_configured(),
+            DEFAULT_RELEASES_REPO.and_then(ReleaseRepo::parse).is_some()
+        );
+    }
 
     #[test]
     fn sha256_matches_known_vectors() {
@@ -827,7 +967,8 @@ mod tests {
 
     #[test]
     fn fallback_release_builds_three_assets() {
-        let release = fallback_release("https://github.com/nicocart/snug-win/releases/tag/v1.2.0")
+        let repo = test_repo();
+        let release = fallback_release(&repo, "https://github.com/acme/snug/releases/tag/v1.2.0")
             .expect("能拼出来");
         assert_eq!(release.tag_name, "v1.2.0");
         assert_eq!(release.normalized_version, "1.2.0");
@@ -835,13 +976,14 @@ mod tests {
         assert_eq!(release.assets[2].name, CHECKSUMS_ASSET);
         assert_eq!(
             release.assets[0].download_url,
-            "https://github.com/nicocart/snug-win/releases/download/v1.2.0/Snug-v1.2.0-win-x64-selfcontained.zip"
+            "https://github.com/acme/snug/releases/download/v1.2.0/Snug-v1.2.0-win-x64-selfcontained.zip"
         );
-        assert!(fallback_release("https://example.com/") .is_none());
+        assert!(fallback_release(&repo, "https://example.com/").is_none());
     }
 
     #[test]
     fn check_result_picks_assets_by_package_kind() {
+        let repo = test_repo();
         let release = UpdateReleaseInfo {
             tag_name: "v1.3.0".to_string(),
             normalized_version: "1.3.0".to_string(),
@@ -867,7 +1009,7 @@ mod tests {
         };
 
         let self_contained =
-            build_check_result(&release, "1.2.0", ReleasePackageKind::SelfContained);
+            build_check_result(&release, "1.2.0", ReleasePackageKind::SelfContained, &repo);
         assert!(self_contained.has_update);
         assert_eq!(self_contained.package_asset_name, "Snug-v1.3.0-win-x64-selfcontained.zip");
         assert_eq!(
@@ -878,14 +1020,14 @@ mod tests {
             self_contained.checksums_download_url.as_deref(),
             Some("https://example.invalid/checksums.txt")
         );
-        // html_url 为空时按 tag 拼一个。
+        // html_url 为空时用仓库 + tag 拼一个。
         assert_eq!(
             self_contained.release_url,
-            "https://github.com/nicocart/snug-win/releases/tag/v1.3.0"
+            "https://github.com/acme/snug/releases/tag/v1.3.0"
         );
 
         let framework =
-            build_check_result(&release, "1.3.0", ReleasePackageKind::FrameworkDependent);
+            build_check_result(&release, "1.3.0", ReleasePackageKind::FrameworkDependent, &repo);
         assert!(!framework.has_update, "同版本不算更新");
         assert_eq!(
             framework.package_download_url.as_deref(),
@@ -893,10 +1035,12 @@ mod tests {
         );
 
         // 缺资产时下载地址是 None。
-        let missing = build_check_result(&release, "1.0.0", ReleasePackageKind::SelfContained);
+        let missing =
+            build_check_result(&release, "1.0.0", ReleasePackageKind::SelfContained, &repo);
         assert!(missing.package_download_url.is_some());
         let no_assets = UpdateReleaseInfo { assets: Vec::new(), ..release };
-        let none = build_check_result(&no_assets, "1.0.0", ReleasePackageKind::SelfContained);
+        let none =
+            build_check_result(&no_assets, "1.0.0", ReleasePackageKind::SelfContained, &repo);
         assert_eq!(none.package_download_url, None);
     }
 
@@ -963,21 +1107,34 @@ mod tests {
         responses: HashMap<String, HttpResponse>,
         download_bytes: Vec<u8>,
         downloads: Mutex<Vec<(String, PathBuf)>>,
+        /// 记录每一次 `get`，用来断言“未配置时不发请求”。
+        gets: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeHttp {
         fn new() -> Self {
-            Self { responses: HashMap::new(), download_bytes: Vec::new(), downloads: Mutex::new(Vec::new()) }
+            Self {
+                responses: HashMap::new(),
+                download_bytes: Vec::new(),
+                downloads: Mutex::new(Vec::new()),
+                gets: Arc::new(Mutex::new(Vec::new())),
+            }
         }
 
         fn with(mut self, url: &str, response: HttpResponse) -> Self {
             self.responses.insert(url.to_string(), response);
             self
         }
+
+        /// 拿到请求记录句柄（可以在把 `self` 交给服务之后继续查）。
+        fn request_log(&self) -> Arc<Mutex<Vec<String>>> {
+            self.gets.clone()
+        }
     }
 
     impl HttpClient for FakeHttp {
         fn get(&self, url: &str) -> Result<HttpResponse, String> {
+            self.gets.lock().unwrap().push(url.to_string());
             self.responses
                 .get(url)
                 .cloned()
@@ -1025,29 +1182,35 @@ mod tests {
 
     fn release_json(tag: &str) -> String {
         format!(
-            r#"{{"tag_name":"{tag}","html_url":"https://github.com/nicocart/snug-win/releases/tag/{tag}","body":"notes","assets":[
+            r#"{{"tag_name":"{tag}","html_url":"https://github.com/acme/snug/releases/tag/{tag}","body":"notes","assets":[
               {{"name":"Snug-v{}-win-x64-selfcontained.zip","browser_download_url":"https://example.invalid/self.zip","size":10}},
               {{"name":"checksums.txt","browser_download_url":"https://example.invalid/checksums.txt","size":2}}]}}"#,
             tag.trim_start_matches('v')
         )
     }
 
-    fn service(http: FakeHttp, create_exe: bool) -> AppUpdateService<FakeHttp, FakeExtractor> {
+    fn service_with(http: FakeHttp, create_exe: bool, repo: Option<ReleaseRepo>) -> AppUpdateService<FakeHttp, FakeExtractor> {
         AppUpdateService::with_parts(
             http,
             FakeExtractor { create_exe },
             "1.2.0",
             ReleasePackageKind::SelfContained,
+            repo,
             temp_root(),
             temp_root(),
         )
     }
 
+    fn service(http: FakeHttp, create_exe: bool) -> AppUpdateService<FakeHttp, FakeExtractor> {
+        service_with(http, create_exe, Some(test_repo()))
+    }
+
     #[test]
     fn check_uses_the_api_first() {
+        let repo = test_repo();
         let http = FakeHttp::new().with(
-            LATEST_API_URL,
-            HttpResponse::new(200, release_json("v1.3.0"), LATEST_API_URL),
+            &repo.api_url(),
+            HttpResponse::new(200, release_json("v1.3.0"), repo.api_url()),
         );
         let check = service(http, true).check_for_update().expect("检查成功");
         assert!(check.has_update);
@@ -1062,13 +1225,10 @@ mod tests {
     #[test]
     fn check_falls_back_to_redirect_when_api_fails() {
         // API 没准备 → 网络错误 → 走网页兜底。
+        let repo = test_repo();
         let http = FakeHttp::new().with(
-            LATEST_WEB_URL,
-            HttpResponse::new(
-                200,
-                "",
-                "https://github.com/nicocart/snug-win/releases/tag/v1.4.0",
-            ),
+            &repo.web_url(),
+            HttpResponse::new(200, "", "https://github.com/acme/snug/releases/tag/v1.4.0"),
         );
         let check = service(http, true).check_for_update().expect("兜底成功");
         assert!(check.has_update);
@@ -1079,11 +1239,12 @@ mod tests {
 
     #[test]
     fn check_falls_back_when_api_returns_an_error_status() {
+        let repo = test_repo();
         let http = FakeHttp::new()
-            .with(LATEST_API_URL, HttpResponse::new(500, "boom", LATEST_API_URL))
+            .with(&repo.api_url(), HttpResponse::new(500, "boom", repo.api_url()))
             .with(
-                LATEST_WEB_URL,
-                HttpResponse::new(200, "", "https://github.com/nicocart/snug-win/releases/tag/v9.9.9"),
+                &repo.web_url(),
+                HttpResponse::new(200, "", "https://github.com/acme/snug/releases/tag/v9.9.9"),
             );
         let check = service(http, true).check_for_update().expect("兜底成功");
         assert_eq!(check.latest_version, "9.9.9");
@@ -1091,13 +1252,37 @@ mod tests {
 
     #[test]
     fn check_without_any_release_is_an_error() {
-        let http = FakeHttp::new().with(
-            LATEST_WEB_URL,
-            HttpResponse::new(200, "", "https://github.com/nicocart/snug-win"),
-        );
+        let repo = test_repo();
+        let http = FakeHttp::new()
+            .with(&repo.web_url(), HttpResponse::new(200, "", "https://github.com/acme/snug"));
         let error = service(http, true).check_for_update().expect_err("拿不到版本");
         assert_eq!(error, UpdateError::NoRelease);
         assert!(error.to_string().contains("无法获取最新版本信息"));
+    }
+
+    #[test]
+    fn unconfigured_update_source_sends_no_request() {
+        // 没配 SNUG_RELEASES_REPO 时不能去猜仓库、更不能真的发请求。
+        let http = FakeHttp::new();
+        let requests = http.request_log();
+        let service = service_with(http, true, None);
+        assert!(!service.is_configured());
+        let error = service.check_for_update().expect_err("未配置就该直接失败");
+        assert_eq!(error, UpdateError::NotConfigured);
+        assert!(error.to_string().contains("SNUG_RELEASES_REPO"));
+        let sent = requests.lock().unwrap();
+        assert!(sent.is_empty(), "不该发任何 HTTP 请求：{sent:?}");
+    }
+
+    #[test]
+    fn set_repo_spec_switches_the_source_or_refuses_malformed_input() {
+        let mut service = service(FakeHttp::new(), true);
+        assert!(service.is_configured());
+        service.set_repo_spec(Some("other-owner/snug-rs")).expect("合法坐标");
+        assert_eq!(service.repo().map(ReleaseRepo::slug), Some("other-owner/snug-rs".to_string()));
+        assert_eq!(service.set_repo_spec(Some("not-a-spec")), Err(UpdateError::NotConfigured));
+        service.set_repo_spec(None).expect("显式关掉");
+        assert!(!service.is_configured());
     }
 
     #[test]
