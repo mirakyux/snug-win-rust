@@ -960,6 +960,50 @@ pub fn is_own_process(pid: i32) -> bool {
     pid == std::process::id() as i32
 }
 
+/// 在本进程里找标题匹配的顶层可见窗口，返回它的句柄。
+///
+/// 应用层要用它找自己的窗口：eframe/winit 不对外暴露 `HWND`，而"把手机屏界面
+/// 搬到虚拟屏上"必须走 `SetWindowPos`（[`crate::placement::apply`]）。
+/// 只认本进程自己的窗口，不会碰别的程序。
+pub fn find_own_window(title: &str) -> Option<u64> {
+    struct Search {
+        pid: i32,
+        title: Vec<u16>,
+        handle: Option<u64>,
+    }
+
+    unsafe extern "system" fn find(window: HWND, data: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(data.0 as *mut Search) };
+        if !unsafe { IsWindowVisible(window) }.as_bool() {
+            return BOOL(1);
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        if pid as i32 != search.pid {
+            return BOOL(1);
+        }
+        let mut buffer = [0u16; 256];
+        let len = unsafe { GetWindowTextW(window, &mut buffer) };
+        if len <= 0 {
+            return BOOL(1);
+        }
+        if buffer[..len as usize] == search.title[..] {
+            search.handle = Some(window.0 as usize as u64);
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search {
+        pid: std::process::id() as i32,
+        title: title.encode_utf16().collect(),
+        handle: None,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(find), LPARAM(&mut search as *mut Search as isize));
+    }
+    search.handle
+}
+
 // ---------------------------------------------------------------------------
 // 单测（只测纯逻辑与假实现，绝不真的动窗口）
 // ---------------------------------------------------------------------------
