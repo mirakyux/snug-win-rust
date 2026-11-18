@@ -294,7 +294,9 @@ pub fn pick_new_monitor(
 
 /// 建屏时下发给驱动的模式表（每个档位 60Hz，物理像素）。
 pub fn build_modes(fit: &ScreenFit) -> Vec<VddMode> {
-    fit.widths()
+    // C# v1.3.0 `BuildModes`：按 `RegistrationOrder`（从宽到窄）注册，
+    // 让 Windows / 驱动先把高分辨率、横屏档位挂上来（见 C# 注释）。
+    fit.registration_order()
         .iter()
         .map(|&width| {
             let (pixel_width, pixel_height) = fit.pixel_size(width);
@@ -1867,15 +1869,23 @@ mod tests {
     }
 
     #[test]
-    fn build_modes_uses_double_pixels_and_60hz() {
+    fn build_modes_registers_widest_first_with_double_pixels_and_60hz() {
         let fit = ScreenFit::standard();
         let modes = build_modes(&fit);
-        assert_eq!(modes.len(), fit.widths().len());
-        assert_eq!(modes[0].width, 1080);
-        assert_eq!(modes[0].height, 1900);
+        // C# v1.3.0：注册顺序 = `RegistrationOrder`（widths 反向，从宽到窄）。
+        assert_eq!(modes.len(), fit.registration_order().len());
+        assert_eq!((modes[0].width, modes[0].height), (2160, 3800), "最宽的档位要先注册");
         assert_eq!(modes[0].refresh_rates, vec![60]);
+        assert_eq!(modes.len(), fit.widths().len());
         let last = modes.last().unwrap();
-        assert_eq!((last.width, last.height), (2160, 3800));
+        assert_eq!((last.width, last.height), (1080, 1900), "最窄的档位最后注册");
+        // 每个档位都是逻辑宽 ×2、60Hz。
+        for (index, width) in fit.registration_order().iter().enumerate() {
+            let (pixel_width, pixel_height) = fit.pixel_size(*width);
+            assert_eq!(modes[index].width, pixel_width as u32);
+            assert_eq!(modes[index].height, pixel_height as u32);
+            assert_eq!(modes[index].refresh_rates, vec![60]);
+        }
     }
 
     // ----- 假实现的整条流程 -----
