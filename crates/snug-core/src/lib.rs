@@ -25,7 +25,7 @@ pub mod windows;
 pub mod zoom;
 
 pub use apps::{AppAction, AppSearchResult, LetterGroup};
-pub use config::AppConfig;
+pub use config::{AppConfig, AppThemeMode, ScreenConfig};
 pub use geometry::{Point, Rect, Size};
 pub use left_behind::{LeftBehindBook, LeftBehindEntry};
 pub use paths::Paths;
