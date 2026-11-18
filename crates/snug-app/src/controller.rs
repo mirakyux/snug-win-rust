@@ -344,18 +344,39 @@ impl Controller {
         config.primary_touch_screen().map(|screen| screen.id)
     }
 
-    /// 当前要展示的那块屏的状态快照。
-    pub fn state(&self) -> DeskState {
+    /// 所有已启用触控屏的 `(id, 名字)`，按配置顺序（多屏切换用）。
+    pub fn touch_screens(&self) -> Vec<(String, String)> {
+        let Ok(config) = self.config.lock() else {
+            return Vec::new();
+        };
+        config
+            .effective_screens()
+            .into_iter()
+            .filter(|screen| screen.enabled && screen.device.kind.is_touch())
+            .map(|screen| (screen.id, screen.name))
+            .collect()
+    }
+
+    /// 指定屏的状态快照；`None` 表示"主触控屏"。
+    pub fn state_of(&self, screen_id: Option<&str>) -> DeskState {
         let Ok(desks) = self.desks.lock() else {
             return DeskState::default();
         };
-        let screen_id = self.primary_screen_id();
-        if let Some(id) = &screen_id
+        let id = match screen_id {
+            Some(id) => Some(id.to_string()),
+            None => self.primary_screen_id(),
+        };
+        if let Some(id) = &id
             && let Some(state) = desks.state_of(id)
         {
             return state;
         }
-        desks.desk_for_screen(None).map(|desk| desk.state()).unwrap_or_default()
+        desks.desk_for_screen(screen_id).map(|desk| desk.state()).unwrap_or_default()
+    }
+
+    /// 当前要展示的那块屏的状态快照（主触控屏）。
+    pub fn state(&self) -> DeskState {
+        self.state_of(None)
     }
 
     /// 屏列表变了（设置里增删改屏，对应 C# `_desks.SetWishes(ScreenPlan.Wishes(...))`）。
@@ -440,8 +461,8 @@ impl Controller {
 
     /// 手机屏的屏幕矩形（物理像素）。界面窗口要搬到这块屏上，对应 C#
     /// `PhoneHomeWindow` 跟着 `_displays.BoundsOf(id)` 走。
-    pub fn phone_bounds(&self) -> Option<Rect> {
-        let id = self.state().display_id?;
+    pub fn phone_bounds_of(&self, screen_id: Option<&str>) -> Option<Rect> {
+        let id = self.state_of(screen_id).display_id?;
         self.displays.bounds_of(id)
     }
 
@@ -452,23 +473,28 @@ impl Controller {
 
     /// 手机屏底部指示条的区域（物理像素）。有窗口铺在屏上时，我们的界面窗口
     /// 要缩成这一条，对应 C# 的 `HomeBarWindow`（它是独立置顶窗口）。
-    pub fn home_bar_area(&self) -> Option<Rect> {
-        let id = self.state().display_id?;
+    pub fn home_bar_area_of(&self, screen_id: Option<&str>) -> Option<Rect> {
+        let id = self.state_of(screen_id).display_id?;
         self.displays.home_bar_area_of(id)
+    }
+
+    /// 把 `Option<&str>` 屏 id 解析成具体 id（`None` = 主触控屏）。
+    fn resolve_screen(&self, screen_id: Option<&str>) -> Option<String> {
+        screen_id.map(str::to_string).or_else(|| self.primary_screen_id())
     }
 
     /// 回到资源库（C# `ShowList`）：界面切回列表，但铺着的窗口**仍留在手机屏上**
     /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
-    pub fn show_list(&self) {
+    pub fn show_list_of(&self, screen_id: Option<&str>) {
         if let Ok(desks) = self.desks.lock() {
-            desks.show_list(None);
+            desks.show_list(screen_id);
         }
     }
 
     /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
-    pub fn return_to_placed(&self) {
+    pub fn return_to_placed_of(&self, screen_id: Option<&str>) {
         if let Ok(desks) = self.desks.lock() {
-            desks.return_to_placed(None);
+            desks.return_to_placed(screen_id);
         }
     }
 
@@ -487,8 +513,8 @@ impl Controller {
     }
 
     /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
-    pub fn pull(&self, window: WindowInfo) {
-        let Some(screen_id) = self.primary_screen_id() else {
+    pub fn pull(&self, screen_id: Option<&str>, window: WindowInfo) {
+        let Some(screen_id) = self.resolve_screen(screen_id) else {
             crate::warn!("资源库：当前没有屏幕，忽略铺窗");
             return;
         };
@@ -498,8 +524,8 @@ impl Controller {
     }
 
     /// 启动一个 App（资源库里点没在跑的 App）。
-    pub fn open(&self, app: AppInfo) {
-        let Some(screen_id) = self.primary_screen_id() else {
+    pub fn open(&self, screen_id: Option<&str>, app: AppInfo) {
+        let Some(screen_id) = self.resolve_screen(screen_id) else {
             return;
         };
         if let Ok(desks) = self.desks.lock() {
@@ -508,8 +534,8 @@ impl Controller {
     }
 
     /// 给一个已经在跑的 App 再开一个窗口（资源库行右侧的「+」）。
-    pub fn new_window(&self, app: snug_core::windows::RunningApp) {
-        let Some(screen_id) = self.primary_screen_id() else {
+    pub fn new_window(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
+        let Some(screen_id) = self.resolve_screen(screen_id) else {
             return;
         };
         if let Ok(desks) = self.desks.lock() {
@@ -518,8 +544,8 @@ impl Controller {
     }
 
     /// 关掉这个 App 的全部窗口（资源库行右侧的「×」）。
-    pub fn quit(&self, app: snug_core::windows::RunningApp) {
-        let Some(screen_id) = self.primary_screen_id() else {
+    pub fn quit(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
+        let Some(screen_id) = self.resolve_screen(screen_id) else {
             return;
         };
         if let Ok(desks) = self.desks.lock() {
@@ -528,8 +554,8 @@ impl Controller {
     }
 
     /// 关掉某一个窗口（展开的窗口行右侧的「×」）。
-    pub fn close_window(&self, window: WindowInfo) {
-        let Some(screen_id) = self.primary_screen_id() else {
+    pub fn close_window(&self, screen_id: Option<&str>, window: WindowInfo) {
+        let Some(screen_id) = self.resolve_screen(screen_id) else {
             return;
         };
         if let Ok(desks) = self.desks.lock() {

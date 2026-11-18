@@ -74,6 +74,12 @@ pub struct PhoneHomeApp {
     pub dark: bool,
     /// 界面里手写颜色用的调色板（随主题切换）。
     pub palette: crate::theme::Palette,
+    /// 当前界面正在显示哪块屏（`None` = 主触控屏）。
+    ///
+    /// 多屏时界面顶部有切换：一块屏一个 desk，状态/铺窗/指示条都跟着这块屏走。
+    /// **与 C# 的差别**：C# 是"一块屏一个 `PhoneHomeWindow`"，我们只有一块窗口，
+    /// 所以同一时刻只画一块屏。理由见 `docs/multi-screen.md`。
+    pub active_screen: Option<String>,
 }
 
 /// 桌面预览的运行态。
@@ -148,7 +154,13 @@ impl PhoneHomeApp {
             // 真正的应用发生在 `update()` 第一帧（那里才拿得到 `Context`）。
             dark: false,
             palette: crate::theme::Palette::DARK,
+            active_screen: None,
         }
+    }
+
+    /// 当前显示的这块屏的状态（`active_screen` 为空时是主触控屏）。
+    fn state(&self) -> snug_core::desk::DeskState {
+        self.controller.state_of(self.active_screen.as_deref())
     }
 
     /// 后台查一次新版（C# `OnCheckUpdate`：`await _updates.CheckAsync()` 之后刷界面）。
@@ -411,7 +423,7 @@ impl PhoneHomeApp {
     /// 没有手机屏时整个程序只剩托盘图标。这条是"Rust 版看起来像不像原版"的关键，
     /// 所以失败时只记 warn，不阻塞界面。
     fn sync_window(&mut self, ctx: &egui::Context) {
-        let state = self.controller.state();
+        let state = self.state();
         let ready = state.screen_phase == PhoneScreenPhase::Ready;
         // 有窗口铺在手机屏上时，我们只留底部那条指示条（C# 里 `PhoneHomeWindow` 隐、
         // `HomeBarWindow` 显）；没有窗口铺着时，整块手机屏都是资源库。
@@ -434,9 +446,9 @@ impl PhoneHomeApp {
         let preview_rect = if ready { None } else { self.preview_rect(ctx) };
         let bounds = if ready {
             if showing_bar {
-                self.controller.home_bar_area()
+                self.controller.home_bar_area_of(self.active_screen.as_deref())
             } else {
-                self.controller.phone_bounds()
+                self.controller.phone_bounds_of(self.active_screen.as_deref())
             }
         } else {
             preview_rect
@@ -546,10 +558,10 @@ impl PhoneHomeApp {
     ///
     /// C# 里手机屏已经就绪时不去开预览窗，而是把资源库列表翻出来——这里保持一致。
     fn open_preview(&mut self, ctx: &egui::Context) {
-        let state = self.controller.state();
+        let state = self.state();
         if state.screen_phase == PhoneScreenPhase::Ready {
             crate::info!("预览：手机屏已就绪，改为回到资源库列表");
-            self.controller.show_list();
+            self.controller.show_list_of(self.active_screen.as_deref());
             return;
         }
         if self.preview.is_some() {
@@ -585,7 +597,7 @@ impl PhoneHomeApp {
 
     /// 把界面读到的运行态喂给设置窗（对应 C# 每次打开设置窗时的 `Refresh`）。
     fn refresh_settings_status(&mut self) {
-        let state = self.controller.state();
+        let state = self.state();
         let status = StatusInfo {
             pipe_available: self.pipe_ready,
             elevated: self.elevated,
@@ -694,7 +706,7 @@ impl PhoneHomeApp {
     /// 这一条要**一直盖在被铺开的窗口上面**，否则用户没法回到资源库；所以它由我们
     /// 自己的置顶窗口承担（`PlacementRequest` 默认 `topmost`）。
     fn draw_home_bar(&mut self, ctx: &egui::Context) {
-        let placed = self.controller.state().placed.map(|placed| placed.window);
+        let placed = self.state().placed.map(|placed| placed.window);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -705,7 +717,7 @@ impl PhoneHomeApp {
                 ui.horizontal_centered(|ui| {
                     if ui.button("‹ 资源库").clicked() {
                         crate::info!("指示条：回到资源库");
-                        self.controller.show_list();
+                        self.controller.show_list_of(self.active_screen.as_deref());
                     }
                     if let Some(window) = &placed {
                         ui.label(egui::RichText::new(window.label()).small().weak());
@@ -783,7 +795,7 @@ impl eframe::App for PhoneHomeApp {
         for event in self.controller.take_selection_events() {
             match event {
                 TouchEvent::SelectionCompleted(at) => {
-                    let state = self.controller.state();
+                    let state = self.state();
                     if self.config.copy_after_selection
                         && !state.list_visible
                         && state.screen_phase == PhoneScreenPhase::Ready
@@ -834,13 +846,17 @@ impl eframe::App for PhoneHomeApp {
                 }
             }
         }
-        if let Some(tray) = &mut self.tray {
-            let state = self.controller.state();
+        {
+            let state = self.state();
             let summary = Self::phase_text(state.screen_phase).to_string();
             let connected = state.screen_phase == PhoneScreenPhase::Ready;
-            tray.set_status(&summary, connected);
-            tray.set_manual_override(self.controller.manual_override());
-            tray.set_reenter_available(self.controller.can_reenter());
+            let manual = self.controller.manual_override();
+            let reenter = self.controller.can_reenter();
+            if let Some(tray) = &mut self.tray {
+                tray.set_status(&summary, connected);
+                tray.set_manual_override(manual);
+                tray.set_reenter_available(reenter);
+            }
         }
         // 托盘事件来自另一个消息窗口，egui 没有输入就不会重绘；靠这个定时器
         // 让 `poll` 有节奏地跑起来（200ms 足够，不是每帧空转）。
@@ -909,7 +925,7 @@ impl eframe::App for PhoneHomeApp {
         // 有窗口铺在手机屏上时，界面只剩底部指示条（C#：PhoneHomeWindow 隐、HomeBarWindow 显）。
         // 和 `sync_window` 同一个条件：点了「‹ 资源库」之后 `list_visible=true`，即使窗口
         // 还铺在手机屏上，也必须回到资源库列表。
-        let bar_state = self.controller.state();
+        let bar_state = self.state();
         if bar_state.placed.is_some() && !bar_state.list_visible && !self.settings.is_open() {
             self.draw_home_bar(ctx);
             self.shots.poll();
@@ -938,7 +954,7 @@ impl eframe::App for PhoneHomeApp {
                             .strong()
                             .color(self.palette.text),
                     );
-                    let header_state = self.controller.state();
+                    let header_state = self.state();
                     if let Some(placed) = &header_state.placed {
                         let label = format!("· {}", placed.window.label());
                         if ui
@@ -1032,11 +1048,33 @@ impl eframe::App for PhoneHomeApp {
                         self.tab = HomeTab::All;
                     }
                 });
+
+                // 多屏：一块屏一个 desk，这里选当前显示哪块（C# 是一块屏一个窗口）。
+                let screens = self.controller.touch_screens();
+                if screens.len() > 1 {
+                    ui.add_space(6.0);
+                    let current = self
+                        .active_screen
+                        .clone()
+                        .or_else(|| screens.first().map(|(id, _)| id.clone()));
+                    ui.horizontal_wrapped(|ui| {
+                        for (id, name) in &screens {
+                            let selected = current.as_deref() == Some(id.as_str());
+                            if ui.selectable_label(selected, name).clicked() {
+                                self.active_screen = Some(id.clone());
+                                // 换了屏要重新摆窗口。
+                                self.last_phone_rect = None;
+                                self.last_offscreen = None;
+                                ctx.request_repaint();
+                            }
+                        }
+                    });
+                }
             });
 
         if back_to_placed {
             crate::info!("资源库：回到手机屏上的窗口");
-            self.controller.return_to_placed();
+            self.controller.return_to_placed_of(self.active_screen.as_deref());
         }
         if close_preview {
             self.close_preview(ctx);
@@ -1239,23 +1277,23 @@ impl eframe::App for PhoneHomeApp {
         }
         if let Some(window) = pull_window {
             crate::info!("资源库：铺开 {}", window.label());
-            self.controller.pull(window);
+            self.controller.pull(self.active_screen.as_deref(), window);
         }
         if let Some(app) = open_app {
             crate::info!("资源库：启动 {}", app.name);
-            self.controller.open(app);
+            self.controller.open(self.active_screen.as_deref(), app);
         }
         if let Some(app) = new_window {
             crate::info!("资源库：给 {} 新开窗口", app.app.name);
-            self.controller.new_window(app);
+            self.controller.new_window(self.active_screen.as_deref(), app);
         }
         if let Some(app) = quit_app {
             crate::info!("资源库：关闭 {} 的全部窗口", app.app.name);
-            self.controller.quit(app);
+            self.controller.quit(self.active_screen.as_deref(), app);
         }
         if let Some(window) = close_window {
             crate::info!("资源库：关闭窗口 {}", window.label());
-            self.controller.close_window(window);
+            self.controller.close_window(self.active_screen.as_deref(), window);
         }
     }
 }
