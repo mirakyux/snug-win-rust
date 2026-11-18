@@ -9,6 +9,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,9 @@ pub enum VddError {
     },
     #[error("管道读写失败：{0}")]
     Io(#[from] std::io::Error),
+    /// 内部不变量被破坏（公开方法都会先 `ensure()`，正常路径不会出现）。
+    #[error("管道尚未连接")]
+    NotConnected,
 }
 
 /// 协议探测结果。
@@ -156,13 +160,104 @@ pub enum VddProtocol {
 
 struct Connection {
     protocol: VddProtocol,
-    file: std::fs::File,
+    pipe: Box<dyn PipeHandle>,
 }
 
-/// 管道客户端：内部只保留一条连接，探测到协议后不再反复尝试。
+/// 连接存活探测结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Alive,
+    /// 对端已经走了（`ERROR_BROKEN_PIPE` / `ERROR_PIPE_NOT_CONNECTED`）。
+    Dead,
+    /// 探测不了（例如 v0.3.x 的只写句柄不允许 `PeekNamedPipe`），按"还活着"处理，
+    /// 真正断了会由写失败兜住。
+    Unknown,
+}
+
+/// 一条管道句柄。真机是 [`PipeFile`]，单测换成假实现。
+trait PipeHandle: Read + Write + Send {
+    fn probe(&mut self) -> Liveness;
+}
+
+struct PipeFile(std::fs::File);
+
+impl Read for PipeFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for PipeFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl PipeHandle for PipeFile {
+    fn probe(&mut self) -> Liveness {
+        peek_liveness(self.0.as_raw_handle())
+    }
+}
+
+/// `PeekNamedPipe` 探测对端是否还在。驱动重启（`pnputil /restart-device`）之后，
+/// 旧实例会立刻返回 `ERROR_BROKEN_PIPE`，缓存句柄就不能再用了。
+///
+/// 这里用一行 `extern` 声明，而不是 `windows` crate 的 `Win32_System_Pipes` feature：
+/// 只为一个函数开一个 feature 不划算（Cargo.toml 由 Chief 统一改，能不惊动就不惊动）。
+fn peek_liveness(handle: RawHandle) -> Liveness {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_BROKEN_PIPE: i32 = 109;
+    const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
+
+    unsafe extern "system" {
+        fn PeekNamedPipe(
+            h_named_pipe: *mut core::ffi::c_void,
+            lp_buffer: *mut core::ffi::c_void,
+            n_buffer_size: u32,
+            lp_bytes_read: *mut u32,
+            lp_total_bytes_avail: *mut u32,
+            lp_bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle as *mut core::ffi::c_void,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        return Liveness::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(ERROR_ACCESS_DENIED) => Liveness::Unknown,
+        Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => Liveness::Dead,
+        // 其它错误（无效句柄之类）也当断了，让下一次操作重新连。
+        _ => Liveness::Dead,
+    }
+}
+
+type Connector = Box<dyn Fn(&str) -> Result<Connection, VddError> + Send + Sync>;
+
+/// 管道客户端。
+///
+/// **重连触发条件**（与 C# `EnsureProtocolAsync` 对齐，修的是 Rust 特有的"缓存句柄永不重置"）：
+/// 1. 每次操作前 `PeekNamedPipe` 探测到断线（`ERROR_BROKEN_PIPE` / `ERROR_PIPE_NOT_CONNECTED`）；
+/// 2. 任何一次写失败（写失败即丢弃连接）；
+/// 3. v0.3.x 的 legacy 通道在写失败后还会**立刻**重连并重写一次（C# `SendLegacyOneShotAsync`）。
+/// 丢弃之后下一次操作会重新 `CreateFile` 并重新探测协议，调用方感知不到多了一步。
 pub struct VddClient {
     name: String,
     connection: Option<Connection>,
+    connector: Connector,
 }
 
 impl Default for VddClient {
@@ -173,7 +268,13 @@ impl Default for VddClient {
 
 impl VddClient {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), connection: None }
+        Self { name: name.into(), connection: None, connector: Box::new(connect) }
+    }
+
+    /// 单测入口：换掉真正去 `CreateFile` 的连接器。
+    #[cfg(test)]
+    fn with_connector(name: &str, connector: Connector) -> Self {
+        Self { name: name.to_string(), connection: None, connector }
     }
 
     pub fn protocol(&self) -> Option<VddProtocol> {
@@ -188,7 +289,7 @@ impl VddClient {
     pub fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&serialize_notify(monitors)),
-            VddProtocol::Legacy => self.write_raw(&serialize_legacy_add(monitors)),
+            VddProtocol::Legacy => self.write_legacy_retry(&serialize_legacy_add(monitors)),
         }
     }
 
@@ -201,9 +302,9 @@ impl VddClient {
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&serialize_notify(add_monitors)),
             VddProtocol::Legacy => {
-                self.write_raw(&serialize_remove(remove_ids))?;
+                self.write_legacy_retry(&serialize_remove(remove_ids))?;
                 std::thread::sleep(Duration::from_millis(120));
-                self.write_raw(&serialize_legacy_add(add_monitors))
+                self.write_legacy_retry(&serialize_legacy_add(add_monitors))
             }
         }
     }
@@ -212,7 +313,7 @@ impl VddClient {
         let json = serialize_remove(ids);
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&json),
-            VddProtocol::Legacy => self.write_raw(&json),
+            VddProtocol::Legacy => self.write_legacy_retry(&json),
         }
     }
 
@@ -220,7 +321,7 @@ impl VddClient {
         let json = serialize_remove_all();
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&json),
-            VddProtocol::Legacy => self.write_raw(&json),
+            VddProtocol::Legacy => self.write_legacy_retry(&json),
         }
     }
 
@@ -230,11 +331,21 @@ impl VddClient {
             VddProtocol::Legacy => Ok(None),
             VddProtocol::V2 => {
                 self.write_framed(&serialize_state_request())?;
-                let Some(connection) = self.connection.as_mut() else {
-                    return Ok(None);
-                };
                 let mut buf = [0u8; 64 * 1024];
-                let read = connection.file.read(&mut buf)?;
+                let read_result = {
+                    let Some(connection) = self.connection.as_mut() else {
+                        return Ok(None);
+                    };
+                    connection.pipe.read(&mut buf)
+                };
+                let read = match read_result {
+                    Ok(read) => read,
+                    Err(error) => {
+                        // 读失败同样说明连接死了，丢掉，下次重连。
+                        self.connection = None;
+                        return Err(VddError::Io(error));
+                    }
+                };
                 if read == 0 {
                     return Ok(None);
                 }
@@ -245,31 +356,59 @@ impl VddClient {
         }
     }
 
+    /// 确认连接可用；不能用（探测到断线）就丢弃，重新 `CreateFile` 并重新探测协议。
     fn ensure(&mut self) -> Result<VddProtocol, VddError> {
-        if let Some(connection) = &self.connection {
-            return Ok(connection.protocol);
+        if let Some(connection) = self.connection.as_mut() {
+            if connection.pipe.probe() != Liveness::Dead {
+                return Ok(connection.protocol);
+            }
+            // 驱动重启后旧管道实例没了：这里丢弃缓存句柄，下面重连。
+            self.connection = None;
         }
-        let connection = connect(&self.name)?;
+        let connection = (self.connector)(&self.name)?;
         let protocol = connection.protocol;
         self.connection = Some(connection);
         Ok(protocol)
     }
 
     fn write_framed(&mut self, json: &str) -> Result<(), VddError> {
-        let bytes = frame(json);
-        if let Some(connection) = self.connection.as_mut() {
-            connection.file.write_all(&bytes)?;
-            connection.file.flush()?;
-        }
-        Ok(())
+        self.write_bytes(&frame(json))
     }
 
     fn write_raw(&mut self, json: &str) -> Result<(), VddError> {
-        if let Some(connection) = self.connection.as_mut() {
-            connection.file.write_all(json.as_bytes())?;
-            connection.file.flush()?;
+        self.write_bytes(json.as_bytes())
+    }
+
+    /// 写一段字节；写失败就把连接丢掉（下次 `ensure()` 重新连）。
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), VddError> {
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(VddError::NotConnected);
+        };
+        let result = connection.pipe.write_all(bytes).and_then(|()| connection.pipe.flush());
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.connection = None;
+                Err(VddError::Io(error))
+            }
         }
-        Ok(())
+    }
+
+    /// legacy 通道：写失败 → 丢弃 → 重连 → 重写一次（C# `SendLegacyOneShotAsync`）。
+    ///
+    /// 重连会重新探测协议；真机上仍是 v0.3.x，所以还是 raw 写。若断线期间驱动换成了
+    /// v2 实现，则改按 EOT 帧写，避免把裸 JSON 塞进双向协议。
+    fn write_legacy_retry(&mut self, json: &str) -> Result<(), VddError> {
+        match self.write_raw(json) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.connection = None;
+                match self.ensure()? {
+                    VddProtocol::Legacy => self.write_raw(json),
+                    VddProtocol::V2 => self.write_framed(json),
+                }
+            }
+        }
     }
 }
 
@@ -281,12 +420,20 @@ fn connect(name: &str) -> Result<Connection, VddError> {
 
     loop {
         match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => return Ok(Connection { protocol: VddProtocol::V2, file }),
+            Ok(file) => {
+                return Ok(Connection {
+                    protocol: VddProtocol::V2,
+                    pipe: Box::new(PipeFile(file)),
+                });
+            }
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
                     // 驱动只开 INBOUND 时，双向打开会被拒；退回只写。
                     if let Ok(file) = OpenOptions::new().write(true).open(&path) {
-                        return Ok(Connection { protocol: VddProtocol::Legacy, file });
+                        return Ok(Connection {
+                            protocol: VddProtocol::Legacy,
+                            pipe: Box::new(PipeFile(file)),
+                        });
                     }
                     first_error.get_or_insert(err);
                 } else if first_error.is_none() {
@@ -308,6 +455,8 @@ fn connect(name: &str) -> Result<Connection, VddError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn monitor() -> VddMonitor {
@@ -383,5 +532,121 @@ mod tests {
     fn pipe_availability_is_false_without_driver() {
         // 真机上没装驱动时必须安全返回 false，不能 panic。
         assert!(!is_driver_pipe_available("snug-rs-test-pipe-that-does-not-exist"));
+    }
+
+    // ----- 连接缓存与重连（假管道，绝不碰真驱动） -----
+
+    #[derive(Debug, Default)]
+    struct FakeWorld {
+        protocol: Option<VddProtocol>,
+        /// 对端是否还在；`false` 模拟驱动重启后旧管道实例消失。
+        alive: bool,
+        connects: usize,
+        writes: Vec<Vec<u8>>,
+        /// 接下来多少次写要失败（模拟 `ERROR_BROKEN_PIPE`）。
+        fail_writes: usize,
+    }
+
+    struct FakePipe(Arc<Mutex<FakeWorld>>);
+
+    impl Read for FakePipe {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for FakePipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut world = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            if world.fail_writes > 0 {
+                world.fail_writes -= 1;
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "假管道断线"));
+            }
+            world.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PipeHandle for FakePipe {
+        fn probe(&mut self) -> Liveness {
+            if self.0.lock().unwrap_or_else(|error| error.into_inner()).alive {
+                Liveness::Alive
+            } else {
+                Liveness::Dead
+            }
+        }
+    }
+
+    fn fake_world(protocol: VddProtocol) -> Arc<Mutex<FakeWorld>> {
+        Arc::new(Mutex::new(FakeWorld { protocol: Some(protocol), alive: true, ..Default::default() }))
+    }
+
+    fn fake_client(world: &Arc<Mutex<FakeWorld>>) -> VddClient {
+        let shared = world.clone();
+        VddClient::with_connector(
+            "snug-rs-test-pipe",
+            Box::new(move |_name| {
+                let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+                state.connects += 1;
+                let protocol = state.protocol.unwrap_or(VddProtocol::V2);
+                Ok(Connection { protocol, pipe: Box::new(FakePipe(shared.clone())) })
+            }),
+        )
+    }
+
+    #[test]
+    fn write_failure_drops_the_connection_and_the_next_call_reconnects() {
+        // Rust 特有 bug 的回归：旧实现只 `is_some()`，写失败也不重置，
+        // 同进程内重试永远复用死连接。
+        let world = fake_world(VddProtocol::V2);
+        let mut client = fake_client(&world);
+        client.notify(&[monitor()]).expect("第一次写成功");
+        assert_eq!(world.lock().unwrap().connects, 1);
+
+        world.lock().unwrap().fail_writes = 1;
+        assert!(client.notify(&[monitor()]).is_err(), "v2 写失败把错误交给调用方");
+        assert_eq!(world.lock().unwrap().connects, 1, "v2 不立刻重写（C# 同）");
+        assert!(client.protocol().is_none(), "写失败后必须丢掉缓存连接");
+
+        client.notify(&[monitor()]).expect("下一次调用应重新连接并成功");
+        assert_eq!(world.lock().unwrap().connects, 2);
+        assert_eq!(world.lock().unwrap().writes.len(), 2);
+    }
+
+    #[test]
+    fn legacy_write_failure_reconnects_and_rewrites_once() {
+        // C# `SendLegacyOneShotAsync`：断线 → Dispose → 重连 → 重写一次。
+        let world = fake_world(VddProtocol::Legacy);
+        let mut client = fake_client(&world);
+        world.lock().unwrap().fail_writes = 1;
+
+        client.notify(&[monitor()]).expect("legacy 要断线→重连→重写一次");
+        let state = world.lock().unwrap();
+        assert_eq!(state.connects, 2, "写失败必须重连");
+        assert_eq!(state.writes.len(), 1, "重试成功只留下一次成功写入");
+        let text = String::from_utf8_lossy(&state.writes[0]);
+        assert!(text.contains("\"Add\""), "legacy 应重写 Add 帧：{text}");
+        assert_eq!(client.protocol(), Some(VddProtocol::Legacy));
+    }
+
+    #[test]
+    fn dead_connection_is_probed_and_replaced_before_writing() {
+        // 模拟 pnputil /restart-device：驱动重启，旧管道实例没了。
+        let world = fake_world(VddProtocol::V2);
+        let mut client = fake_client(&world);
+        client.notify(&[monitor()]).expect("先建立连接");
+
+        world.lock().unwrap().alive = false;
+        client
+            .notify(&[monitor()])
+            .expect("探测到断线后应静默重连，而不是把错误抛给调用方");
+
+        let state = world.lock().unwrap();
+        assert_eq!(state.connects, 2, "探测到断线必须重新 CreateFile");
+        assert_eq!(state.writes.len(), 2);
     }
 }
