@@ -236,12 +236,28 @@ fn placement_matches_the_csharp_reference() {
         let f: Vec<&str> = line.split('\t').collect();
         match f[0] {
             "STYLE" => {
-                let actual = placement::desired_ex_style(
-                    integer(f[1]) as i32,
-                    flag(f[3]),
-                    flag(f[4]),
+                let baseline = integer(f[1]) as i32;
+                let topmost = flag(f[2]);
+                let no_activate = flag(f[3]);
+                let passthrough = flag(f[4]);
+                let observed = integer(f[5]) as i32;
+                let actual = placement::desired_ex_style(baseline, no_activate, passthrough);
+
+                // C# 那一侧是**真窗口**：`PlacePhysical` 之后的 `SetWindowPos(HWND_TOPMOST)`
+                // 会由系统自己给窗口加上 `WS_EX_TOPMOST`，WPF 窗口本身还带 `WS_EX_WINDOWEDGE`。
+                // 这两位不是 `desired_ex_style` 算出来的，所以只比较它负责的三位；
+                // 置顶与否单独用 TOPMOST 位断言。
+                const OWNED: i32 = 0x0000_0080 // WS_EX_TOOLWINDOW
+                    | 0x0800_0000 // WS_EX_NOACTIVATE
+                    | 0x0000_0020; // WS_EX_TRANSPARENT
+                const TOPMOST_BIT: i32 = 0x0000_0008; // WS_EX_TOPMOST
+
+                assert_eq!(actual & OWNED, observed & OWNED, "desired_ex_style {line}");
+                assert_eq!(
+                    observed & TOPMOST_BIT != 0,
+                    topmost,
+                    "WS_EX_TOPMOST 与 topmost 不一致 {line}"
                 );
-                assert_eq!(actual, integer(f[5]) as i32, "desired_ex_style {line}");
                 styles += 1;
             }
             "RECT" => {

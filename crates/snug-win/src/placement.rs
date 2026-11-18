@@ -78,12 +78,16 @@ pub fn desired_ex_style(current: i32, no_activate: bool, passthrough: bool) -> i
 }
 
 /// 目标矩形 → `SetWindowPos` 的整数参数；宽高至少 1（C# `Math.Max(1, ...)`）。
+///
+/// 取整用 [`f64::round_ties_even`]：C# 的 `Math.Round(double)` 是"银行家舍入"，
+/// `Math.Round(300.5) == 300`。Rust 的 `f64::round` 是"五入远离零"，会给出 301——
+/// 这一位差就被 C# 对拍抓到了（`tools/geometry-ref/placement.tsv`）。
 pub fn placement_rect(bounds: Rect) -> (i32, i32, i32, i32) {
     (
-        bounds.x.round() as i32,
-        bounds.y.round() as i32,
-        i32::max(1, bounds.width.round() as i32),
-        i32::max(1, bounds.height.round() as i32),
+        bounds.x.round_ties_even() as i32,
+        bounds.y.round_ties_even() as i32,
+        i32::max(1, bounds.width.round_ties_even() as i32),
+        i32::max(1, bounds.height.round_ties_even() as i32),
     )
 }
 
@@ -202,9 +206,12 @@ mod tests {
 
     #[test]
     fn placement_rect_rounds_and_clamps() {
+        // 100.5 → 100：C# 的 `Math.Round` 是银行家舍入（.5 进偶数），不是四舍五入。
+        // 这条期望值原先写的是 101（Rust `round()` 的语义），被 C# 对拍纠正
+        // （`tools/geometry-ref/placement.tsv` 里 `RECT 10.4 20.6 300.5 200.49` 那条）。
         assert_eq!(
             placement_rect(Rect::new(10.4, 20.6, 100.5, 200.4)),
-            (10, 21, 101, 200)
+            (10, 21, 100, 200)
         );
         // 0 尺寸必须变成 1，否则 SetWindowPos 会认为是"隐藏"。
         assert_eq!(placement_rect(Rect::new(0.0, 0.0, 0.0, 0.0)), (0, 0, 1, 1));
