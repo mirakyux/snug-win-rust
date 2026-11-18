@@ -20,11 +20,13 @@ pub mod vdd;
 mod wide;
 pub mod window;
 pub mod apps;
+pub mod elevation;
 pub mod placement;
 pub mod startup;
 pub mod update;
 
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
+pub use elevation::{is_elevated, restart_elevated};
 pub use placement::{PlacementRequest, apply as apply_placement};
 pub use startup::{StartupError, StartupService};
 pub use touch::{HookEngine, TouchHook, WinInput};
