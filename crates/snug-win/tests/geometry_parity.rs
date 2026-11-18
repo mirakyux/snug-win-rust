@@ -14,8 +14,10 @@
 //! ```
 //!
 //! 生成物没提交时这组测试会打印提示并跳过（不假装通过）；提交后每次 `cargo test`
-//! 都会真跑。placement 那组只验证“扩展样式”和“物理矩形取整”，因为
-//! `SetWindowPos` 的 flags / z-order 在 C# 里没有可观察的纯函数出口。
+//! 都会真跑。placement 那组验证「扩展样式」与「物理矩形取整」：样式位除
+//! `WS_EX_TOPMOST`（`SetWindowPos` 由系统加）和 `WS_EX_WINDOWEDGE`（系统补的边框位）
+//! 之外**逐位全比**，所以“顺手把 current 里别的位清掉”这类 bug 也能抓到；
+//! `SetWindowPos` 的 flags / z-order 在 C# 里没有可观察的纯函数出口，不在对拍范围。
 
 use std::path::PathBuf;
 
@@ -236,23 +238,29 @@ fn placement_matches_the_csharp_reference() {
         let f: Vec<&str> = line.split('\t').collect();
         match f[0] {
             "STYLE" => {
-                let baseline = integer(f[1]) as i32;
+                // 第 1 字段是 C# 侧**读回的真实**扩展样式（不是"打算设的值"）：
+                // WPF/系统可能在同一个窗口上已经归一化过，拿打算设的值会比错。
+                let before = integer(f[1]) as i32;
                 let topmost = flag(f[2]);
                 let no_activate = flag(f[3]);
                 let passthrough = flag(f[4]);
                 let observed = integer(f[5]) as i32;
-                let actual = placement::desired_ex_style(baseline, no_activate, passthrough);
+                let desired = placement::desired_ex_style(before, no_activate, passthrough);
 
-                // C# 那一侧是**真窗口**：`PlacePhysical` 之后的 `SetWindowPos(HWND_TOPMOST)`
-                // 会由系统自己给窗口加上 `WS_EX_TOPMOST`，WPF 窗口本身还带 `WS_EX_WINDOWEDGE`。
-                // 这两位不是 `desired_ex_style` 算出来的，所以只比较它负责的三位；
-                // 置顶与否单独用 TOPMOST 位断言。
-                const OWNED: i32 = 0x0000_0080 // WS_EX_TOOLWINDOW
-                    | 0x0800_0000 // WS_EX_NOACTIVATE
-                    | 0x0000_0020; // WS_EX_TRANSPARENT
+                // 两个位不归 `desired_ex_style` 管：
+                // - WS_EX_TOPMOST：`SetWindowPos(HWND_TOPMOST)` 由系统加，单独断言；
+                // - WS_EX_WINDOWEDGE：现有 TSV 里 baseline 不含它时 after 也会多出来，
+                //   是系统在显示/SetWindowPos 时补的边框位（例：`STYLE 0 …` 那组 after
+                //   带 0x100）。除这两位之外**逐位全比**，所以“把 current 整个覆盖掉”
+                //   这类 bug（比如顺手清掉 APPWINDOW）会被抓住。
                 const TOPMOST_BIT: i32 = 0x0000_0008; // WS_EX_TOPMOST
+                const SYSTEM_OWNED: i32 = TOPMOST_BIT | 0x0000_0100; // | WS_EX_WINDOWEDGE
 
-                assert_eq!(actual & OWNED, observed & OWNED, "desired_ex_style {line}");
+                assert_eq!(
+                    desired & !SYSTEM_OWNED,
+                    observed & !SYSTEM_OWNED,
+                    "desired_ex_style 除系统位外必须逐位相等 {line}"
+                );
                 assert_eq!(
                     observed & TOPMOST_BIT != 0,
                     topmost,

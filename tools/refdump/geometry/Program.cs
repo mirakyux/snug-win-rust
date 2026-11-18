@@ -259,7 +259,10 @@ internal static class Program
         IntPtr hwnd = helper.EnsureHandle();
         window.Show();
 
-        long[] baselines = [0, 0x80, 0x20, 0x100, 0x08000000];
+        // baseline 里特意混入常见外来位：0x80/0x20 是函数自己要开合的，
+        // 0x100（WS_EX_WINDOWEDGE）和 0x00040000（WS_EX_APPWINDOW）用来验
+        // "别的位有没有被顺手清掉"——这正是只看三位抓不到的那类 bug。
+        long[] baselines = [0, 0x80, 0x20, 0x100, 0x08000000, 0x00040000];
         (double X, double Y, double W, double H)[] boundsCases =
         [
             (10.4, 20.6, 300.5, 200.49),
@@ -279,6 +282,9 @@ internal static class Program
                         foreach (var bounds in boundsCases)
                         {
                             Win32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, baseline);
+                            // 记录**读回的真实值**而不是"我打算设的值"：WPF/系统可能已经
+                            // 归一化过（比如补回 WS_EX_WINDOWEDGE），拿打算设的值去比会算错。
+                            long before = Win32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                             WindowPlacementHelper.PlacePhysical(
                                 window,
                                 new RectD(bounds.X, bounds.Y, bounds.W, bounds.H),
@@ -288,7 +294,7 @@ internal static class Program
                                 passthrough: passthrough);
 
                             long desired = Win32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                            sb.Append("STYLE\t").Append(baseline.ToString(Inv)).Append('\t')
+                            sb.Append("STYLE\t").Append(before.ToString(Inv)).Append('\t')
                               .Append(topmost ? "1" : "0").Append('\t')
                               .Append(noActivate ? "1" : "0").Append('\t')
                               .Append(passthrough ? "1" : "0").Append('\t')
