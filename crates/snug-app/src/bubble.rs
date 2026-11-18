@@ -85,7 +85,7 @@ impl CopyBubble {
 
     /// 每帧调：处理超时、画气泡、返回"用户在哪个点按了复制"。
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<Point> {
-        if !self.visible {
+        if !self.is_visible() {
             return None;
         }
         if let Some(deadline) = self.deadline
