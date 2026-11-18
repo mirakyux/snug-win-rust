@@ -48,7 +48,10 @@ use crate::wide::{contains_ignore_case, from_wide, to_wide};
 pub const MONITOR_NAME: &str = "Snug 手机屏";
 /// 建屏时依次尝试的连接器编号（C# `PhoneScreenSpec.CandidateIds`）。
 pub const CANDIDATE_IDS: [u32; 4] = [0, 1, 2, 3];
-/// 手机屏的目标缩放（C# `PhoneDisplayService.TargetDpiPercent`）。
+/// 手机/平板的目标缩放（C# `TargetDpiPercent` 的默认档位）。
+///
+/// v1.3 起电脑屏按 `ScreenFit::target_dpi_percent` 可能是 100%，实际下发以那个为准；
+/// 这个常量只作为"普通手机/平板"的参考值（几何对拍与界面默认值还在用）。
 pub const TARGET_DPI_PERCENT: i32 = 200;
 
 /// Windows「设置 → 缩放」的档位表（C# `DisplayConfigService.DpiScaleTable`）。
@@ -786,14 +789,13 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             sleep_for(self.timings.resolution_settle);
         }
 
-        if let Some(after) = find_monitor_of(&self.api, &self.maps, display_id)
-            && after.mode.dpi_scale_percent != TARGET_DPI_PERCENT
-        {
-            self.api.set_dpi_scale(
-                after.adapter_id,
-                after.source_id,
-                TARGET_DPI_PERCENT,
-            );
+        if let Some(after) = find_monitor_of(&self.api, &self.maps, display_id) {
+            // C# v1.3：目标 DPI 由 `ScreenFit.TargetDpiPercent(width)` 决定——
+            // 电脑屏超过 3840×2400 的 2 倍阈值时是 100%，否则 200%。
+            let target_dpi = fit.target_dpi_percent(width);
+            if after.mode.dpi_scale_percent != target_dpi {
+                self.api.set_dpi_scale(after.adapter_id, after.source_id, target_dpi);
+            }
         }
     }
 }
@@ -2255,6 +2257,49 @@ mod tests {
         assert!(is_online_of(&screen.api, &screen.maps, id));
         assert_eq!(width_of_display(&screen.api, &screen.maps, id), Some(540));
         assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), Some(ScreenFit::standard()));
+    }
+
+    #[test]
+    fn big_computer_screen_targets_100_percent_dpi() {
+        // 4K 电脑屏（横握 2160×3840 的竖写规格 → 3840×2160 横向）：
+        // v1.3 起 2× 会超过 3840×2400 阈值，改用 1 倍像素 + 100% DPI。
+        let fit = ScreenFit::from_device(
+            &snug_core::PhoneSpec::new(2160.0, 3840.0, None),
+            snug_core::DeviceKind::Computer,
+            snug_core::ScreenOrientation::Landscape,
+        );
+        assert_eq!(fit.base_width(), 3840);
+        assert_eq!(fit.pixel_size(fit.base_width()), (3840, 2160));
+        assert_eq!(fit.target_dpi_percent(fit.base_width()), 100);
+
+        let base_width = fit.base_width();
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        screen.create(fit).expect("建屏成功");
+        {
+            let world = shared.lock().unwrap();
+            assert_eq!(
+                world.resolutions,
+                vec![(r"\\.\DISPLAY2".to_string(), 3840, 2160, 60.0)],
+                "1 倍屏不该再放大"
+            );
+            // 假驱动上线时报的就是 100%，所以这里不该重复下发 DPI。
+            assert!(world.dpi_calls.is_empty(), "已经是 100% 就不用再设");
+        }
+
+        // 驱动把 DPI 报成 200% 时，`set_width` 要按 v1.3 拉回 100%。
+        {
+            let mut world = shared.lock().unwrap();
+            for monitor in world.monitors.iter_mut() {
+                monitor.mode.dpi_scale_percent = 200;
+            }
+        }
+        screen.set_width(0, base_width);
+        let world = shared.lock().unwrap();
+        assert_eq!(
+            world.dpi_calls.last().map(|call| call.2),
+            Some(100),
+            "大电脑屏的目标缩放是 100%"
+        );
     }
 
     #[test]
