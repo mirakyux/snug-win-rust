@@ -399,7 +399,10 @@ impl PhoneHomeApp {
         // `list_visible` 变 true，但窗口还在手机屏上（`placed` 仍有值）。如果只看
         // `placed`，界面就永远停在指示条，用户怎么点都回不到资源库——真机反馈的
         // 「打开后没法返回那个列表」就是这条。
-        let showing_bar = state.placed.is_some() && !state.list_visible;
+        // 设置窗打开时必须让窗口恢复整屏：设置窗是画在**当前窗口**里的 `egui::Window`，
+        // 而指示条状态下窗口只有 1080×56，把它塞进去只会剩一条灰边（真机反馈）。
+        let showing_bar =
+            state.placed.is_some() && !state.list_visible && !self.settings.is_open();
         let bounds = if ready {
             if showing_bar {
                 self.controller.home_bar_area()
@@ -603,6 +606,7 @@ impl PhoneHomeApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("⚙").on_hover_text("设置").clicked() {
+                            crate::info!("指示条：打开设置");
                             self.settings.open();
                         }
                         if let Some(window) = &placed
@@ -734,6 +738,8 @@ impl eframe::App for PhoneHomeApp {
         if self.settings.is_open() {
             self.refresh_settings_status();
         }
+        // 设置窗画在手机屏这块界面上：用户是在手机（UU 远程）上操作的，独立窗口开在
+        // 电脑主屏反而看不见。顶部有「返回」可以关掉，标题栏的 X 也能关。
         let before = self.config.clone();
         match self.settings.show(ctx, &mut self.config) {
             SettingsOutcome::Changed => {
@@ -743,11 +749,14 @@ impl eframe::App for PhoneHomeApp {
                 }
                 match impact {
                     ChangeImpact::RebuildPhoneScreen => {
-                        self.controller
-                            .set_fit(snug_core::ScreenFit::from_phone(&self.config.phone.screen.to_fit_spec()));
+                        self.controller.set_fit(snug_core::ScreenFit::from_phone(
+                            &self.config.phone.screen.to_fit_spec(),
+                        ));
                         self.controller.set_default_zoom(self.config.zoom_steps);
                     }
-                    ChangeImpact::ReloadGestures => self.controller.apply_gesture_settings(&self.config),
+                    ChangeImpact::ReloadGestures => {
+                        self.controller.apply_gesture_settings(&self.config)
+                    }
                     ChangeImpact::RefreshHomeBar | ChangeImpact::None => {}
                 }
             }
@@ -767,7 +776,7 @@ impl eframe::App for PhoneHomeApp {
         // 和 `sync_window` 同一个条件：点了「‹ 资源库」之后 `list_visible=true`，即使窗口
         // 还铺在手机屏上，也必须回到资源库列表。
         let bar_state = self.controller.state();
-        if bar_state.placed.is_some() && !bar_state.list_visible {
+        if bar_state.placed.is_some() && !bar_state.list_visible && !self.settings.is_open() {
             self.draw_home_bar(ctx);
             self.shots.poll();
             self.shots.show(ctx);

@@ -416,6 +416,9 @@ impl SettingsWindow {
     }
 
     /// 画一帧。`cfg` 是本模块唯一会改的外部状态。
+    /// 画一帧设置窗。调用方把它放进**独立的 OS 窗口**里（`show_viewport_immediate`），
+    /// 所以这里是整块面板而不是主窗口里的浮动 `egui::Window`——原版 C# 的设置窗也是
+    /// 独立的 WPF 窗口，出现在主屏上，不是塞在手机屏那块虚拟屏里。
     pub fn show(&mut self, ctx: &egui::Context, cfg: &mut AppConfig) -> SettingsOutcome {
         if !self.open {
             return SettingsOutcome::Idle;
@@ -425,15 +428,32 @@ impl SettingsWindow {
             self.baseline = Some(before.clone());
         }
 
-        let mut still_open = self.open;
+        let mut titlebar_open = self.open;
+        let mut back_clicked = false;
         egui::Window::new("SnugWin 设置")
-            .open(&mut still_open)
+            .open(&mut titlebar_open)
             .collapsible(false)
             .resizable(true)
-            .default_size([780.0, 600.0])
+            .default_size([820.0, 640.0])
             .min_size([700.0, 520.0])
-            .show(ctx, |ui| self.layout(ui, cfg));
-        self.open = still_open;
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(self.tab.page_title()).size(19.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("返回").min_size(egui::vec2(76.0, 32.0)))
+                            .on_hover_text("关闭设置窗（不退出程序）")
+                            .clicked()
+                        {
+                            back_clicked = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(2.0);
+                self.layout(ui, cfg);
+            });
+        self.open = titlebar_open && !back_clicked;
 
         if !self.open {
             self.baseline = None;
