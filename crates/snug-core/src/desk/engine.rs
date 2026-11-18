@@ -15,14 +15,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::config::ScreenConfig;
 use crate::geometry::Rect;
 use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
 use crate::paths::Paths;
+use crate::phone_models::PHONE_SCREEN_NAME;
 use crate::record::PhoneRecord;
 use crate::screen_fit::ScreenFit;
+use crate::screen_plan::ScreenBehavior;
 use crate::store::{JsonFileStore, RestoreRecordStore};
 use crate::touch::CloseButton;
 use crate::windows::{AppInfo, DisplayModeInfo, OtherDisplay, RunningApp, WindowInfo, WindowKey};
@@ -166,6 +169,30 @@ struct Replaced {
     until: f64,
 }
 
+/// 多块屏共用的 zoom.json / left-behind.json。
+///
+/// C# 的 `_zoomBook` / `_leftBehind` 是所有 `PhoneDesk` 共用的**同一个对象**；
+/// Rust 版把值放进 `Arc<Mutex<_>>`，这样各屏看到的是同一份记忆，不会互相覆盖文件。
+pub(crate) struct SharedDeskBooks {
+    pub(crate) zoom_book: Arc<Mutex<ZoomBook>>,
+    pub(crate) zoom_file: Arc<JsonFileStore<ZoomBook>>,
+    pub(crate) left_behind: Arc<Mutex<LeftBehindBook>>,
+    pub(crate) left_behind_file: Arc<JsonFileStore<LeftBehindBook>>,
+}
+
+impl SharedDeskBooks {
+    /// 从数据目录读一次（读坏的文件已被隔离）。
+    pub(crate) fn load(paths: &Paths) -> Self {
+        let zoom_file = Arc::new(JsonFileStore::<ZoomBook>::new(paths.zoom_book_file()));
+        let zoom_book = Arc::new(Mutex::new(zoom_file.load_or_quarantine().unwrap_or_default()));
+        let left_behind_file =
+            Arc::new(JsonFileStore::<LeftBehindBook>::new(paths.left_behind_file()));
+        let left_behind =
+            Arc::new(Mutex::new(left_behind_file.load_or_quarantine().unwrap_or_default()));
+        Self { zoom_book, zoom_file, left_behind, left_behind_file }
+    }
+}
+
 /// 跨线程共享的部分：状态快照、watch 表、重试句柄、平台接口与存储。
 struct DeskShared {
     state: Mutex<DeskState>,
@@ -182,22 +209,121 @@ struct DeskShared {
     #[allow(dead_code)]
     apps: Arc<dyn AppControl>,
     timeline: Arc<dyn Timeline>,
+    /// 每块屏一份还原记录（`phone-screen.json` / `screen-<id>.json`）。
     ledger: RestoreRecordStore<PhoneRecord>,
-    zoom_file: JsonFileStore<ZoomBook>,
-    left_behind_file: JsonFileStore<LeftBehindBook>,
+    books: Arc<SharedDeskBooks>,
+    /// 屏身份（C# `PhoneDesk` 的 `_screenId` / `_screenName` / `_behavior`）。
+    screen_id: String,
+    screen_name: Mutex<String>,
+    behavior: Mutex<ScreenBehavior>,
     events: DeskEvents,
 }
 
-struct DeskHandle {
-    lane: SerialLane<DeskCore>,
-    shared: Arc<DeskShared>,
+/// 共享串行队列的状态：所有屏的 [`DeskCore`] 都放在这里。
+///
+/// 对应 C# `DeskSet` 里那条所有 `PhoneDesk` 共享的 `SerialLane`：一个工作线程、
+/// 按入队顺序执行，所以跨屏操作（转移窗口、退出 App）可以在同一个动作里同步做完。
+#[derive(Default)]
+pub(crate) struct DeskHub {
+    desks: HashMap<String, DeskCore>,
 }
 
-impl Drop for DeskHandle {
+impl DeskHub {
+    /// 屏 id 大小写不敏感（C# 字典用 `StringComparer.OrdinalIgnoreCase`）。
+    pub(crate) fn key(screen_id: &str) -> String {
+        screen_id.to_lowercase()
+    }
+
+    pub(crate) fn core_mut(&mut self, id: &str) -> Option<&mut DeskCore> {
+        self.desks.get_mut(&Self::key(id))
+    }
+
+    pub(crate) fn insert(&mut self, core: DeskCore) {
+        let key = Self::key(core.screen_id());
+        self.desks.insert(key, core);
+    }
+
+    pub(crate) fn remove(&mut self, id: &str) -> Option<DeskCore> {
+        self.desks.remove(&Self::key(id))
+    }
+
+    pub(crate) fn ids(&self) -> Vec<String> {
+        self.desks.keys().cloned().collect()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.desks.clear();
+    }
+
+    /// 跨屏转移：除 `except` 之外，哪块屏正铺着这个窗口就把它摘下来。
+    pub(crate) fn detach_for_transfer(
+        &mut self,
+        except: &str,
+        window: WindowKey,
+    ) -> Option<PhoneRecord> {
+        let except = Self::key(except);
+        let source = self
+            .desks
+            .iter()
+            .find(|(id, core)| **id != except && core.placed_window_key() == Some(window))
+            .map(|(id, _)| id.clone())?;
+        self.desks.get_mut(&source)?.detach_placement_for_transfer()
+    }
+}
+
+/// 指向共享队列里「某一块屏」的句柄：入队的动作只作用在这块屏的 [`DeskCore`] 上。
+#[derive(Clone)]
+pub(crate) struct DeskSlot {
+    lane: SerialLane<DeskHub>,
+    id: String,
+}
+
+impl DeskSlot {
+    pub(crate) fn new(lane: SerialLane<DeskHub>, id: impl Into<String>) -> Self {
+        Self { lane, id: id.into() }
+    }
+
+    fn run(&self, operation: impl FnOnce(&mut DeskCore) + Send + 'static) {
+        let id = self.id.clone();
+        self.lane.run(move |hub: &mut DeskHub| {
+            if let Some(core) = hub.core_mut(&id) {
+                operation(core);
+            }
+        });
+    }
+
+    fn call(&self, operation: impl FnOnce(&mut DeskCore) + Send + 'static) {
+        let id = self.id.clone();
+        self.lane.call(move |hub: &mut DeskHub| {
+            if let Some(core) = hub.core_mut(&id) {
+                operation(core);
+            }
+        });
+    }
+
+    fn drain(&self) {
+        self.lane.drain();
+    }
+}
+
+/// 共享队列的拥有者：最后一个 owner 消失时关掉工作线程。
+///
+/// 单屏 [`Desk`] 自己持有；[`super::set::DeskSet`] 持有所有屏共用的那一个。
+pub(crate) struct HubOwner {
+    pub(crate) lane: SerialLane<DeskHub>,
+}
+
+impl Drop for HubOwner {
     fn drop(&mut self) {
-        // 最后一个句柄消失时关掉工作线程；桌面状态自己攥着发送端，靠 Stop 才能退出。
         self.lane.stop();
     }
+}
+
+struct DeskHandle {
+    slot: DeskSlot,
+    shared: Arc<DeskShared>,
+    /// 共享队列的拥有者；字段本身不读，靠它的 `Drop` 在工作线程用完时退出。
+    _owner: Option<Arc<HubOwner>>,
 }
 
 /// 手机屏桌面。可克隆，所有方法线程安全。
@@ -207,18 +333,16 @@ pub struct Desk {
 }
 
 /// 工作线程独占的私有字段（对应 C# PhoneDesk 的实例字段）。
-struct DeskCore {
+pub(crate) struct DeskCore {
     shared: Arc<DeskShared>,
-    /// 用来从 watch/重试线程把动作排回本队列。
-    enqueue: SerialLane<DeskCore>,
+    /// 用来从 watch/重试线程把动作排回共享队列。
+    slot: DeskSlot,
     display: Option<PendingDisplay>,
     retiring: Option<Retiring>,
     persist_owed: bool,
     settling: bool,
     failures: usize,
     placement: Option<Placement>,
-    zoom_book: ZoomBook,
-    left_behind: LeftBehindBook,
     recheck_generation: u64,
     verifying: bool,
     checking_returns: bool,
@@ -228,7 +352,10 @@ struct DeskCore {
 }
 
 impl Desk {
-    /// 对应 C# `PhoneDesk(displays, windows, apps, paths, timeline, defaultZoom, fit)`。
+    /// 对应 C# `PhoneDesk(displays, windows, apps, paths, timeline, defaultZoom, fit)` 的单屏形态。
+    ///
+    /// 自己起一条串行队列、自己读 zoom/left-behind、用 legacy 屏 id 与 `phone-screen.json`；
+    /// 现有单屏测试与 app 都用它，行为与 v1.2 的单屏版本一致。
     pub fn new(
         displays: Arc<dyn PhoneDisplays>,
         windows: Arc<dyn WindowControl>,
@@ -236,51 +363,122 @@ impl Desk {
         paths: &Paths,
         options: DeskOptions,
     ) -> Desk {
-        let fit = options.fit.clone().unwrap_or_else(ScreenFit::standard);
+        let DeskOptions { timeline, default_zoom, fit, events } = options;
+        let fit = fit.unwrap_or_else(ScreenFit::standard);
         let timeline =
-            options.timeline.unwrap_or_else(|| Arc::new(SystemTimeline::new()) as Arc<dyn Timeline>);
-        // 与 C# 构造函数一致：先把字号记忆、left-behind 读出来（读坏的文件已被隔离）。
-        let zoom_file = JsonFileStore::<ZoomBook>::new(paths.zoom_book_file());
-        let zoom_book = zoom_file.load_or_quarantine().unwrap_or_default();
-        let left_behind_file = JsonFileStore::<LeftBehindBook>::new(paths.left_behind_file());
-        let left_behind = left_behind_file.load_or_quarantine().unwrap_or_default();
+            timeline.unwrap_or_else(|| Arc::new(SystemTimeline::new()) as Arc<dyn Timeline>);
 
+        let lane = SerialLane::<DeskHub>::start(|_| DeskHub::default());
+        let owner = Arc::new(HubOwner { lane: lane.clone() });
+        let books = Arc::new(SharedDeskBooks::load(paths));
+        Desk::spawn(
+            &lane,
+            books,
+            displays,
+            windows,
+            apps,
+            paths,
+            timeline,
+            default_zoom,
+            fit,
+            ScreenConfig::LEGACY_PHONE_ID,
+            PHONE_SCREEN_NAME,
+            ScreenBehavior::TouchScreen,
+            events,
+            Some(owner),
+        )
+    }
+
+    /// 在一条共享队列里起一块屏（C# 带 `sharedLane` / `sharedZoomBook` 等参数的构造函数）。
+    ///
+    /// `owner` 只有单屏 [`Desk::new`] 才传；[`super::set::DeskSet`] 自己攥着共享队列的 owner。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn(
+        lane: &SerialLane<DeskHub>,
+        books: Arc<SharedDeskBooks>,
+        displays: Arc<dyn PhoneDisplays>,
+        windows: Arc<dyn WindowControl>,
+        apps: Arc<dyn AppControl>,
+        paths: &Paths,
+        timeline: Arc<dyn Timeline>,
+        default_zoom: i32,
+        fit: ScreenFit,
+        screen_id: impl Into<String>,
+        screen_name: impl Into<String>,
+        behavior: ScreenBehavior,
+        events: DeskEvents,
+        owner: Option<Arc<HubOwner>>,
+    ) -> Desk {
+        let screen_id: String = screen_id.into();
+        let screen_name: String = screen_name.into();
+        let screen_name = if screen_name.trim().is_empty() {
+            PHONE_SCREEN_NAME.to_string()
+        } else {
+            screen_name
+        };
+
+        // 还原记录按屏分文件：legacy id 用 `phone-screen.json`，其余 `screen-<id>.json`。
+        let ledger = RestoreRecordStore::new(paths.record_file_for_screen(Some(&screen_id)));
         let shared = Arc::new(DeskShared {
             state: Mutex::new(DeskState::default()),
             watches: Mutex::new(HashMap::new()),
             pending_retry: Mutex::new(None),
             wanted: AtomicBool::new(false),
             remote: AtomicBool::new(false),
-            default_zoom: AtomicI32::new(options.default_zoom),
+            default_zoom: AtomicI32::new(default_zoom),
             fit: Mutex::new(fit),
             displays,
             windows,
             apps,
             timeline,
-            ledger: RestoreRecordStore::new(paths.phone_record_file()),
-            zoom_file,
-            left_behind_file,
-            events: options.events,
+            ledger,
+            books,
+            screen_id: screen_id.clone(),
+            screen_name: Mutex::new(screen_name),
+            behavior: Mutex::new(behavior),
+            events,
         });
 
+        let slot = DeskSlot::new(lane.clone(), screen_id);
         let for_core = Arc::clone(&shared);
-        let lane = SerialLane::start(move |enqueue| DeskCore {
-            shared: for_core,
-            enqueue,
-            display: None,
-            retiring: None,
-            persist_owed: false,
-            settling: false,
-            failures: 0,
-            placement: None,
-            zoom_book,
-            left_behind,
-            recheck_generation: 0,
-            verifying: false,
-            checking_returns: false,
-            replaced: None,
+        let core_slot = slot.clone();
+        lane.run(move |hub: &mut DeskHub| {
+            hub.insert(DeskCore {
+                shared: for_core,
+                slot: core_slot,
+                display: None,
+                retiring: None,
+                persist_owed: false,
+                settling: false,
+                failures: 0,
+                placement: None,
+                recheck_generation: 0,
+                verifying: false,
+                checking_returns: false,
+                replaced: None,
+            });
         });
-        Desk { inner: Arc::new(DeskHandle { lane, shared }) }
+        Desk { inner: Arc::new(DeskHandle { slot, shared, _owner: owner }) }
+    }
+
+    /// 屏 id（C# `ScreenId`）。
+    pub fn screen_id(&self) -> String {
+        self.inner.shared.screen_id.clone()
+    }
+
+    /// 屏名（C# `ScreenName`），可用 [`Self::update_wish`] 改。
+    pub fn screen_name(&self) -> String {
+        self.inner.shared.screen_name.lock().expect("screen name").clone()
+    }
+
+    /// 这块屏是触屏还是电脑副屏（C# `Behavior`）。
+    pub fn behavior(&self) -> ScreenBehavior {
+        *self.inner.shared.behavior.lock().expect("behavior")
+    }
+
+    /// 正铺在这块屏上的窗口（C# `PlacedWindowKey`）。
+    pub fn placed_window_key(&self) -> Option<WindowKey> {
+        self.state().placed.map(|placed| placed.window.key)
     }
 
     /// 当前状态快照。
@@ -296,10 +494,20 @@ impl Desk {
         self.inner.shared.fit.lock().expect("desk fit").clone()
     }
 
-    fn log(&self, message: impl AsRef<str>) {
+    pub(crate) fn log(&self, message: impl AsRef<str>) {
         if let Some(log) = self.inner.shared.events.log.as_ref() {
             log(message.as_ref());
         }
+    }
+
+    /// 对应 C# `UpdateWish`：换名字、换比例、换行为。
+    pub fn update_wish(&self, name: impl Into<String>, fit: ScreenFit, behavior: ScreenBehavior) {
+        let name = name.into();
+        if !name.trim().is_empty() {
+            *self.inner.shared.screen_name.lock().expect("screen name") = name;
+        }
+        *self.inner.shared.behavior.lock().expect("behavior") = behavior;
+        self.set_fit(fit);
     }
 
     /// 对应 C# `SetWanted`：用户在手机上进入 / 离开手机屏。
@@ -307,7 +515,7 @@ impl Desk {
         if self.inner.shared.wanted.swap(on, Ordering::SeqCst) == on {
             return;
         }
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             if !on {
                 core.cancel_retry();
                 core.set_state(core.state().with_dismissed(false));
@@ -328,7 +536,7 @@ impl Desk {
 
     /// 对应 C# `SettleDisplays`：撤屏后系统还没下线 / 要持久化其它屏模式时善后。
     pub fn settle_displays(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| core.settle_displays());
+        self.inner.slot.run(|core: &mut DeskCore| core.settle_displays());
     }
 
     /// 对应 C# `Pull`：把某个窗口放上手机屏。
@@ -339,16 +547,14 @@ impl Desk {
             self.log(format!("{app} 正在退出，不放 {label}"));
             return;
         }
-        self.inner.lane.run(move |core: &mut DeskCore| {
-            core.begin(DeskWork::with_label(DeskWorkKind::Placing, label));
-            core.place(window, true);
-            core.set_state(core.state().with_work(None));
+        self.inner.slot.run(move |core: &mut DeskCore| {
+            core.pull_with(window, None);
         });
     }
 
     /// 对应 C# `PutBack`：把手机屏上的窗口放回原位。
     pub fn put_back(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             if core.placement.is_none() {
                 return;
             }
@@ -368,7 +574,7 @@ impl Desk {
 
     /// 对应 C# `ReturnToPlaced`：从 App 资源库回到已摆好的窗口。
     pub fn return_to_placed(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             let Some(placement) = core.placement.clone() else {
                 return;
             };
@@ -390,13 +596,13 @@ impl Desk {
         if clamped == placed.zoom {
             return;
         }
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             core.begin(DeskWork::new(DeskWorkKind::Zooming));
             if core.change_zoom(delta)
                 && let Some(placement) = core.placement.clone()
                 && let Some(app_id) = placement.window.app_id.clone()
             {
-                core.zoom_book.remember(placement.record.zoom, &app_id);
+                core.zoom_book().remember(placement.record.zoom, &app_id);
                 core.save_zoom_book();
             }
             core.set_state(core.state().with_work(None));
@@ -406,11 +612,11 @@ impl Desk {
     /// 对应 C# `SetDefaultZoom`：改了默认字号后，忘掉各 App 记住的级数。
     pub fn set_default_zoom(&self, steps: i32) {
         self.inner.shared.default_zoom.store(steps, Ordering::SeqCst);
-        self.inner.lane.run(|core: &mut DeskCore| {
-            if core.zoom_book.remembered.is_empty() {
+        self.inner.slot.run(|core: &mut DeskCore| {
+            if core.zoom_book().remembered.is_empty() {
                 return;
             }
-            core.zoom_book.forget_all();
+            core.zoom_book().forget_all();
             core.save_zoom_book();
         });
     }
@@ -424,7 +630,7 @@ impl Desk {
             }
             *current = fit;
         }
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             if core.state().screen_phase == PhoneScreenPhase::Off {
                 return;
             }
@@ -449,7 +655,7 @@ impl Desk {
         if !self.inner.shared.wanted.load(Ordering::SeqCst) || self.state().dismissed {
             return;
         }
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             let state = core
                 .state()
                 .with_dismissed(true)
@@ -463,32 +669,64 @@ impl Desk {
     }
 
     /// 对应 C# `ReenterScreen`（`DeskSet.ReenterAllDismissedTouch` 的单屏版）：
-    /// 同一次远程里用户点「重新进入手机屏」，清掉 dismissed 并立刻恢复建屏。
+    /// 同一次远程里用户点「重新进入手机屏」，清掉 dismissed 与 Notice 并立刻恢复建屏。
     /// 没标记 dismissed（没退出过）或这块屏本来就不该有（`wanted == false`）时什么也不做。
-    pub fn reenter(&self) {
+    pub fn reenter_screen(&self) {
         if !self.inner.shared.wanted.load(Ordering::SeqCst) || !self.state().dismissed {
             return;
         }
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             core.set_state(core.state().with_dismissed(false).with_notice(None));
             core.log("同会话重新进入手机屏：恢复建屏");
             core.reconcile();
         });
     }
 
+    /// `reenter_screen` 的旧名字，保留给已经接好的调用方。
+    pub fn reenter(&self) {
+        self.reenter_screen();
+    }
+
+    /// 对应 C# `DetachPlacementForTransfer`：把正铺着的记录摘出来，给跨屏转移用。
+    ///
+    /// 清掉摆放状态并回到 App 资源库；返回的记录里仍是**原来那块屏上的还原坐标**。
+    /// `DeskSet` 在共享队列内部直接调 [`DeskCore`] 版本，这个包装留给单屏/测试用。
+    #[allow(dead_code)]
+    pub(crate) fn detach_placement_for_transfer(&self) -> Option<PhoneRecord> {
+        let slot = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&slot);
+        self.inner.slot.call(move |core: &mut DeskCore| {
+            *sink.lock().expect("transfer") = core.detach_placement_for_transfer();
+        });
+        slot.lock().expect("transfer").take()
+    }
+
+    /// 对应 C# `ReturnWindowIfPlacedAsync`：铺着的窗口属于这个 pid 就先还回原位再对宽度。
+    pub fn return_window_if_placed(&self, pid: i32) {
+        self.inner.slot.run(move |core: &mut DeskCore| core.return_window_if_placed(pid));
+    }
+
+    /// 对应 C# `EvacuateComputerScreenWindowsAsync`：电脑副屏撤掉前，把落在它矩形内的
+    /// 窗口搬到主屏居中（否则它们会留在已经消失的坐标上）。
+    ///
+    /// C# 在 `RemoveScreenAsync` 里调用；屏没就绪（`_display` 为空）时什么都不做。
+    pub fn evacuate_computer_screen_windows(&self) {
+        self.inner.slot.run(|core: &mut DeskCore| core.evacuate_computer_screen_windows());
+    }
+
     /// 对应 C# `VerifyPlacement`：确认手机屏上的窗口还在。
     pub fn verify_placement(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| core.verify_placement());
+        self.inner.slot.run(|core: &mut DeskCore| core.verify_placement());
     }
 
     /// 对应 C# `DisplaysChanged`。
     pub fn displays_changed(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| core.displays_changed());
+        self.inner.slot.run(|core: &mut DeskCore| core.displays_changed());
     }
 
     /// 对应 C# `Recover`：启动时把上次没还回去的窗口还回去。
     pub fn recover(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             core.put_back_leftover();
         });
     }
@@ -496,7 +734,7 @@ impl Desk {
     /// 对应 C# `Open`：打开 App 并把出现的窗口放上手机屏。
     pub fn open(&self, app: AppInfo) {
         let label = app.name.clone();
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             core.begin(DeskWork::with_label(DeskWorkKind::Opening, label));
             core.open_window(app, None);
             core.set_state(core.state().with_work(None));
@@ -511,7 +749,7 @@ impl Desk {
         }
         let label = app.app.name.clone();
         let pid = app.pid;
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             core.begin(DeskWork::with_label(DeskWorkKind::Opening, label));
             core.open_window(app.app, Some(pid));
             core.set_state(core.state().with_work(None));
@@ -523,13 +761,13 @@ impl Desk {
         if self.state().quitting.contains(&app.pid) {
             return;
         }
-        self.inner.lane.run(move |core: &mut DeskCore| core.quit_app(app));
+        self.inner.slot.run(move |core: &mut DeskCore| core.quit_app(app));
     }
 
     /// 对应 C# `ForceQuit`。
     pub fn force_quit(&self, pid: i32, app_name: impl Into<String>) {
         let app_name = app_name.into();
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             core.unwatch(WatchedKey::for_quit(pid));
             core.set_state(core.state().with_notice(None));
             core.warn(format!("强制退出 {app_name}（pid {pid}）"));
@@ -542,12 +780,12 @@ impl Desk {
 
     /// 对应 C# `Close`。
     pub fn close(&self, window: WindowInfo) {
-        self.inner.lane.run(move |core: &mut DeskCore| core.close_window(window));
+        self.inner.slot.run(move |core: &mut DeskCore| core.close_window(window));
     }
 
     /// 对应 C# `ClosePlaced`：手机上点了关闭按钮，先放回原位再关。
     pub fn close_placed(&self, window_handle: u64) {
-        self.inner.lane.run(move |core: &mut DeskCore| {
+        self.inner.slot.run(move |core: &mut DeskCore| {
             let Some(placement) = core.placement.clone() else {
                 return;
             };
@@ -564,7 +802,7 @@ impl Desk {
 
     /// 对应 C# `DismissNotice`。
     pub fn dismiss_notice(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             if let Some(DeskNotice::QuitStalled { pid, .. }) = core.state().notice {
                 core.unwatch(WatchedKey::for_quit(pid));
             }
@@ -574,7 +812,7 @@ impl Desk {
 
     /// 对应 C# `ShowList`：回到 App 资源库。
     pub fn show_list(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| {
+        self.inner.slot.run(|core: &mut DeskCore| {
             core.set_state(core.state().with_list_visible(true));
             core.match_width();
         });
@@ -582,16 +820,31 @@ impl Desk {
 
     /// 对应 C# `CheckReturns`：看看有没有窗口带着手机屏上的样子回来了。
     pub fn check_returns(&self) {
-        self.inner.lane.run(|core: &mut DeskCore| core.check_returns());
+        self.inner.slot.run(|core: &mut DeskCore| core.check_returns());
     }
 
     /// 对应 C# `ShutdownAsync`：退出前把手机屏撤干净（阻塞到做完）。
     pub fn shutdown(&self) {
         self.inner.shared.wanted.store(false, Ordering::SeqCst);
-        self.inner.lane.call(|core: &mut DeskCore| {
+        self.inner.slot.call(|core: &mut DeskCore| {
             core.cancel_retry();
             core.reconcile();
         });
+    }
+
+    /// 只入队撤屏、不等它做完（`DeskSet` 摘掉一块屏时用，避免界面线程被长动作卡住）。
+    pub(crate) fn shutdown_non_blocking(&self) {
+        self.inner.shared.wanted.store(false, Ordering::SeqCst);
+        self.inner.slot.run(|core: &mut DeskCore| {
+            core.cancel_retry();
+            core.reconcile();
+        });
+    }
+
+    /// 此刻这块屏是否真的静止（没有挂着的重试、没有 watch）。
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.inner.shared.pending_retry.lock().expect("retry").is_none()
+            && self.inner.shared.watches.lock().expect("watches").is_empty()
     }
 
     /// 对应 C# `IdleAsync`：等重试跑完、队列排空、所有 watch 结束。
@@ -604,7 +857,7 @@ impl Desk {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            self.inner.lane.drain();
+            self.inner.slot.drain();
             let unchanged = {
                 let pending = self.inner.shared.pending_retry.lock().expect("retry");
                 match (retry.as_ref(), pending.as_ref()) {
@@ -631,7 +884,7 @@ impl Desk {
     pub(crate) fn retiring(&self) -> bool {
         let slot = Arc::new(Mutex::new(false));
         let sink = Arc::clone(&slot);
-        self.inner.lane.call(move |core: &mut DeskCore| {
+        self.inner.slot.call(move |core: &mut DeskCore| {
             *sink.lock().expect("slot") = core.retiring.is_some();
         });
         let value = *slot.lock().expect("slot");
@@ -643,8 +896,8 @@ impl Desk {
     pub(crate) fn left_behind_len(&self) -> usize {
         let slot = Arc::new(Mutex::new(0usize));
         let sink = Arc::clone(&slot);
-        self.inner.lane.call(move |core: &mut DeskCore| {
-            *sink.lock().expect("slot") = core.left_behind.entries.len();
+        self.inner.slot.call(move |core: &mut DeskCore| {
+            *sink.lock().expect("slot") = core.left_behind().entries.len();
         });
         let value = *slot.lock().expect("slot");
         value
@@ -652,6 +905,24 @@ impl Desk {
 }
 
 impl DeskCore {
+    fn screen_id(&self) -> &str {
+        &self.shared.screen_id
+    }
+
+    fn behavior(&self) -> ScreenBehavior {
+        *self.shared.behavior.lock().expect("behavior")
+    }
+
+    /// 共享的 left-behind 书（所有屏同一份）。
+    fn left_behind(&self) -> MutexGuard<'_, LeftBehindBook> {
+        self.shared.books.left_behind.lock().expect("left_behind")
+    }
+
+    /// 共享的字号记忆（所有屏同一份）。
+    fn zoom_book(&self) -> MutexGuard<'_, ZoomBook> {
+        self.shared.books.zoom_book.lock().expect("zoom_book")
+    }
+
     fn now(&self) -> f64 {
         self.shared.timeline.now()
     }
@@ -771,6 +1042,8 @@ impl DeskCore {
             self.put_back(&mut record, true);
         }
         self.set_placement(None);
+        // 电脑副屏撤掉前，把落在它矩形里的窗口搬回主屏（C# 在 RetireDisplayAsync 之前调用）。
+        self.evacuate_computer_screen_windows();
         self.retire_display();
 
         let tokens = {
@@ -894,7 +1167,7 @@ impl DeskCore {
         *self.shared.pending_retry.lock().expect("retry") =
             Some(RetryHandle { token: token.clone(), finished: Arc::clone(&finished) });
 
-        let lane = self.enqueue.clone();
+        let lane = self.slot.clone();
         let timeline = Arc::clone(&self.shared.timeline);
         std::thread::Builder::new()
             .name("snug-desk-retry".to_string())
@@ -1153,8 +1426,18 @@ impl DeskCore {
         }
     }
 
+    /// 对应 C# `Pull`：入队前的 Begin + PlaceAsync + 清 work。
+    pub(crate) fn pull_with(&mut self, window: WindowInfo, transfer: Option<PhoneRecord>) {
+        self.begin(DeskWork::with_label(DeskWorkKind::Placing, window.label()));
+        self.place(window, true, transfer);
+        self.set_state(self.state().with_work(None));
+    }
+
     /// 对应 C# `PlaceAsync`：把窗口放上手机屏（`zoom = false` 用于"询问窗口"）。
-    fn place(&mut self, window: WindowInfo, zoom: bool) {
+    ///
+    /// `transfer` 非空表示这个窗口是从别的屏转移过来的：沿用当时的原始还原坐标
+    /// （C# 的 `transferredRecord with { Window = window.Key }`）。
+    fn place(&mut self, window: WindowInfo, zoom: bool, transfer: Option<PhoneRecord>) {
         let started = self.now();
         let Some(id) = self.ready_display(&format!("放 {}", window.label())) else {
             self.set_state(self.state().with_notice(Some(DeskNotice::ScreenNotReady)));
@@ -1202,21 +1485,34 @@ impl DeskCore {
             .filter(|key| *key != window.key)
             .collect();
 
-        let owed_index = self.left_behind.match_window(&window, look.frame);
-        let record = match owed_index {
-            Some(index) => self.left_behind.entries[index].returned_as(window.key),
-            None => PhoneRecord {
-                window: window.key,
-                app: window.app_name.clone(),
-                label: window.label(),
-                original: self.original_frame(look.frame, id),
-                was_full_screen: look.full_screen,
-                was_minimized: look.minimized,
-                zoom: 0,
-                app_id: window.app_id.clone(),
-                title: Some(window.title.clone()),
-                filled: None,
-            },
+        let (owed_index, record) = {
+            let book = self.left_behind();
+            // 跨屏转移时不查 left-behind：记录直接沿用来源屏的。
+            let owed_index =
+                if transfer.is_some() { None } else { book.match_window(&window, look.frame) };
+            let record = match transfer {
+                Some(mut record) => {
+                    record.window = window.key;
+                    self.log(format!("{} 直接跨屏转移，沿用原始还原坐标", window.label()));
+                    record
+                }
+                None => match owed_index {
+                    Some(index) => book.entries[index].returned_as(window.key),
+                    None => PhoneRecord {
+                        window: window.key,
+                        app: window.app_name.clone(),
+                        label: window.label(),
+                        original: self.original_frame(look.frame, id),
+                        was_full_screen: look.full_screen,
+                        was_minimized: look.minimized,
+                        zoom: 0,
+                        app_id: window.app_id.clone(),
+                        title: Some(window.title.clone()),
+                        filled: None,
+                    },
+                },
+            };
+            (owed_index, record)
         };
 
         let mut next = Placement {
@@ -1233,7 +1529,7 @@ impl DeskCore {
         }
         if let Some(index) = owed_index {
             self.log(format!("{} 带着手机屏上的样子回来了，接着放", window.label()));
-            self.left_behind.remove_at(index);
+            self.left_behind().remove_at(index);
             self.save_left_behind();
         }
         if look.minimized {
@@ -1271,7 +1567,7 @@ impl DeskCore {
         ));
 
         let steps =
-            self.zoom_book.steps_for(window.app_id.as_deref(), self.default_zoom())
+            self.zoom_book().steps_for(window.app_id.as_deref(), self.default_zoom())
                 - next.record.zoom;
         if !zoom || steps == 0 {
             return;
@@ -1380,8 +1676,11 @@ impl DeskCore {
             }
         }
         let now = now_ms();
-        self.left_behind.add(LeftBehindEntry::new(record, now));
-        self.left_behind.prune(now);
+        {
+            let mut book = self.left_behind();
+            book.add(LeftBehindEntry::new(record, now));
+            book.prune(now);
+        }
         self.save_left_behind();
         self.settle_record();
     }
@@ -1469,14 +1768,16 @@ impl DeskCore {
 
     /// 对应 C# `SaveLeftBehind`。
     fn save_left_behind(&self) {
-        if let Err(error) = self.shared.left_behind_file.save(&self.left_behind) {
+        let book = self.left_behind();
+        if let Err(error) = self.shared.books.left_behind_file.save(&book) {
             self.error(format!("left-behind.json 保存失败：{error}"));
         }
     }
 
     /// 对应 C# `SaveZoomBook`。
     fn save_zoom_book(&self) {
-        if let Err(error) = self.shared.zoom_file.save(&self.zoom_book) {
+        let book = self.zoom_book();
+        if let Err(error) = self.shared.books.zoom_file.save(&book) {
             self.error(format!("zoom.json 保存失败：{error}"));
         }
     }
@@ -1526,7 +1827,7 @@ impl DeskCore {
         }
         self.recheck_generation += 1;
         let generation = self.recheck_generation;
-        let lane = self.enqueue.clone();
+        let lane = self.slot.clone();
         let timeline = Arc::clone(&self.shared.timeline);
         std::thread::Builder::new()
             .name("snug-desk-recheck".to_string())
@@ -1618,7 +1919,7 @@ impl DeskCore {
                     self.state()
                         .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, appeared.label()))),
                 );
-                self.place(appeared, true);
+                self.place(appeared, true, None);
                 return;
             }
             if !self.shared.apps.is_running(pid)
@@ -1641,7 +1942,7 @@ impl DeskCore {
     }
 
     /// 对应 C# `Quit` 里排进队列的那段。
-    fn quit_app(&mut self, app: RunningApp) {
+    pub(crate) fn quit_app(&mut self, app: RunningApp) {
         let pid = app.pid;
         self.set_state(self.state().with_notice(None).with_quitting_added(pid));
 
@@ -1724,7 +2025,7 @@ impl DeskCore {
         let shared = Arc::clone(&self.shared);
         let context = WatchContext {
             shared: Arc::clone(&shared),
-            lane: self.enqueue.clone(),
+            lane: self.slot.clone(),
             token: token.clone(),
         };
         std::thread::Builder::new()
@@ -1775,7 +2076,7 @@ impl DeskCore {
 
     /// 对应 C# `CheckReturns`。
     pub(crate) fn check_returns(&mut self) {
-        if (self.replaced.is_none() && self.left_behind.entries.is_empty())
+        if (self.replaced.is_none() && self.left_behind().entries.is_empty())
             || self.state().work.is_some()
             || self.checking_returns
         {
@@ -1828,7 +2129,7 @@ impl DeskCore {
                 .with_notice(None)
                 .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, window.label()))),
         );
-        self.place(window, true);
+        self.place(window, true, None);
         if matches!(
             self.state().work.as_ref().map(|work| work.kind),
             Some(DeskWorkKind::Placing) | Some(DeskWorkKind::Zooming)
@@ -1840,7 +2141,7 @@ impl DeskCore {
 
     /// 对应 C# `TakeBackReturnedAsync`。
     fn take_back_returned(&mut self) {
-        self.left_behind.prune(now_ms());
+        self.left_behind().prune(now_ms());
         self.repay_app_wide_zoom();
 
         let mut skip: HashSet<WindowKey> = HashSet::new();
@@ -1853,11 +2154,14 @@ impl DeskCore {
 
         // C# 用 `Distinct()`：保留首次出现的顺序。
         let mut app_ids: Vec<String> = Vec::new();
-        for entry in &self.left_behind.entries {
-            if let Some(app_id) = entry.record.app_id.clone()
-                && !app_ids.contains(&app_id)
-            {
-                app_ids.push(app_id);
+        {
+            let book = self.left_behind();
+            for entry in &book.entries {
+                if let Some(app_id) = entry.record.app_id.clone()
+                    && !app_ids.contains(&app_id)
+                {
+                    app_ids.push(app_id);
+                }
             }
         }
 
@@ -1869,7 +2173,7 @@ impl DeskCore {
                     .frames(pid)
                     .into_iter()
                     .filter(|(key, frame)| {
-                        !skip.contains(key) && self.left_behind.awaits(&app_id, frame.size())
+                        !skip.contains(key) && self.left_behind().awaits(&app_id, frame.size())
                     })
                     .collect();
                 if candidates.is_empty() {
@@ -1879,7 +2183,7 @@ impl DeskCore {
                     let Some(frame) = candidates.get(&window.key).copied() else {
                         continue;
                     };
-                    let Some(index) = self.left_behind.match_window(&window, frame) else {
+                    let Some(index) = self.left_behind().match_window(&window, frame) else {
                         continue;
                     };
                     self.take_back(index, window, frame);
@@ -1905,18 +2209,18 @@ impl DeskCore {
             }
         }
 
-        let owed = self.left_behind.entries[index].returned_as(window.key);
+        let owed = self.left_behind().entries[index].returned_as(window.key);
         if owed.zoom != 0 {
             if !self.shared.windows.zoom(window.key, -owed.zoom) {
                 return;
             }
-            self.left_behind.entries[index].record.zoom = 0;
+            self.left_behind().entries[index].record.zoom = 0;
             self.save_left_behind();
         }
         if self.shared.windows.move_window(window.key, owed.original).is_none() {
             return;
         }
-        self.left_behind.remove_at(index);
+        self.left_behind().remove_at(index);
         self.save_left_behind();
         self.log(format!(
             "{} 带着手机屏上的样子回来了，放回原位 {}",
@@ -1928,8 +2232,9 @@ impl DeskCore {
     /// 对应 C# `RepayAppWideZoomAsync`。
     fn repay_app_wide_zoom(&mut self) {
         let mut changed = false;
-        for index in 0..self.left_behind.entries.len() {
-            let entry = self.left_behind.entries[index].clone();
+        let count = self.left_behind().entries.len();
+        for index in 0..count {
+            let entry = self.left_behind().entries[index].clone();
             if entry.scope() != Some(ZoomScope::App) || entry.record.zoom == 0 {
                 continue;
             }
@@ -1939,19 +2244,77 @@ impl DeskCore {
             {
                 continue;
             }
-            self.left_behind.entries[index].record.zoom = 0;
+            self.left_behind().entries[index].record.zoom = 0;
             changed = true;
         }
         if changed {
             self.save_left_behind();
         }
     }
+
+    /// 对应 C# `DetachPlacementForTransfer`：摘出还原记录、清摆放状态、回到资源库。
+    pub(crate) fn detach_placement_for_transfer(&mut self) -> Option<PhoneRecord> {
+        let placement = self.placement.as_ref()?;
+        let transferred = placement.record.clone();
+        self.set_placement(None);
+        self.set_state(self.state().with_list_visible(true));
+        Some(transferred)
+    }
+
+    /// 对应 C# `ReturnWindowIfPlacedAsync`：铺着的窗口属于这个 pid 就先还回原位再对宽度。
+    pub(crate) fn return_window_if_placed(&mut self, pid: i32) {
+        let Some(placement) = self.placement.clone() else {
+            return;
+        };
+        if placement.window.key.pid != pid {
+            return;
+        }
+        self.return_to_original(&placement, true);
+        self.match_width();
+    }
+
+    /// 对应 C# `EvacuateComputerScreenWindowsAsync`：电脑副屏撤掉前把落在它矩形内的窗口
+    /// 搬到主屏居中（`w`/`h` 取 `min(窗口, 主屏)`，坐标再居中夹到 ≥0）。
+    pub(crate) fn evacuate_computer_screen_windows(&mut self) {
+        if self.behavior() != ScreenBehavior::Computer {
+            return;
+        }
+        let Some(display) = self.display else {
+            return;
+        };
+        let Some(bounds) = self.shared.displays.bounds_of(display.id) else {
+            return;
+        };
+        let Some(main) = self.shared.displays.main_area() else {
+            return;
+        };
+        for (key, frame) in self.shared.windows.snapshot() {
+            if !bounds.contains(frame.center()) {
+                continue;
+            }
+            let w = frame.width.min(main.width);
+            let h = frame.height.min(main.height);
+            let x = main.x + (main.width - w).max(0.0) / 2.0;
+            let y = main.y + (main.height - h).max(0.0) / 2.0;
+            self.shared.windows.move_window(key, Rect::new(x, y, w, h));
+        }
+    }
+
+    /// 对应 C# `Quit` 里"先在别的屏上把这个 App 的窗口还回去"的前置判断。
+    pub(crate) fn placed_pid(&self) -> Option<i32> {
+        self.placement.as_ref().map(|placement| placement.window.key.pid)
+    }
+
+    /// 对应 C# `PlacedWindowKey`。
+    pub(crate) fn placed_window_key(&self) -> Option<WindowKey> {
+        self.placement.as_ref().map(|placement| placement.window.key)
+    }
 }
 
 /// watch 线程手里的上下文：平台接口、把动作排回桌面的队列、取消令牌。
 struct WatchContext {
     shared: Arc<DeskShared>,
-    lane: SerialLane<DeskCore>,
+    lane: DeskSlot,
     token: CancelToken,
 }
 
@@ -2001,7 +2364,7 @@ impl WatchContext {
                 .with_notice(None)
                 .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, label)));
             core.set_state(state);
-            core.place(window, false);
+            core.place(window, false, None);
             core.set_state(core.state().with_work(None));
         });
     }

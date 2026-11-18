@@ -5,9 +5,10 @@
 #![allow(dead_code)] // 测试脚手架：假平台按 C# 接口全实现，分块移植时逐步用到
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::desk::engine::{Desk, DeskEvents, DeskOptions};
 use crate::desk::model::{DeskGone, DeskState};
@@ -15,9 +16,11 @@ use crate::desk::services::{
     AppControl, CancelToken, PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException, Timeline,
     WindowControl, WindowLook,
 };
+use crate::desk::set::{DeskSet, DeskSetEvents, DeskSetOptions};
 use crate::geometry::{Rect, Size};
 use crate::paths::Paths;
-use crate::screen_fit::ScreenFit;
+use crate::screen_fit::{PhoneSpec, ScreenFit};
+use crate::screen_plan::{ScreenBehavior, ScreenWish};
 use crate::windows::{AppInfo, DisplayModeInfo, OtherDisplay, WindowInfo, WindowKey};
 
 static NEXT_HARNESS: AtomicUsize = AtomicUsize::new(0);
@@ -628,6 +631,251 @@ impl Harness {
 }
 
 impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 多屏版假显示器：每块屏一个独立 id，并记录「两次 `create` 有没有重叠」。
+///
+/// 单屏的 [`FakeDisplays`] 只认一个活动屏（现有单屏测试靠它），多屏测试用这个。
+pub struct FakeMultiDisplays {
+    next_id: AtomicU32,
+    screens: Mutex<HashMap<u32, MultiScreen>>,
+    create_calls: Mutex<Vec<u32>>,
+    in_create: AtomicBool,
+    overlapped: AtomicBool,
+    create_delay_micros: AtomicU64,
+    fail_creates: AtomicUsize,
+    main: Rect,
+}
+
+struct MultiScreen {
+    fit: ScreenFit,
+    width: i32,
+    bounds: Rect,
+}
+
+impl Default for FakeMultiDisplays {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU32::new(2001),
+            screens: Mutex::new(HashMap::new()),
+            create_calls: Mutex::new(Vec::new()),
+            in_create: AtomicBool::new(false),
+            overlapped: AtomicBool::new(false),
+            create_delay_micros: AtomicU64::new(0),
+            fail_creates: AtomicUsize::new(0),
+            main: Rect::new(0.0, 0.0, 1920.0, 1040.0),
+        }
+    }
+}
+
+impl FakeMultiDisplays {
+    pub fn fail_creates(&self, times: usize) {
+        self.fail_creates.store(times, Ordering::SeqCst);
+    }
+
+    /// 让每次建屏在 `create` 里停一会儿，好暴露"两个 desk 同时建屏"。
+    pub fn slow_creates(&self, micros: u64) {
+        self.create_delay_micros.store(micros, Ordering::SeqCst);
+    }
+
+    pub fn create_calls(&self) -> Vec<u32> {
+        self.create_calls.lock().expect("create calls").clone()
+    }
+
+    /// 是否观察到两次 `create` 重叠（共享队列生效时应当永远为 false）。
+    pub fn overlap_detected(&self) -> bool {
+        self.overlapped.load(Ordering::SeqCst)
+    }
+
+    pub fn screen_count(&self) -> usize {
+        self.screens.lock().expect("screens").len()
+    }
+
+    fn screen_bounds(&self, fit: &ScreenFit) -> Rect {
+        let index = self.screens.lock().expect("screens").len() as f64;
+        let width = fit.base_width() as f64;
+        let size: Size = fit.size(fit.base_width());
+        // 虚拟屏互相不重叠地排在主屏右边。
+        Rect::new(2560.0 + index * 1600.0, 0.0, width * 2.0, size.height * 2.0)
+    }
+}
+
+impl PhoneDisplays for FakeMultiDisplays {
+    fn create(&self, fit: ScreenFit) -> Result<u32, PhoneScreenException> {
+        if self.in_create.swap(true, Ordering::SeqCst) {
+            self.overlapped.store(true, Ordering::SeqCst);
+        }
+        let delay = self.create_delay_micros.load(Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_micros(delay));
+        }
+        if self.fail_creates.load(Ordering::SeqCst) > 0 {
+            self.fail_creates.fetch_sub(1, Ordering::SeqCst);
+            self.in_create.store(false, Ordering::SeqCst);
+            return Err(PhoneScreenException::new(PhoneScreenErrorKind::CreateFailed));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let width = fit.base_width();
+        let bounds = self.screen_bounds(&fit);
+        self.screens
+            .lock()
+            .expect("screens")
+            .insert(id, MultiScreen { fit, width, bounds });
+        self.create_calls.lock().expect("create calls").push(id);
+        self.in_create.store(false, Ordering::SeqCst);
+        Ok(id)
+    }
+
+    fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool {
+        let mut screens = self.screens.lock().expect("screens");
+        let Some(screen) = screens.get_mut(&display_id) else {
+            return false;
+        };
+        screen.width = fit.base_width();
+        screen.fit = fit;
+        true
+    }
+
+    fn fit_of(&self, display_id: u32) -> Option<ScreenFit> {
+        self.screens.lock().expect("screens").get(&display_id).map(|screen| screen.fit.clone())
+    }
+
+    fn retire(&self, display_id: u32) -> bool {
+        self.screens.lock().expect("screens").remove(&display_id).is_some()
+    }
+
+    fn is_online(&self, display_id: u32) -> bool {
+        self.screens.lock().expect("screens").contains_key(&display_id)
+    }
+
+    fn width_of(&self, display_id: u32) -> Option<i32> {
+        self.screens.lock().expect("screens").get(&display_id).map(|screen| screen.width)
+    }
+
+    fn set_width(&self, display_id: u32, width: i32) {
+        if let Some(screen) = self.screens.lock().expect("screens").get_mut(&display_id) {
+            screen.width = width;
+        }
+    }
+
+    fn bounds_of(&self, display_id: u32) -> Option<Rect> {
+        self.screens.lock().expect("screens").get(&display_id).map(|screen| screen.bounds)
+    }
+
+    fn window_area_of(&self, display_id: u32) -> Option<Rect> {
+        let screens = self.screens.lock().expect("screens");
+        let screen = screens.get(&display_id)?;
+        let bar = ScreenFit::home_bar_height(screen.width as f64) * 2.0;
+        Some(Rect::new(
+            screen.bounds.x,
+            screen.bounds.y,
+            screen.bounds.width,
+            screen.bounds.height - bar,
+        ))
+    }
+
+    fn main_area(&self) -> Option<Rect> {
+        Some(self.main)
+    }
+
+    fn other_displays(&self) -> Vec<OtherDisplay> {
+        Vec::new()
+    }
+
+    fn set_mode(&self, _display_id: u32, _mode: DisplayModeInfo, _permanently: bool) {}
+}
+
+/// 多屏测试脚手架：一套假平台 + 临时目录 + 一个 [`DeskSet`]。
+pub struct DeskSetHarness {
+    pub set: DeskSet,
+    pub displays: Arc<FakeMultiDisplays>,
+    pub windows: Arc<FakeWindows>,
+    pub apps: Arc<FakeApps>,
+    pub timeline: Arc<FakeTimeline>,
+    pub paths: Paths,
+    pub dir: PathBuf,
+    state_changes: Arc<AtomicUsize>,
+}
+
+impl DeskSetHarness {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "snug-desk-set-{}-{}",
+            std::process::id(),
+            NEXT_HARNESS.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths::with_data_dir(dir.clone());
+
+        let displays = Arc::new(FakeMultiDisplays::default());
+        let windows = Arc::new(FakeWindows::default());
+        let apps = Arc::new(FakeApps::default());
+        let timeline = Arc::new(FakeTimeline::default());
+
+        let state_changes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&state_changes);
+        let events = DeskSetEvents {
+            state_changed: Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..DeskSetEvents::default()
+        };
+        let set = DeskSet::new(
+            Arc::clone(&displays) as Arc<dyn PhoneDisplays>,
+            Arc::clone(&windows) as Arc<dyn WindowControl>,
+            Arc::clone(&apps) as Arc<dyn AppControl>,
+            &paths,
+            DeskSetOptions {
+                timeline: Some(Arc::clone(&timeline) as Arc<dyn Timeline>),
+                events,
+                ..DeskSetOptions::default()
+            },
+        );
+        Self { set, displays, windows, apps, timeline, paths, dir, state_changes }
+    }
+
+    /// 一块触屏愿望（标准手机屏）。
+    pub fn wish(&self, id: &str) -> ScreenWish {
+        ScreenWish {
+            id: id.to_string(),
+            name: id.to_string(),
+            device: crate::phone_models::PhoneChoice::standard(),
+            orientation: crate::phone_models::ScreenOrientation::Portrait,
+            fit: ScreenFit::standard(),
+            behavior: ScreenBehavior::TouchScreen,
+        }
+    }
+
+    /// 一块带指定比例的触屏愿望。
+    pub fn wish_with_fit(&self, id: &str, fit: ScreenFit) -> ScreenWish {
+        ScreenWish { fit, ..self.wish(id) }
+    }
+
+    /// 一块电脑副屏愿望（1080p 横屏）。
+    pub fn computer_wish(&self, id: &str) -> ScreenWish {
+        ScreenWish {
+            id: id.to_string(),
+            name: id.to_string(),
+            device: crate::phone_models::PhoneChoice::standard_computer(),
+            orientation: crate::phone_models::ScreenOrientation::Landscape,
+            fit: ScreenFit::from_device(
+                &PhoneSpec::new(1080.0, 1920.0, None),
+                crate::phone_models::DeviceKind::Computer,
+                crate::phone_models::ScreenOrientation::Landscape,
+            ),
+            behavior: ScreenBehavior::Computer,
+        }
+    }
+
+    pub fn state_changes(&self) -> usize {
+        self.state_changes.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for DeskSetHarness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }

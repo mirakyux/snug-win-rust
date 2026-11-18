@@ -58,6 +58,22 @@ impl Paths {
         self.data_dir.join("phone-screen.json")
     }
 
+    /// 每块屏的还原记录文件（C# `SnugPaths.RecordFileForScreen`）。
+    ///
+    /// legacy 单屏（或没给 id）继续用 `phone-screen.json`，其余屏各用 `screen-<id>.json`，
+    /// 这样多屏并存时互不覆盖。
+    pub fn record_file_for_screen(&self, screen_id: Option<&str>) -> PathBuf {
+        match screen_id {
+            Some(id)
+                if !id.trim().is_empty()
+                    && !id.eq_ignore_ascii_case(crate::config::ScreenConfig::LEGACY_PHONE_ID) =>
+            {
+                self.data_dir.join(format!("screen-{id}.json"))
+            }
+            _ => self.phone_record_file(),
+        }
+    }
+
     pub fn zoom_book_file(&self) -> PathBuf {
         self.data_dir.join("zoom.json")
     }
@@ -117,6 +133,27 @@ mod tests {
         assert_eq!(
             p.owned_displays_file(),
             Path::new(r"C:\Users\test\AppData\Local\SnugWin\owned-displays.json")
+        );
+    }
+
+    #[test]
+    fn record_file_per_screen_falls_back_to_the_legacy_name() {
+        let p = sample();
+        // legacy 屏（大小写不敏感）与空 id 都落到单屏那份。
+        assert_eq!(
+            p.record_file_for_screen(Some(crate::config::ScreenConfig::LEGACY_PHONE_ID)),
+            p.phone_record_file()
+        );
+        assert_eq!(
+            p.record_file_for_screen(Some("00000000-0000-0000-0000-000000000001".to_uppercase().as_str())),
+            p.phone_record_file()
+        );
+        assert_eq!(p.record_file_for_screen(None), p.phone_record_file());
+        assert_eq!(p.record_file_for_screen(Some("   ")), p.phone_record_file());
+        // 其余屏各写各的文件。
+        assert_eq!(
+            p.record_file_for_screen(Some("abc-123")),
+            Path::new(r"C:\Users\test\AppData\Local\SnugWin\screen-abc-123.json")
         );
     }
 

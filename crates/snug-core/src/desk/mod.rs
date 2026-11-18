@@ -9,6 +9,7 @@
 mod engine;
 pub mod lane;
 pub mod model;
+mod set;
 pub mod services;
 
 #[cfg(test)]
@@ -18,6 +19,7 @@ pub use engine::{Desk, DeskEvents, DeskOptions, MINIMUM_LIFETIME};
 pub use model::{
     DeskGone, DeskNotice, DeskState, DeskWork, DeskWorkKind, PhoneScreenPhase, PlacedWindow,
 };
+pub use set::{DeskSet, DeskSetEvents, DeskSetOptions};
 pub use services::{
     AppControl, CancelToken, PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException,
     SystemTimeline, Timeline, WindowControl, WindowLook,
