@@ -7,6 +7,10 @@
 //! 容差、1 像素）最容易“自己写测试自己过”——测试和实现是同一个人的两个假设。
 //! 跟原版 C# 对拍才能证明移植没走样。
 //!
+//! v1.3 起 `ScreenFit` 多了设备种类与方向：`screen_fit.tsv` 里除原有的
+//! FIT/SIZE/PIXEL/RATIO/FITTO/BAR 记录外，还有 DEVICE/DEVSIZE/DEVPIXEL/DEVDI/
+//! PREVIEW 五组（手机竖/横、平板竖/横、电脑横/竖）。老数据缺这五组时只跳过它们。
+//!
 //! 生成命令（在仓库根目录，需要 .NET 10 SDK）：
 //!
 //! ```text
@@ -23,7 +27,7 @@ use std::path::PathBuf;
 
 use snug_core::crop::{self, CropHandle};
 use snug_core::screen_fit::{PhoneSpec, ScreenFit};
-use snug_core::{Point, Rect, Size};
+use snug_core::{DeviceKind, Point, Rect, ScreenOrientation, Size};
 use snug_win::placement;
 
 const EPS: f64 = 1e-6;
@@ -92,10 +96,41 @@ fn crop_handle(index: i64) -> CropHandle {
     }
 }
 
+/// `DEVICE` / `DEVSIZE` / `DEVPIXEL` / `DEVDI` 记录共用的前 7 个字段：
+/// `TAG, 短边, 长边, points, notch, kind, orientation`。
+fn device_fit(fields: &[&str]) -> ScreenFit {
+    let spec = PhoneSpec::new(number(fields[1]), number(fields[2]), optional_number(fields[3]))
+        .with_notch(optional_number(fields[4]));
+    ScreenFit::from_device(&spec, device_kind(fields[5]), orientation_of(fields[6]))
+}
+
+fn device_kind(field: &str) -> DeviceKind {
+    match field {
+        "phone" => DeviceKind::Phone,
+        "tablet" => DeviceKind::Tablet,
+        "computer" => DeviceKind::Computer,
+        other => panic!("未知的 DeviceKind：{other:?}"),
+    }
+}
+
+fn orientation_of(field: &str) -> ScreenOrientation {
+    match field {
+        "portrait" => ScreenOrientation::Portrait,
+        "landscape" => ScreenOrientation::Landscape,
+        other => panic!("未知的 ScreenOrientation：{other:?}"),
+    }
+}
+
+fn optional_number(field: &str) -> Option<f64> {
+    if field.is_empty() { None } else { Some(number(field)) }
+}
+
 #[test]
 fn screen_fit_matches_the_csharp_reference() {
     let Some(text) = reference_file("screen_fit.tsv") else { return };
     let mut checked = 0usize;
+    let mut device_rows = 0usize;
+    let mut preview_rows = 0usize;
 
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -168,12 +203,76 @@ fn screen_fit_matches_the_csharp_reference() {
                     "home_bar_height",
                 );
             }
+            // ---- v1.3：设备种类 × 方向（FromDevice） ----
+            "DEVICE" => {
+                let fit = device_fit(&fields);
+                close(fit.ratio(), number(fields[7]), "ratio");
+                assert_eq!(fit.base_width(), integer(fields[8]) as i32, "base_width");
+                let widths = fit.widths().iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+                assert_eq!(widths, fields[9], "widths {line}");
+                let mut reversed = fit.widths().to_vec();
+                reversed.reverse();
+                assert_eq!(fit.registration_order(), reversed, "RegistrationOrder 是 Widths 倒序");
+                device_rows += 1;
+            }
+            "DEVSIZE" => {
+                let fit = device_fit(&fields);
+                let size = fit.size(integer(fields[7]) as i32);
+                close(size.width, number(fields[8]), "size.width");
+                close(size.height, number(fields[9]), "size.height");
+                device_rows += 1;
+            }
+            "DEVPIXEL" => {
+                let fit = device_fit(&fields);
+                let pixels = fit.pixel_size(integer(fields[7]) as i32);
+                assert_eq!(
+                    pixels,
+                    (integer(fields[8]) as i32, integer(fields[9]) as i32),
+                    "pixel_size({})",
+                    fields[7]
+                );
+                device_rows += 1;
+            }
+            "DEVDI" => {
+                let fit = device_fit(&fields);
+                let dpi = fit.target_dpi_percent(integer(fields[7]) as i32);
+                assert_eq!(dpi, integer(fields[8]) as i32, "target_dpi_percent({})", fields[7]);
+                device_rows += 1;
+            }
+            "PREVIEW" => {
+                // PREVIEW 记录不带 notch（预览只看比例与基准宽）。
+                let spec = PhoneSpec::new(
+                    number(fields[3]),
+                    number(fields[4]),
+                    optional_number(fields[5]),
+                );
+                let fit =
+                    ScreenFit::from_device(&spec, device_kind(fields[6]), orientation_of(fields[7]));
+                let (design_w, design_h, scale) = ScreenFit::compute_preview_layout(
+                    Size::new(number(fields[1]), number(fields[2])),
+                    &fit,
+                );
+                close(design_w, number(fields[8]), "preview.designWidth");
+                close(design_h, number(fields[9]), "preview.designHeight");
+                close(scale, number(fields[10]), "preview.scale");
+                preview_rows += 1;
+            }
             other => panic!("未知记录：{other}"),
         }
         checked += 1;
     }
 
     assert!(checked > 50, "对拍记录太少：{checked}");
+    // 老 TSV（v1.2 生成）里没有 DEVICE/PREVIEW 记录，此时这两条为 0、其余照旧；
+    // 重新生成后必须覆盖到全部 6 种 kind×orientation 组合，数量不对说明生成器被改瘦了。
+    assert!(
+        device_rows == 0 || device_rows >= 60,
+        "DEVICE 组记录太少：{device_rows}（6 种 kind×orientation × 10 款设备）"
+    );
+    assert!(
+        preview_rows == 0 || preview_rows >= 90,
+        "PREVIEW 组记录太少：{preview_rows}"
+    );
 }
 
 #[test]

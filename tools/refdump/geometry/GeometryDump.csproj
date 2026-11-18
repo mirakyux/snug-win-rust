@@ -36,10 +36,15 @@
     <Compile Include="Program.cs" />
     <Compile Include="NamespaceAnchor.cs" />
 
-    <!-- 参考版源码（只读） -->
+    <!-- 参考版源码（只读）。
+         Geometry / CropGeometry / Win32 / WindowPlacementHelper 仍取 1.2.0：
+         前两个 1.3.0 与 1.2.0 完全相同；Win32 与 WindowPlacementHelper 在 1.3.0
+         有改动（多屏相关），切过去会把无关的 placement 真值一起改掉。
+         ScreenFit 与 PhoneModels 必须取 1.3.0：新增的 DeviceKind/ScreenOrientation
+         与 FromDevice 只在那里。 -->
     <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\Geometry.cs" Link="ref\Geometry.cs" />
-    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\PhoneModels.cs" Link="ref\PhoneModels.cs" />
-    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\ScreenFit.cs" Link="ref\ScreenFit.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win-130\src\SnugWin.Core\PhoneScreen\PhoneModels.cs" Link="ref\PhoneModels.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win-130\src\SnugWin.Core\PhoneScreen\ScreenFit.cs" Link="ref\ScreenFit.cs" />
     <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\CropGeometry.cs" Link="ref\CropGeometry.cs" />
     <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Windows\Native\Win32.cs" Link="ref\Win32.cs" />
     <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.App\Views\WindowPlacementHelper.cs" Link="ref\WindowPlacementHelper.cs" />

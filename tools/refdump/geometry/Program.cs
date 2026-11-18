@@ -1,8 +1,13 @@
 // 几何对拍的真值生成器。
 //
-// 只编译参考版 C# 源码（SnugWin.Core 的 ScreenFit / CropGeometry / Geometry、
+// 只编译参考版 C# 源码（SnugWin.Core 的 ScreenFit / PhoneModels / CropGeometry / Geometry、
 // SnugWin.Windows 的 Win32、SnugWin.App 的 WindowPlacementHelper），不拷贝、不改写。
 // 输出三份 TSV，字段见各处注释；Rust 侧 crates/snug-win/tests/geometry_parity.rs 读它们。
+//
+// v1.3 起 ScreenFit 多了设备种类与方向（手机竖屏/手机横屏/平板/电脑横竖），
+// 所以 screen_fit.tsv 里除原有的 FIT/SIZE/PIXEL/RATIO/FITTO/BAR 记录外，
+// 还追加了 DEVICE/DEVSIZE/DEVPIXEL/DEVDI/PREVIEW 记录（老记录格式一字不改，
+// 老数据仍然能过，重新生成后覆盖面更大）。
 //
 // 用法：dotnet run --project tools/refdump/geometry -c Release -- tools/geometry-ref
 //
@@ -122,6 +127,110 @@ internal static class Program
                   .Append(p).Append('\t').Append(N(c.WinW)).Append('\t').Append(N(c.WinH)).Append('\t')
                   .Append(N(c.AreaW)).Append('\t').Append(N(c.AreaH)).Append('\t')
                   .Append(I(c.Current)).Append('\t').Append(I(result)).Append('\n');
+            }
+        }
+
+        // ---- v1.3：设备种类 × 方向（ScreenFit.FromDevice 的六条分支） ----
+        (int W, int H, int? P, int? Notch)[] devices =
+        [
+            (1320, 2868, 440, null),   // iPhone 17 Pro Max
+            (1206, 2622, 402, null),   // iPhone 17 Pro
+            (750, 1334, 375, null),    // iPhone SE
+            (1668, 2388, 834, null),   // iPad Pro 11
+            (1640, 2360, 820, null),   // iPad Air
+            (1920, 1080, null, null),  // 1080p 副屏
+            (3840, 2160, null, null),  // 4K 副屏（要走 1 倍像素分支）
+            (1080, 1920, null, null),  // 反向 16:9，验证电脑竖屏
+            (1600, 1200, null, 600),   // 4:3 带挖孔，验证扣减宽度
+            (2560, 1600, null, null),  // 2K
+        ];
+        DeviceKind[] kinds = [DeviceKind.Phone, DeviceKind.Tablet, DeviceKind.Computer];
+        ScreenOrientation[] orientations =
+        [
+            ScreenOrientation.Portrait,
+            ScreenOrientation.Landscape,
+        ];
+
+        foreach (var kind in kinds)
+        {
+            foreach (var orientation in orientations)
+            {
+                foreach (var device in devices)
+                {
+                    var spec = new PhoneScreenSpecData(device.W, device.H, device.P, device.Notch);
+                    var fit = ScreenFit.FromDevice(spec, kind, orientation);
+                    string p = device.P?.ToString(Inv) ?? "";
+                    string n = device.Notch?.ToString(Inv) ?? "";
+                    string k = kind.ToString().ToLowerInvariant();
+                    string o = orientation.ToString().ToLowerInvariant();
+
+                    sb.Append("DEVICE\t").Append(I(device.W)).Append('\t').Append(I(device.H))
+                      .Append('\t').Append(p).Append('\t').Append(n).Append('\t')
+                      .Append(k).Append('\t').Append(o).Append('\t')
+                      .Append(N(fit.Ratio)).Append('\t').Append(I(fit.BaseWidth)).Append('\t')
+                      .Append(string.Join(",", fit.Widths.Select(I))).Append('\n');
+
+                    int[] sampleWidths = [fit.Widths[0], fit.BaseWidth, fit.Widths[^1]];
+                    foreach (int width in sampleWidths.Distinct())
+                    {
+                        var size = fit.Size(width);
+                        sb.Append("DEVSIZE\t").Append(I(device.W)).Append('\t').Append(I(device.H))
+                          .Append('\t').Append(p).Append('\t').Append(n).Append('\t')
+                          .Append(k).Append('\t').Append(o).Append('\t').Append(I(width)).Append('\t')
+                          .Append(N(size.Width)).Append('\t').Append(N(size.Height)).Append('\n');
+
+                        var (pw, ph) = fit.PixelSize(width);
+                        sb.Append("DEVPIXEL\t").Append(I(device.W)).Append('\t').Append(I(device.H))
+                          .Append('\t').Append(p).Append('\t').Append(n).Append('\t')
+                          .Append(k).Append('\t').Append(o).Append('\t').Append(I(width)).Append('\t')
+                          .Append(I(pw)).Append('\t').Append(I(ph)).Append('\n');
+
+                        sb.Append("DEVDI\t").Append(I(device.W)).Append('\t').Append(I(device.H))
+                          .Append('\t').Append(p).Append('\t').Append(n).Append('\t')
+                          .Append(k).Append('\t').Append(o).Append('\t').Append(I(width)).Append('\t')
+                          .Append(I(fit.TargetDpiPercent(width))).Append('\n');
+                    }
+                }
+            }
+        }
+
+        // ---- v1.3：桌面预览布局 ComputePreviewLayout ----
+        (double W, double H)[] workAreas =
+        [
+            (1920, 1032),
+            (2048, 1240),
+            (1280, 680),
+            (2560, 1400),
+            (3840, 2080),
+        ];
+        (int W, int H, int? P)[] previewDevices =
+        [
+            (1320, 2868, 440),
+            (1668, 2388, 834),
+            (1920, 1080, null),
+        ];
+        foreach (var work in workAreas)
+        {
+            foreach (var device in previewDevices)
+            {
+                foreach (var kind in kinds)
+                {
+                    foreach (var orientation in orientations)
+                    {
+                        var fit = ScreenFit.FromDevice(
+                            new PhoneScreenSpecData(device.W, device.H, device.P), kind, orientation);
+                        string p = device.P?.ToString(Inv) ?? "";
+                        var (designW, designH, scale) =
+                            ScreenFit.ComputePreviewLayout(new SizeD(work.W, work.H), fit);
+                        sb.Append("PREVIEW\t").Append(N(work.W)).Append('\t').Append(N(work.H))
+                          .Append('\t').Append(I(device.W)).Append('\t').Append(I(device.H))
+                          .Append('\t').Append(p).Append('\t')
+                          .Append(kind.ToString().ToLowerInvariant()).Append('\t')
+                          .Append(orientation.ToString().ToLowerInvariant()).Append('\t')
+                          .Append(N(designW)).Append('\t').Append(N(designH)).Append('\t')
+                          .Append(N(scale)).Append('\n');
+                    }
+                }
             }
         }
 
