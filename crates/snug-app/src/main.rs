@@ -4,6 +4,7 @@
 //! 当前这个二进制已经能：加载配置与机型库、单实例、写日志、把手机屏界面按机型比例显示出来。
 
 mod controller;
+mod library;
 mod logging;
 mod settings;
 mod tray;

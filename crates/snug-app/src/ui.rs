@@ -9,8 +9,11 @@ use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
 
 use crate::controller::Controller;
+use crate::library::{Library, TILE};
 use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsTab, SettingsWindow, StatusInfo};
 use crate::tray::{Tray, TrayCommand};
+
+use snug_core::apps::AppAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeTab {
@@ -24,7 +27,6 @@ pub const WINDOW_TITLE: &str = "Snug 手机屏";
 
 pub struct PhoneHomeApp {
     pub config: AppConfig,
-    pub catalog: Option<PhoneCatalog>,
     pub paths: Paths,
     /// 虚拟屏驱动管道是否就绪（平台层尚未接通时只用于界面提示）。
     pub pipe_ready: bool,
@@ -53,6 +55,8 @@ pub struct PhoneHomeApp {
     pub last_update: Option<snug_win::UpdateCheckResult>,
     /// 正在跑的下载/校验（进度与结果都从这里回来）。
     pub install_rx: Option<std::sync::mpsc::Receiver<InstallOutcome>>,
+    /// App 资源库（后台扫描 + 图标缓存）。
+    pub library: Library,
 }
 
 /// 后台检查更新的结果。
@@ -90,7 +94,6 @@ impl PhoneHomeApp {
         };
         Self {
             config,
-            catalog,
             paths,
             pipe_ready,
             controller,
@@ -107,6 +110,7 @@ impl PhoneHomeApp {
             update_rx: None,
             last_update: None,
             install_rx: None,
+            library: Library::new(),
         }
     }
 
@@ -548,6 +552,11 @@ impl eframe::App for PhoneHomeApp {
         // 设置窗：先执行上一帧排出的动作，再画这一帧（动作会影响配置和控制器状态）。
         self.poll_update_check();
         self.poll_install_update();
+        // 资源库：收扫描结果；手机屏就绪或太久没扫就重扫一次。
+        self.library.poll();
+        if self.library.needs_scan(false) {
+            self.library.start_scan();
+        }
         for action in self.settings.take_actions() {
             self.apply_setting(action);
         }
@@ -598,6 +607,15 @@ impl eframe::App for PhoneHomeApp {
                     if !self.pipe_ready {
                         ui.label(egui::RichText::new("驱动未就绪").color(egui::Color32::LIGHT_RED));
                     }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} App · {} 窗口",
+                            self.library.installed().len(),
+                            self.library.running().len()
+                        ))
+                        .weak()
+                        .small(),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.search)
@@ -638,51 +656,142 @@ impl eframe::App for PhoneHomeApp {
             match self.tab {
                 HomeTab::Running => {
                     ui.add_space(6.0);
-                    if ui
-                        .add_sized(
+                    let windows = self.library.filter_windows(&self.search);
+                    if windows.is_empty() {
+                        ui.add_sized(
                             [ui.available_width(), 60.0],
-                            egui::Button::new(egui::RichText::new("暂无运行中的窗口").size(15.0)),
-                        )
-                        .clicked()
-                    {
-                        // 平台层接上后：拉出 App 列表并放置窗口。
+                            egui::Button::new(egui::RichText::new(if self.search.trim().is_empty() {
+                                "暂无运行中的窗口"
+                            } else {
+                                "没有匹配的窗口"
+                            })
+                            .size(15.0)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("窗口会在这里显示，点一下即铺满手机屏").weak(),
+                        );
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let mut clicked = None;
+                            for window in &windows {
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 44.0],
+                                        egui::Button::new(window.label()),
+                                    )
+                                    .clicked()
+                                {
+                                    clicked = Some(window.clone());
+                                }
+                            }
+                            if let Some(window) = clicked {
+                                crate::info!("资源库：铺开 {}", window.label());
+                                self.controller.pull(window);
+                            }
+                        });
                     }
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("窗口会在这里显示，点一下即铺满手机屏").weak());
                 }
                 HomeTab::All => {
                     ui.add_space(6.0);
-                    let models = self
-                        .catalog
-                        .as_ref()
-                        .map(|c| c.brands.len())
-                        .unwrap_or(0);
-                    if let Some(catalog) = &self.catalog {
-                        let query = snug_core::phone_models::normalize(&self.search);
-                        let brands: Vec<&snug_core::phone_models::Brand> = if query.is_empty() {
-                            catalog.brands.iter().collect()
-                        } else {
-                            catalog
-                                .brands
-                                .iter()
-                                .filter(|b| snug_core::phone_models::normalize(&b.name).contains(&query))
-                                .collect()
-                        };
-                        if brands.is_empty() {
-                            ui.label(egui::RichText::new("没有匹配的机型").weak());
-                        }
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for brand in brands {
-                                ui.collapsing(format!("{}（{} 款）", brand.name, brand.models.len()), |ui| {
-                                    for model in &brand.models {
-                                        ui.label(format!("{}  {}×{}", model.name, model.screen.width, model.screen.height));
-                                    }
-                                });
-                            }
-                        });
-                    } else {
-                        ui.label(format!("机型库未加载（{models}）"));
+                    if self.library.needs_scan(false) {
+                        self.library.start_scan();
                     }
+                    let apps = self.library.filter_installed(&self.search);
+                    if apps.is_empty() {
+                        let hint = if !self.library.scanned_once {
+                            "正在读取已安装的 App…"
+                        } else if self.search.trim().is_empty() {
+                            "没有找到已安装的 App"
+                        } else {
+                            "没有匹配的 App"
+                        };
+                        ui.label(egui::RichText::new(hint).weak());
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut clicked = None;
+                        let columns = ((ui.available_width() / TILE).floor() as usize).max(1);
+                        for row in apps.chunks(columns) {
+                            ui.horizontal(|ui| {
+                                for app in row {
+                                    let texture = self.library.icon(ctx, app);
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(TILE - 4.0, TILE),
+                                        egui::Sense::click(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        10.0,
+                                        if response.hovered() {
+                                            egui::Color32::from_rgb(56, 60, 70)
+                                        } else {
+                                            egui::Color32::from_rgb(40, 43, 50)
+                                        },
+                                    );
+                                    match &texture {
+                                        Some(texture) => {
+                                            let side = TILE * 0.52;
+                                            let icon_rect = egui::Rect::from_center_size(
+                                                egui::pos2(rect.center().x, rect.top() + 8.0 + side / 2.0),
+                                                egui::vec2(side, side),
+                                            );
+                                            ui.painter().image(
+                                                texture.id(),
+                                                icon_rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                        None => {
+                                            // C# 对取不到图标的 App 画占位图（首字母）。
+                                            let initial = app
+                                                .name
+                                                .chars()
+                                                .next()
+                                                .map(|c| c.to_uppercase().to_string())
+                                                .unwrap_or_else(|| "?".to_string());
+                                            ui.painter().text(
+                                                egui::pos2(rect.center().x, rect.top() + 8.0 + TILE * 0.26),
+                                                egui::Align2::CENTER_CENTER,
+                                                initial,
+                                                egui::FontId::proportional(24.0),
+                                                egui::Color32::from_gray(170),
+                                            );
+                                        }
+                                    }
+                                    let text_rect = egui::Rect::from_min_max(
+                                        egui::pos2(rect.left() + 2.0, rect.bottom() - 24.0),
+                                        egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
+                                    );
+                                    ui.painter().text(
+                                        text_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &app.name,
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::from_gray(220),
+                                    );
+                                    if response.clicked() {
+                                        clicked = Some(app.clone());
+                                    }
+                                }
+                            });
+                        }
+                        if let Some(app) = clicked {
+                            match self.library.action_for(&app) {
+                                AppAction::Pull(window) => {
+                                    crate::info!("资源库：铺开 {}", window.label());
+                                    self.controller.pull(window);
+                                }
+                                AppAction::Open(app) => {
+                                    crate::info!("资源库：启动 {}", app.name);
+                                    self.controller.open(app);
+                                }
+                            }
+                        }
+                    });
                 }
             }
         });

@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays};
+use snug_core::windows::{AppInfo, WindowInfo};
 use snug_core::{AppConfig, Paths, Rect, ScreenFit};
 use snug_win::{WinPhoneDisplays, WinWindows};
 
@@ -122,6 +123,16 @@ impl Controller {
     pub fn phone_bounds(&self) -> Option<Rect> {
         let id = self.desk.state().display_id?;
         self.displays.bounds_of(id)
+    }
+
+    /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
+    pub fn pull(&self, window: WindowInfo) {
+        self.desk.pull(window);
+    }
+
+    /// 启动一个 App（资源库里点没在跑的 App）。
+    pub fn open(&self, app: AppInfo) {
+        self.desk.open(app);
     }
 
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
