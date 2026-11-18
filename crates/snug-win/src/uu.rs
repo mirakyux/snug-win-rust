@@ -13,6 +13,15 @@
 //! [`UuSensor::sample`] 只出原始信号，不替上层做判断；合成规则在 core 的
 //! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 为 `None` 表示"读不到"，
 //! 与 `false`（确定没在推流）区分开——C# 读不到时给 `false`，这里按需求给 `None`。
+//!
+//! **有意偏离 C#（A：日志增长不再单独判在场）**：真机实测这台机器的
+//! `GameViewerServer` 空闲时（没人连、`connection_log_controlled_*` 三天没动）
+//! 也会按 ~3.05 秒的周期刷推流日志，每次 148–933 字节；C# 的判定阈值正好是
+//! "两次增长间隔 <= 3.0 秒"，一秒采样把 3.05 秒量化成 3.0 秒就会命中。用同一套
+//! 判定回放 60 秒真实日志，`capture_active` 有 2 个采样点是 `true`——和真机上
+//! "16:25:20 亮、16:25:22 灭"的幽灵会话完全同型。所以现在 `capture_active=true`
+//! 必须另有佐证（活动 TCP 对端 / 可见覆盖窗 / 控制端表非空）才会上报；日志增长
+//! 本身降级为诊断字段 [`UuSignalSet::log_growth`]，留给以后拿真机会话校准。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -48,9 +57,16 @@ pub struct UuSignalSet {
     /// UIA 读到的控制端表；`readable == false` 表示读不到。
     pub controllers: ControllerTable,
     /// `None` = 读不到（进程不在、日志目录读不到），`Some(false)` = 确定没在推流。
+    ///
+    /// 只有 `peer_active` / `client_visible` / 控制端表非空时才会是 `Some(true)`，
+    /// 见模块注释里 A 的说明。
     pub capture_active: Option<bool>,
     /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。
     pub peer_active: bool,
+    /// 日志增长信号（**诊断/校准用**，不参与在场判定）：`None` = 读不到。
+    pub log_growth: Option<bool>,
+    /// 控制端表读不到的原因（可读、或客户端没跑时为 `None`）。
+    pub controller_diagnosis: Option<ControllerDiagnosis>,
     /// GameViewerServer 日志尾部（诊断用），读不到就是 `None`。
     pub log_tail: Option<String>,
 }
@@ -73,7 +89,30 @@ impl UuSignalSet {
             controllers: ControllerTable::unreadable(),
             capture_active: Some(false),
             peer_active: false,
+            log_growth: Some(false),
+            controller_diagnosis: None,
             log_tail: None,
+        }
+    }
+}
+
+/// 控制端表读不到的原因（只用于真机排障日志与诊断字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerDiagnosis {
+    /// 客户端进程在，但没有可见顶层窗口（在托盘里）——C# 同样是直接"读不到"。
+    NoVisibleWindow,
+    /// UIA COM 起不来（`Uia::new` 失败）。
+    ComFailed,
+    /// 有窗口，但 UIA 没读出内容（含遍历超预算、窗口刚好关掉）。
+    UiaUnreadable,
+}
+
+impl ControllerDiagnosis {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NoVisibleWindow => "GameViewer 没有可见顶层窗口（在托盘时属正常）",
+            Self::ComFailed => "UIA COM 初始化失败",
+            Self::UiaUnreadable => "UIA 遍历未读出内容（可能超预算或窗口刚关闭）",
         }
     }
 }
@@ -156,6 +195,17 @@ fn read_i32_le(bytes: &[u8], offset: usize) -> Option<i32> {
 // 日志增长（纯逻辑）
 // ---------------------------------------------------------------------------
 
+/// 文件名是否匹配 `streamer_log_controlled_*_<pid>.slog`
+/// （`Directory.EnumerateFiles` 的通配符语义）。
+///
+/// Windows 上通配符匹配**忽略大小写**，这里同样转小写比较；区分大小写会漏掉
+/// `Streamer_Log_Controlled_...SLOG` 这类变体。
+pub fn is_streamer_log_name(name: &str, server_pid: i32) -> bool {
+    let name = name.to_lowercase();
+    name.starts_with("streamer_log_controlled_")
+        && name.ends_with(&format!("_{server_pid}.slog"))
+}
+
 /// 推流日志的"持续增长"判定（C# `SampleCaptureActive` 里的 Signal B）。
 #[derive(Debug, Default)]
 struct LogGrowth {
@@ -209,8 +259,13 @@ pub trait UuProbe: Send + Sync {
     fn has_visible_window(&self, pid: i32) -> bool;
     /// pid 的所有可见顶层窗口句柄（UIA 用）。
     fn visible_windows(&self, pid: i32) -> Vec<u64>;
-    /// `UiaHelper.ReadGameViewerControllers`；读不到返回 `ControllerTable::unreadable()`。
-    fn controllers(&self, handles: &[u64]) -> ControllerTable;
+    /// `UiaHelper.ReadGameViewerControllers`。
+    ///
+    /// 第二个返回值是"读不到的原因"，只用于诊断日志；可读时给 `None`。
+    fn controllers(
+        &self,
+        handles: &[u64],
+    ) -> (ControllerTable, Option<ControllerDiagnosis>);
     /// TCP 表；`None` = 读不到（不要当成"没有连接"）。
     fn tcp_rows(&self) -> Option<Vec<TcpRow>>;
     /// `ResolveServerLogDir`：按候选目录找存在的那个。
@@ -231,6 +286,8 @@ pub struct UuSensor {
     probe: Box<dyn UuProbe>,
     manual: AtomicBool,
     log: Mutex<LogGrowth>,
+    /// 上次记过的控制端诊断（用来做"状态变化才记一条"）。
+    last_diagnosis: Mutex<Option<ControllerDiagnosis>>,
 }
 
 impl UuSensor {
@@ -241,7 +298,12 @@ impl UuSensor {
 
     /// 换一套探测实现（测试用）。
     pub fn with_probe(probe: Box<dyn UuProbe>) -> Self {
-        Self { probe, manual: AtomicBool::new(false), log: Mutex::new(LogGrowth::default()) }
+        Self {
+            probe,
+            manual: AtomicBool::new(false),
+            log: Mutex::new(LogGrowth::default()),
+            last_diagnosis: Mutex::new(None),
+        }
     }
 
     /// C# `ManualOverride`：不管 UU 连没连都当作"在远程"。
@@ -264,6 +326,8 @@ impl UuSensor {
                 controllers: ControllerTable::from_names(["手动开启 (Phone)"]),
                 capture_active: Some(true),
                 peer_active: false,
+                log_growth: None,
+                controller_diagnosis: None,
                 log_tail: None,
             };
         }
@@ -273,17 +337,20 @@ impl UuSensor {
 
         let client_visible = server_pid.is_some_and(|pid| self.probe.has_visible_window(pid));
 
-        let controllers = match client_pid {
+        let (controllers, controller_diagnosis) = match client_pid {
             Some(pid) => {
                 let handles = self.probe.visible_windows(pid);
                 if handles.is_empty() {
-                    ControllerTable::unreadable()
+                    // C# 同样：客户端没有可见窗口就直接 Unreadable，不去读 UIA。
+                    (ControllerTable::unreadable(), Some(ControllerDiagnosis::NoVisibleWindow))
                 } else {
                     self.probe.controllers(&handles)
                 }
             }
-            None => ControllerTable::unreadable(),
+            // 客户端没跑不算"读不到"，不记诊断。
+            None => (ControllerTable::unreadable(), None),
         };
+        self.note_controller_diagnosis(controllers.readable, controller_diagnosis);
 
         let peer_active = server_pid
             .and_then(|pid| self.probe.tcp_rows().map(|rows| has_active_peer(&rows, pid)))
@@ -300,7 +367,17 @@ impl UuSensor {
             self.probe.read_tail(path, LOG_TAIL_BYTES)
         });
 
-        let capture_active = self.capture_active(server_pid, peer_active, log_files.as_deref(), now);
+        let log_growth = self.log_signal(server_pid, log_files.as_deref(), now);
+
+        // 有意偏离 C#（见模块注释 A）：日志增长只能当"弱信号"，必须另有佐证。
+        let corroborated =
+            peer_active || client_visible || !controllers.names.is_empty();
+        let capture_active = match (peer_active, log_growth) {
+            // C# 先看 TCP 对端；对端在就直接算在推流。
+            (true, _) => Some(true),
+            (false, None) => None,
+            (false, Some(growing)) => Some(growing && corroborated),
+        };
 
         UuSignalSet {
             client_running: client_pid.is_some(),
@@ -308,18 +385,43 @@ impl UuSensor {
             controllers,
             capture_active,
             peer_active,
+            log_growth,
+            controller_diagnosis,
             log_tail,
         }
     }
 
-    /// C# `SampleCaptureActive`：对端优先，其次日志持续增长。
+    /// 控制端诊断只在**状态变化**时记一条，避免一秒一条刷爆日志。
+    fn note_controller_diagnosis(
+        &self,
+        readable: bool,
+        diagnosis: Option<ControllerDiagnosis>,
+    ) {
+        let mut last = self.last_diagnosis.lock().unwrap();
+        if *last == diagnosis {
+            return;
+        }
+        let previous = std::mem::replace(&mut *last, diagnosis);
+        match diagnosis {
+            Some(reason) => crate::warn(&format!(
+                "uu: 控制端表读不到：{}",
+                reason.describe()
+            )),
+            // 从"读不到"恢复成可读才值得记；客户端退出导致的 None 不记。
+            None if readable && previous.is_some() => {
+                crate::warn("uu: 控制端表恢复可读")
+            }
+            None => {}
+        }
+    }
+
+    /// 日志增长信号（C# `SampleCaptureActive` 的 Signal B）。
     ///
-    /// 与 C# 的差异：日志读不到时 C# 给 `false`，这里给 `None`（"不可读"），
-    /// 由上层决定要不要当成没在推流。
-    fn capture_active(
+    /// 与 C# 的差异：日志读不到时 C# 给 `false`，这里给 `None`（"不可读"）。
+    /// 注意它现在**只是诊断/校准字段**，不再单独决定 `capture_active`。
+    fn log_signal(
         &self,
         server_pid: Option<i32>,
-        peer_active: bool,
         log_files: Option<&[(String, u64)]>,
         now: f64,
     ) -> Option<bool> {
@@ -328,9 +430,6 @@ impl UuSensor {
             *self.log.lock().unwrap() = LogGrowth::default();
             return Some(false);
         };
-        if peer_active {
-            return Some(true);
-        }
         let Some(files) = log_files else {
             return None;
         };
@@ -479,10 +578,20 @@ impl UuProbe for WinProbe {
         search_windows(pid, false)
     }
 
-    fn controllers(&self, handles: &[u64]) -> ControllerTable {
+    fn controllers(&self, handles: &[u64]) -> (ControllerTable, Option<ControllerDiagnosis>) {
         match crate::uia::Uia::new() {
-            Ok(uia) => uia.read_controllers(handles),
-            Err(_) => ControllerTable::unreadable(),
+            Ok(uia) => {
+                let table = uia.read_controllers(handles);
+                if table.readable {
+                    (table, None)
+                } else {
+                    (table, Some(ControllerDiagnosis::UiaUnreadable))
+                }
+            }
+            Err(_) => (
+                ControllerTable::unreadable(),
+                Some(ControllerDiagnosis::ComFailed),
+            ),
         }
     }
 
@@ -550,18 +659,17 @@ impl UuProbe for WinProbe {
 
     fn log_files(&self, dir: &str, server_pid: i32) -> Option<Vec<(String, u64)>> {
         let entries = std::fs::read_dir(dir).ok()?;
-        let suffix = format!("_{server_pid}.slog");
         let mut files = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("streamer_log_controlled_") && name.ends_with(&suffix) {
-                let path = entry.path();
-                if let Ok(metadata) = entry.metadata()
-                    && let Some(text) = path.to_str()
-                {
-                    files.push((text.to_string(), metadata.len()));
-                }
+            if !is_streamer_log_name(&name.to_string_lossy(), server_pid) {
+                continue;
+            }
+            let path = entry.path();
+            if let Ok(metadata) = entry.metadata()
+                && let Some(text) = path.to_str()
+            {
+                files.push((text.to_string(), metadata.len()));
             }
         }
         Some(files)
@@ -654,6 +762,8 @@ mod tests {
         visible: Vec<i32>,
         windows: HashMap<i32, Vec<u64>>,
         controllers: Option<ControllerTable>,
+        /// `controllers` 读不到时报告的原因；`None` 时按 `UiaUnreadable` 算。
+        controller_diag: Option<ControllerDiagnosis>,
         tcp: Option<Vec<TcpRow>>,
         dir: Option<String>,
         files: Option<Vec<(String, u64)>>,
@@ -673,8 +783,21 @@ mod tests {
             self.windows.get(&pid).cloned().unwrap_or_default()
         }
 
-        fn controllers(&self, _handles: &[u64]) -> ControllerTable {
-            self.controllers.clone().unwrap_or_else(ControllerTable::unreadable)
+        fn controllers(
+            &self,
+            _handles: &[u64],
+        ) -> (ControllerTable, Option<ControllerDiagnosis>) {
+            match &self.controllers {
+                Some(table) if table.readable => (table.clone(), None),
+                Some(table) => (
+                    table.clone(),
+                    Some(self.controller_diag.unwrap_or(ControllerDiagnosis::UiaUnreadable)),
+                ),
+                None => (
+                    ControllerTable::unreadable(),
+                    Some(self.controller_diag.unwrap_or(ControllerDiagnosis::UiaUnreadable)),
+                ),
+            }
         }
 
         fn tcp_rows(&self) -> Option<Vec<TcpRow>> {
@@ -741,13 +864,32 @@ mod tests {
         let signals = sensor.sample(0.0);
         assert_eq!(signals.controllers.names, vec!["iPhone 15 (Phone)"]);
         assert!(signals.controllers.readable);
+        assert_eq!(signals.controller_diagnosis, None);
 
-        // 没有可见窗口 → 不去读 UIA，直接不可读。
+        // 没有可见窗口 → 不去读 UIA，直接不可读，并给出"在托盘"这一诊断。
         let mut probe = FakeProbe::default();
         probe.pids.insert("GameViewer".into(), 8);
         probe.controllers = Some(ControllerTable::from_names(["不应该被用到"]));
         let sensor = UuSensor::with_probe(Box::new(probe));
-        assert!(!sensor.sample(0.0).controllers.readable);
+        let signals = sensor.sample(0.0);
+        assert!(!signals.controllers.readable);
+        assert_eq!(
+            signals.controller_diagnosis,
+            Some(ControllerDiagnosis::NoVisibleWindow)
+        );
+
+        // 有窗口但 COM 起不来 → 诊断要能区分开。
+        let mut probe = FakeProbe::default();
+        probe.pids.insert("GameViewer".into(), 8);
+        probe.windows.insert(8, vec![100]);
+        probe.controller_diag = Some(ControllerDiagnosis::ComFailed);
+        let sensor = UuSensor::with_probe(Box::new(probe));
+        let signals = sensor.sample(0.0);
+        assert!(!signals.controllers.readable);
+        assert_eq!(
+            signals.controller_diagnosis,
+            Some(ControllerDiagnosis::ComFailed)
+        );
     }
 
     #[test]
@@ -768,22 +910,80 @@ mod tests {
     }
 
     #[test]
-    fn capture_turns_on_after_continuous_log_growth_and_reads_tail() {
+    fn idle_log_growth_is_recorded_but_never_presence() {
         let bytes = std::sync::Arc::new(Mutex::new(100u64));
         let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
 
-        assert_eq!(sensor.sample(0.0).capture_active, Some(false), "第一次只建基线");
+        assert_eq!(sensor.sample(0.0).log_growth, Some(false), "第一次只建基线");
         *bytes.lock().unwrap() = 200;
-        assert_eq!(sensor.sample(1.0).capture_active, Some(false), "第一次增长还不够");
+        assert_eq!(sensor.sample(1.0).log_growth, Some(false), "第一次增长还不够");
         *bytes.lock().unwrap() = 300;
-        assert_eq!(sensor.sample(2.0).capture_active, Some(true), "3 秒内第二次增长");
+        let signals = sensor.sample(2.0);
+        assert_eq!(signals.log_growth, Some(true), "日志确实在持续增长");
+        // A：日志增长单独不足以判在场（真机空闲就会这样长）。
+        assert_eq!(signals.capture_active, Some(false));
+        assert!(!signals.to_signals().is_present());
         assert_eq!(
             sensor.sample(2.0).log_tail.as_deref(),
             Some("last line\n"),
             "日志尾部原样给上层"
         );
-        assert_eq!(sensor.sample(3.5).capture_active, Some(true), "2 秒内保持");
-        assert_eq!(sensor.sample(4.1).capture_active, Some(false), "超过 2 秒不再保持");
+        // 2 秒后不再"持续"。
+        assert_eq!(sensor.sample(4.1).log_growth, Some(false));
+    }
+
+    #[test]
+    fn idle_log_cadence_does_not_mark_present() {
+        // 用 16:25 那次真机采样到的节奏：~3.05 秒一次、每次 148–933 字节。
+        let bytes = std::sync::Arc::new(Mutex::new(1000u64));
+        let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
+
+        let mut t = 0.0;
+        for delta in [0u64, 148, 933, 500, 819] {
+            *bytes.lock().unwrap() += delta;
+            let signals = sensor.sample(t);
+            assert_eq!(signals.capture_active, Some(false), "t={t} 空闲增长不能算在场");
+            assert!(!signals.to_signals().is_present(), "t={t} 不能误判连入");
+            t += 3.05;
+        }
+        assert_eq!(sensor.sample(t).log_growth, Some(false), "3.05s 间隔不算连续");
+    }
+
+    #[test]
+    fn peer_alone_marks_present_without_log_growth() {
+        let mut probe = FakeProbe::default();
+        probe.pids.insert("GameViewerServer".into(), 7);
+        probe.dir = Some(r"C:\gv\log".into());
+        probe.files = Some(Vec::new()); // 日志没增长
+        probe.tcp = Some(vec![row(
+            MIB_TCP_STATE_ESTAB,
+            0x0100_000A,
+            wire_port(2533),
+            7,
+        )]);
+        let sensor = UuSensor::with_probe(Box::new(probe));
+
+        let signals = sensor.sample(0.0);
+        assert!(signals.peer_active);
+        assert_eq!(signals.log_growth, Some(false));
+        assert_eq!(signals.capture_active, Some(true), "对端是独立佐证");
+        assert!(signals.to_signals().is_present());
+    }
+
+    #[test]
+    fn streamer_log_name_matching_ignores_case() {
+        // C# 的 Directory.EnumerateFiles 在 Windows 上忽略大小写。
+        assert!(is_streamer_log_name(
+            "streamer_log_controlled_20261115185258370_5924.slog",
+            5924
+        ));
+        assert!(is_streamer_log_name(
+            "STREAMER_LOG_CONTROLLED_20261115185258370_5924.SLOG",
+            5924
+        ));
+        assert!(!is_streamer_log_name("streamer_log_controlled_x_999.slog", 5924));
+        assert!(!is_streamer_log_name("connection_log_controlled_x_5924.slog", 5924));
+        assert!(!is_streamer_log_name("streamer_log_controlled_x_5924.slog.bak", 5924));
     }
 
     // 可改文件大小的假探测（用 Arc<Mutex<u64>> 共享）。
@@ -801,8 +1001,14 @@ mod tests {
         fn visible_windows(&self, _pid: i32) -> Vec<u64> {
             Vec::new()
         }
-        fn controllers(&self, _handles: &[u64]) -> ControllerTable {
-            ControllerTable::unreadable()
+        fn controllers(
+            &self,
+            _handles: &[u64],
+        ) -> (ControllerTable, Option<ControllerDiagnosis>) {
+            (
+                ControllerTable::unreadable(),
+                Some(ControllerDiagnosis::UiaUnreadable),
+            )
         }
         fn tcp_rows(&self) -> Option<Vec<TcpRow>> {
             Some(Vec::new())
