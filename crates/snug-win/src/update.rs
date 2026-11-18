@@ -1190,12 +1190,28 @@ mod tests {
     }
 
     fn service_with(http: FakeHttp, create_exe: bool, repo: Option<ReleaseRepo>) -> AppUpdateService<FakeHttp, FakeExtractor> {
+        // 这里的 "1.2.0" 是**测试场景里的旧版本**（配合 `release_json("v1.3.0")`
+        // 验"有新版本"），不是包版本常量——别改成 APP_VERSION，否则那些用例的
+        // "发现更新"前提就没了。要真实版本用 `service_current`。
         AppUpdateService::with_parts(
             http,
             FakeExtractor { create_exe },
             "1.2.0",
             ReleasePackageKind::SelfContained,
             repo,
+            temp_root(),
+            temp_root(),
+        )
+    }
+
+    /// 版本号与生产构造同源的服务实例（只给 `current_version_comes_from_*` 用）。
+    fn service_current(http: FakeHttp) -> AppUpdateService<FakeHttp, FakeExtractor> {
+        AppUpdateService::with_parts(
+            http,
+            FakeExtractor { create_exe: true },
+            APP_VERSION,
+            ReleasePackageKind::SelfContained,
+            Some(test_repo()),
             temp_root(),
             temp_root(),
         )
@@ -1425,7 +1441,7 @@ mod tests {
 
     #[test]
     fn current_version_comes_from_the_cargo_package_version() {
-        let service = service(FakeHttp::new(), true);
+        let service = service_current(FakeHttp::new());
         assert_eq!(service.current_version(), env!("CARGO_PKG_VERSION"));
 
         // 生产构造与 crate 版本同源（根 Cargo.toml 的 [workspace.package] version）。
