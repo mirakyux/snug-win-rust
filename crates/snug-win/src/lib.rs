@@ -37,3 +37,29 @@ pub use window::{WinDesktop, WinWindows};
 pub fn implemented_modules() -> &'static [&'static str] {
     &["vdd", "display", "window", "touch", "uia", "startup", "update"]
 }
+
+// ---------------------------------------------------------------------------
+// 告警输出
+// ---------------------------------------------------------------------------
+
+/// 应用层装的告警接收端（库本身不持有日志文件）。
+type WarnSink = Box<dyn Fn(&str) + Send + Sync>;
+
+static WARN_SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
+
+/// 把平台层的告警接到应用自己的日志（通常是 `crate::logging::Warn`）。
+///
+/// 只认第一次安装：后装的调用会被忽略。没装时 [`warn`] 写 stderr——GUI 程序没有
+/// 控制台，所以正式运行前应当装一个，否则告警只进调试器。
+pub fn set_warn_sink(sink: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = WARN_SINK.set(Box::new(sink));
+}
+
+/// 平台层告警，对应 C# 的 `Log.Warn`。库里没有日志后端，交给 [`set_warn_sink`] 装的
+/// 接收端；没装就写 stderr。
+pub fn warn(message: &str) {
+    match WARN_SINK.get() {
+        Some(sink) => sink(message),
+        None => eprintln!("[Warn] {message}"),
+    }
+}

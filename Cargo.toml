@@ -3,7 +3,9 @@ resolver = "2"
 members = ["crates/snug-core", "crates/snug-win", "crates/snug-app"]
 
 [workspace.package]
-version = "0.1.0"
+# 唯一版本来源：C# 版 Directory.Build.props 的 <Version>1.2.0</Version>。
+# crate 版本 = exe 资源里的 FileVersion/ProductVersion = 自动更新跟 GitHub tag 比的版本。
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -15,5 +17,7 @@ thiserror = "2"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-strip = true
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# 不开 panic = "abort"：eframe/egui 有个别地方依赖 unwind。

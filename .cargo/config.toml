@@ -1,0 +1,9 @@
+# 单 exe、零运行时依赖：MSVC 目标静态链接 C 运行库。
+#
+# 不写这一段时，rustc 默认动态链接 CRT，产物会 import `VCRUNTIME140.dll`
+# （VC++ 运行库，不在 Windows 自带列表里）——用户没装 VC++ Redistributable 就起不来。
+# `+crt-static` 把 CRT 编进 exe，剩下的依赖只有 kernel32/user32 这类系统 DLL。
+#
+# 代价：exe 体积略增；跨 CRT 边界传 FILE*/malloc 指针的库会有问题，本仓没有这种依赖。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

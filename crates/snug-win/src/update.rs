@@ -38,10 +38,13 @@ pub const LATEST_WEB_URL: &str = "https://github.com/nicocart/snug-win/releases/
 pub const CHECKSUMS_ASSET: &str = "checksums.txt";
 /// 更新包里必须有的可执行文件。
 pub const TARGET_EXE: &str = "SnugWin.App.exe";
-/// **应用版本**（单一来源）。对应 C# `Directory.Build.props` 的 `<Version>1.2.0</Version>`：
-/// 自动更新拿它跟 GitHub 的 tag 比，所以必须跟着 C# 发布线走。
-/// crate 版本（`CARGO_PKG_VERSION` = 0.1.0）只是本仓内部编号，不能拿来做更新判断。
-pub const APP_VERSION: &str = "1.2.0";
+/// **应用版本**，编译期取 crate 版本。
+///
+/// 对应 C# `Directory.Build.props` 的 `<Version>1.2.0</Version>`：自动更新拿它跟
+/// GitHub 的 tag 比。Rust 这边版本号只出现在根 `Cargo.toml` 的
+/// `[workspace.package] version` 一处——crate 版本、exe 资源版本（build.rs 读
+/// `CARGO_PKG_VERSION`）、跟 tag 比的版本都从这里来，所以用 `env!` 而不是再写一个常量。
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 下载时带的 User-Agent（C# `SnugWin-Updater/1.1`）。
 pub const USER_AGENT: &str = "SnugWin-Updater/1.1";
 /// staging 目录名前缀。
@@ -672,13 +675,20 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
             return Err(UpdateError::Network(message));
         }
 
-        if let Some(text) = checksums
-            && let Some(expected) = try_find_sha256(&text, &check.package_asset_name)
-        {
-            let actual = sha256_file(&zip_path)?;
-            if !actual.eq_ignore_ascii_case(&expected) {
-                let _ = std::fs::remove_dir_all(&staging_root);
-                return Err(UpdateError::ChecksumMismatch { expected, actual });
+        if let Some(text) = checksums {
+            match try_find_sha256(&text, &check.package_asset_name) {
+                Some(expected) => {
+                    let actual = sha256_file(&zip_path)?;
+                    if !actual.eq_ignore_ascii_case(&expected) {
+                        let _ = std::fs::remove_dir_all(&staging_root);
+                        return Err(UpdateError::ChecksumMismatch { expected, actual });
+                    }
+                }
+                // 有意偏离 C#：`AppUpdateService.cs` 141-151 行在这一支是**静默跳过**
+                // （`TryFindSha256` 返回 false 时外层没有 else，连 Warn 都没有）。
+                // 行为保持一致（不校验、照常继续），只补一行告警：checksums.txt 改名
+                // 或包名对不上时，整条完整性校验会悄无声息地失效，至少让它留痕。
+                None => crate::warn(&missing_checksum_warning(&check.package_asset_name)),
             }
         }
 
@@ -700,6 +710,14 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
             target_app_dir: self.app_dir.clone(),
         })
     }
+}
+
+/// "checksums.txt 里没有这个包名"的告警文案。
+///
+/// C# `AppUpdateService.cs:141-151` 在这一支是静默跳过（`TryFindSha256` 返回 false，
+/// 外层没有 else）；我们行为一致，只把这行日志补上，文案抽出来单独测。
+fn missing_checksum_warning(asset: &str) -> String {
+    format!("checksums.txt 里找不到 {asset}，跳过 SHA-256 校验（C# 同语义，此处只补日志）")
 }
 
 /// 写脚本并拉起 PowerShell（C# `LaunchApplyScript`）。
@@ -1156,6 +1174,9 @@ mod tests {
     fn checksums_without_the_asset_name_skips_verification_like_csharp() {
         // C# 的 TryFindSha256 找不到包名时返回 false → 整个校验分支跳过（不是放行错误哈希）。
         // 这条和上一条一起把两条分支都钉住：名字对上必须校验，对不上才跳过。
+        // 注意：C# `AppUpdateService.cs:141-151` 在这一支连日志都没有（静默跳过），
+        // 我们的行为保持一致，只补一行 Warn（见 missing_checksum_warning），所以这里
+        // 断言的是"不报错、照常继续"，日志文案由 missing_checksum_warning_names_the_asset 覆盖。
         let mut http = FakeHttp::new();
         http.download_bytes = b"payload".to_vec();
         let http = http.with(
@@ -1187,14 +1208,42 @@ mod tests {
     }
 
     #[test]
-    fn current_version_comes_from_the_app_version_constant() {
+    fn current_version_comes_from_the_cargo_package_version() {
         let service = service(FakeHttp::new(), true);
-        assert_eq!(service.current_version(), "1.2.0");
+        assert_eq!(service.current_version(), env!("CARGO_PKG_VERSION"));
 
-        // 生产构造用的是 APP_VERSION（跟 C# 发布线一致），不是 crate 版本。
+        // 生产构造与 crate 版本同源（根 Cargo.toml 的 [workspace.package] version）。
         let production = AppUpdateService::new(FakeHttp::new(), ".", ".");
         assert_eq!(production.current_version(), APP_VERSION);
-        assert_eq!(APP_VERSION, "1.2.0");
-        assert_ne!(APP_VERSION, env!("CARGO_PKG_VERSION"), "crate 版本只是内部编号");
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"), "版本只能有一个来源");
+
+        // 必须是 major.minor.patch 三段数字：exe 资源版本和 GitHub tag 都按这个格式生成。
+        let parts: Vec<&str> = APP_VERSION.split('.').collect();
+        assert_eq!(parts.len(), 3, "版本号必须是三段：{APP_VERSION}");
+        assert!(
+            parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+            "版本号每段都得是数字：{APP_VERSION}"
+        );
+    }
+
+    #[test]
+    fn warn_is_delivered_to_the_installed_sink() {
+        // snug-win 是库，告警要靠应用装接收端才会进文件日志；没装时退到 stderr。
+        // OnceLock 只认第一次安装，所以这里装一次、断言消息确实送达。
+        static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        crate::set_warn_sink(|message| {
+            WARNED.lock().unwrap_or_else(|error| error.into_inner()).push(message.to_string());
+        });
+        crate::warn("校验被跳过");
+        let warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(warned.iter().any(|message| message == "校验被跳过"), "warned={warned:?}");
+    }
+
+    #[test]
+    fn missing_checksum_warning_names_the_asset() {
+        // 名字对不上时行为不变（继续、不校验），但必须留一行日志说明"校验没生效"。
+        let message = missing_checksum_warning("SnugWin-v1.3.0-win-x64-selfcontained.zip");
+        assert!(message.contains("SnugWin-v1.3.0-win-x64-selfcontained.zip"), "{message}");
+        assert!(message.contains("跳过 SHA-256 校验"), "{message}");
     }
 }
