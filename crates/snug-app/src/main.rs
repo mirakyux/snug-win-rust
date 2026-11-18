@@ -6,6 +6,7 @@
 mod controller;
 mod logging;
 mod settings;
+mod tray;
 mod ui;
 
 use std::fs::File;

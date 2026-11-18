@@ -9,7 +9,8 @@ use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
 
 use crate::controller::Controller;
-use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsWindow, StatusInfo};
+use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsTab, SettingsWindow, StatusInfo};
+use crate::tray::{Tray, TrayCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeTab {
@@ -34,6 +35,8 @@ pub struct PhoneHomeApp {
     pub elevated: bool,
     /// 设置里点了"以管理员身份重启"，下一帧收尾退出。
     pub request_exit: bool,
+    /// 托盘（这台机器没有托盘时为 `None`，界面照样能用）。
+    pub tray: Option<Tray>,
 }
 
 impl PhoneHomeApp {
@@ -47,6 +50,18 @@ impl PhoneHomeApp {
     ) -> Self {
         let mut settings = SettingsWindow::new();
         settings.set_catalog(catalog.clone());
+        // 托盘必须在主线程建（它建的那个隐藏窗口靠 eframe 的消息泵分发），
+        // 而 `new` 就是在 `run_native` 的创建回调里跑的。
+        let tray = match Tray::new(false) {
+            Some(tray) => {
+                crate::info!("托盘已就绪");
+                Some(tray)
+            }
+            None => {
+                crate::warn!("托盘创建失败（可能没有 shell 会话），本次没有托盘图标");
+                None
+            }
+        };
         Self {
             config,
             catalog,
@@ -59,6 +74,7 @@ impl PhoneHomeApp {
             settings,
             elevated: snug_win::is_elevated(),
             request_exit: false,
+            tray,
         }
     }
 
@@ -184,6 +200,8 @@ impl PhoneHomeApp {
 
 impl eframe::App for PhoneHomeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 托盘要先撤掉：进程退出后留着图标，explorer 会留一个"幽灵图标"直到鼠标划过。
+        self.tray = None;
         // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
         self.controller.shutdown();
         let file = self.paths.config_file();
@@ -195,6 +213,35 @@ impl eframe::App for PhoneHomeApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 托盘事件：菜单点击、双击。先把事件收齐再处理，避免与 `apply_setting` 抢借用。
+        let tray_commands = self.tray.as_mut().map(|tray| tray.poll()).unwrap_or_default();
+        for command in tray_commands {
+            match command {
+                TrayCommand::OpenSettings(tab) => {
+                    self.settings.select_tab(SettingsTab::from_index(tab));
+                    self.settings.open();
+                    ctx.request_repaint();
+                }
+                TrayCommand::SetManualOverride(on) => {
+                    self.apply_setting(SettingsAction::SetManualOverride(on));
+                }
+                TrayCommand::Quit => {
+                    crate::info!("托盘：退出（先还原窗口）");
+                    self.request_exit = true;
+                }
+            }
+        }
+        if let Some(tray) = &mut self.tray {
+            let state = self.controller.state();
+            let summary = Self::phase_text(state.screen_phase).to_string();
+            let connected = state.screen_phase == PhoneScreenPhase::Ready;
+            tray.set_status(&summary, connected);
+            tray.set_manual_override(self.controller.manual_override());
+        }
+        // 托盘事件来自另一个消息窗口，egui 没有输入就不会重绘；靠这个定时器
+        // 让 `poll` 有节奏地跑起来（200ms 足够，不是每帧空转）。
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+
         // 设置窗：先执行上一帧排出的动作，再画这一帧（动作会影响配置和控制器状态）。
         for action in self.settings.take_actions() {
             self.apply_setting(action);
