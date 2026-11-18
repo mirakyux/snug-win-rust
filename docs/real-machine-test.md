@@ -56,6 +56,45 @@ $env:SNUGWIN_HOME = "$env:USERPROFILE\snug-rs-test"
 
 退出时检查归位：被搬到手机屏上的窗口回到原屏幕原位，虚拟屏撤掉，`phone-screen.json` 记下状态。
 
+### 退出验收（必须逐项过）
+
+放一个退出请求，让它自己走完收尾（撤托盘、撤屏、归位窗口、存配置）：
+
+```powershell
+Set-Content "$env:SNUGWIN_HOME\quit.request" -Value quit -Encoding ascii
+```
+
+判 PASS 的四条：
+
+1. **30 秒内进程退出，退出码 0**。卡住不动的，看下面「已知陷阱」第一条。
+2. 日志按顺序走完：`收到退出请求文件，开始收尾` → `收尾：开始（撤托盘 + 撤屏 + 归位窗口 + 存配置）`
+   → `已撤掉手机屏 #N` 与铺上去的窗口 `已放回原位` → `收尾：完成`。
+3. `Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams` 的条数
+   **回到建屏之前的数量**——虚拟屏真的撤掉了，没留孤儿屏。
+4. `Get-Process -Name snug` 为空。
+
+第 2 步停在半路、进程还活着，说明是**收尾阻塞**，不是"慢"，别等，按陷阱清单查。
+
+## 已知陷阱
+
+### 收尾时读窗口标题会自己等自己（已修，`dee0c10`）
+
+`GetWindowTextW` 对**同进程**窗口是同步投递 `WM_GETTEXT` 给对方窗口所属的线程。收尾时
+UI 线程阻塞等 desk 线程撤屏，而 desk 线程正在做窗口快照（`EnumWindows` → 逐个读标题），
+筛出来的正是我们自己的 egui 窗口 —— 两个线程互等，进程永远退不出去，虚拟屏留在桌面上。
+日志现象是停在 `desk: 撤屏前别的屏：…` 之后一行都没有。
+
+现在 `window_title` 改用 `SendMessageTimeoutW(WM_GETTEXT, 150ms)`，读不到返回空串，并且
+`probe_window` 直接跳过本进程的窗口。**以后再加"枚举窗口顺便读标题"的代码，不要回头用
+`GetWindowTextW` / `GetWindowTextLengthW`。**
+
+### 启动方式：脚本里别用 `Start-Process`
+
+`Start-Process` 走 ShellExecute，对这个带 `requireAdministrator` 清单的 exe，会先去问
+Shell / 提权通道，表现为弹「打开文件 - 安全警告」或长时间不起进程（脚本就卡在那一行）。
+`scripts/smoke-test.ps1` 已改成 `ProcessStartInfo(UseShellExecute=$false)`；手工测时在
+PowerShell 里直接 `.\target\release\snug.exe` 即可。
+
 ## 出问题看哪里
 
 - 平台层告警走 `snug_win::set_warn_sink` → 应用日志的 `[Warn]`，不再只进 stderr。
