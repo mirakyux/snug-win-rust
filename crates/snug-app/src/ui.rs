@@ -488,12 +488,32 @@ impl PhoneHomeApp {
             }
             SettingsAction::CheckUpdate => self.start_update_check(),
             SettingsAction::InstallUpdate => self.start_install_update(),
+            SettingsAction::InstallDriver => {
+                // C# `LocateBundledDriverScript`：从程序目录往上找 5 层 `driver/Install-SnugDriver.ps1`。
+                match locate_driver_script() {
+                    Some(script) => {
+                        crate::info!("设置：安装/修复虚拟屏驱动，脚本 {}", script.display());
+                        match run_elevated_powershell(&script) {
+                            Ok(()) => crate::info!("设置：驱动脚本已拉起（会弹 UAC）"),
+                            Err(err) => crate::warn!("设置：拉起驱动脚本失败 {err}"),
+                        }
+                    }
+                    None => crate::warn!(
+                        "设置：没找到 driver/Install-SnugDriver.ps1（程序目录及其上 5 层），无法安装驱动"
+                    ),
+                }
+            }
+            SettingsAction::OpenPhoneModels => {
+                // C# 是弹一个独立的 `PhoneModelWindow`；我们的机型选择在设置窗"常规"页，
+                // 直接把人送到那儿，比再开一个只有一份列表的窗口更好用。
+                crate::info!("设置：打开机型选择（常规页）");
+                self.settings.select_tab(SettingsTab::General);
+                self.settings.open();
+            }
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
                 self.controller.apply_gesture_settings(&self.config);
             }
-            // 下面这些要等平台层的更新器/驱动/机型窗接上，先如实写日志，不假装成功。
-            other => crate::warn!("设置：动作 {other:?} 尚未接线，已忽略"),
         }
     }
 
@@ -535,7 +555,8 @@ impl PhoneHomeApp {
             });
     }
 
-    /// 手机屏当前阶段的简短文案。
+
+/// 手机屏当前阶段的简短文案。
     fn phase_text(phase: PhoneScreenPhase) -> &'static str {
         match phase {
             PhoneScreenPhase::Off => "手机屏：关",
@@ -888,4 +909,32 @@ impl eframe::App for PhoneHomeApp {
             }
         });
     }
+}
+
+    /// 从程序目录往上找 `driver/Install-SnugDriver.ps1`（C# `LocateBundledDriverScript`：最多 5 层）。
+fn locate_driver_script() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_exe().ok()?.parent().map(|dir| dir.to_path_buf())?;
+    for _ in 0..5 {
+        let candidate = dir.join("driver").join("Install-SnugDriver.ps1");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// 用 PowerShell 跑驱动脚本。本进程已经是管理员（清单 requireAdministrator），
+/// 所以直接起子进程；不是管理员时 Windows 会由脚本自己报错，我们不假装成功。
+fn run_elevated_powershell(script: &std::path::Path) -> std::io::Result<()> {
+    std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &script.to_string_lossy(),
+        ])
+        .spawn()
+        .map(|_| ())
 }

@@ -26,12 +26,12 @@ pub struct Controller {
     displays: Arc<WinPhoneDisplays>,
     /// 手势钩子（C# `TouchHookService`）。
     touch: Arc<snug_win::TouchHook>,
+    /// UU 远程探测（C# `UUSensor`）：由后台线程每秒采样一次。
+    uu: Arc<snug_win::UuSensor>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: std::sync::Mutex<Option<TouchRegion>>,
     #[allow(dead_code)] // 后续设置界面/诊断要用
     paths: Paths,
-    /// "手动强制手机屏"（C# `UUSensor.ManualOverride`），界面回显用。
-    manual_override: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -70,12 +70,26 @@ impl Controller {
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
         let desk_worker = desk.clone();
+        let uu = Arc::new(snug_win::UuSensor::new());
+        let uu_worker = uu.clone();
         let worker = std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
+                // UU 采样：一路读不到不该影响状态机，`sample` 自己保证只返回"读不到"。
+                // 采样节奏照 C# 的 1 秒一次；`idle`/`check_returns` 保持 500ms。
+                let mut tracker = snug_core::session::ConnectionTracker::new();
+                let started = std::time::Instant::now();
+                let mut last_sample = -1.0_f64;
                 while stop.load(Ordering::Relaxed) {
                     desk_worker.idle();
                     desk_worker.check_returns();
+                    let now = started.elapsed().as_secs_f64();
+                    if now - last_sample >= 1.0 {
+                        last_sample = now;
+                        let signals = uu_worker.sample(now);
+                        tracker.update(&signals.to_signals(), now);
+                        desk_worker.set_remote(tracker.is_connected());
+                    }
                     std::thread::sleep(Duration::from_millis(500));
                 }
             })
@@ -87,9 +101,9 @@ impl Controller {
             desk,
             displays,
             touch,
+            uu,
             touch_region: std::sync::Mutex::new(None),
             paths: paths.clone(),
-            manual_override: Arc::new(AtomicBool::new(false)),
             running,
             worker,
         }
@@ -122,16 +136,16 @@ impl Controller {
 
     /// 手动强制（C# `AppController.SetManualOverride` → `UUSensor.ManualOverride`）。
     ///
-    /// 语义是"不管 UU 连没连都保持手机屏"。`uu` 探测模块还没接进来，
-    /// 这里先把用户的意图记下来（设置窗要回显），并如实说明本次不会生效。
+    /// 语义是"不管 UU 连没连都保持手机屏"。现在是真的：采样线程每秒看一次这个开关，
+    /// 打开时 `sample` 直接给"在远程"的信号。
     pub fn set_manual_override(&self, on: bool) {
-        self.manual_override.store(on, Ordering::Relaxed);
-        crate::warn!("手动强制手机屏 = {on}：uu 探测模块未接线，本次未生效");
+        crate::info!("手动强制手机屏 = {on}");
+        self.uu.set_manual_override(on);
     }
 
     /// 当前"手动强制"状态（设置窗回显用）。
     pub fn manual_override(&self) -> bool {
-        self.manual_override.load(Ordering::Relaxed)
+        self.uu.manual_override()
     }
 
     /// 手机屏的屏幕矩形（物理像素）。界面窗口要搬到这块屏上，对应 C#
