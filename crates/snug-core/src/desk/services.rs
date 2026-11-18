@@ -98,6 +98,16 @@ impl std::error::Error for PhoneScreenException {}
 pub trait PhoneDisplays: Send + Sync {
     /// 建一块手机屏，返回显示器编号。
     fn create(&self, fit: ScreenFit) -> Result<u32, PhoneScreenException>;
+
+    /// 建一块带名字的手机屏（C# v1.3 `IScreenService.CreateAsync(fit, displayName, ct)`）。
+    ///
+    /// 默认实现忽略名字、转调 [`Self::create`]——平台/协议不支持命名时行为不变；
+    /// Windows 实现会把这个名字写进驱动的 `VddMonitor.name`（v2 协议才带）。
+    fn create_named(&self, fit: ScreenFit, name: &str) -> Result<u32, PhoneScreenException> {
+        let _ = name;
+        self.create(fit)
+    }
+
     /// 把已有手机屏改成新的比例。
     fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool;
     fn fit_of(&self, display_id: u32) -> Option<ScreenFit>;

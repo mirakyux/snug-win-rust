@@ -497,6 +497,19 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 建屏（C# `CreateAsync`）。
     fn create(&mut self, fit: ScreenFit) -> Result<u32, PhoneScreenException> {
+        self.create_with_name(fit, None)
+    }
+
+    /// 建屏并给驱动一个显示名（C# v1.3 `CreateAsync(fit, displayName, ct)`）。
+    ///
+    /// `name` 只进 `VddMonitor.name`（驱动的"显示器名字"，设置里看到的就是它）；
+    /// 不传/全空白时退回 [`MONITOR_NAME`]。`device_names` 里记的仍是 Windows 的
+    /// GDI 设备名（`\\.\DISPLAYx`），这两者不能混——后者是改分辨率/查模式的句柄。
+    fn create_with_name(
+        &mut self,
+        fit: ScreenFit,
+        name: Option<&str>,
+    ) -> Result<u32, PhoneScreenException> {
         if !self.api.driver_pipe_available() && !self.api.restart_virtual_display_device() {
             return Err(PhoneScreenException::with_detail(
                 PhoneScreenErrorKind::CreateFailed,
@@ -506,6 +519,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 ),
             ));
         }
+
+        // C#：`string.IsNullOrWhiteSpace(displayName) ? PhoneScreenSpec.Name : displayName`。
+        let vdd_name = name.filter(|value| !value.trim().is_empty()).unwrap_or(MONITOR_NAME);
 
         let before_monitors = self.api.active_monitors();
         let existing: HashSet<String> = before_monitors
@@ -529,7 +545,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             }
             let monitor = VddMonitor {
                 id: candidate,
-                name: Some(MONITOR_NAME.to_string()),
+                name: Some(vdd_name.to_string()),
                 enabled: true,
                 modes: modes.clone(),
             };
@@ -619,6 +635,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         let Some(device_name) = lock_maps(&self.maps).device_names.get(&display_id).cloned() else {
             return false;
         };
+        // C# v1.3 `ReshapeAsync` 这里仍写死 `PhoneScreenSpec.Name`（不是建屏时给的
+        // displayName）；照抄，避免换比例顺手把用户起的名字改掉这件事出现两版差异。
         let monitor = VddMonitor {
             id: display_id,
             name: Some(MONITOR_NAME.to_string()),
@@ -1566,6 +1584,12 @@ impl PhoneDisplays for WinPhoneDisplays {
         self.with_ops(|screen| screen.create(fit))
     }
 
+    /// C# v1.3 的带名字建屏：名字写进 VDD 的 `VddMonitor.name`（legacy 协议没有
+    /// 这个字段，驱动会退回默认名——见 `vdd.rs` 的 `VddLegacyMonitor`）。
+    fn create_named(&self, fit: ScreenFit, name: &str) -> Result<u32, PhoneScreenException> {
+        self.with_ops(|screen| screen.create_with_name(fit, Some(name)))
+    }
+
     fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool {
         self.with_ops(|screen| screen.reshape(display_id, fit))
     }
@@ -1904,6 +1928,8 @@ mod tests {
         pending_attach: Option<String>,
         modes: HashSet<(String, i32, i32)>,
         notified: Vec<Vec<u32>>,
+        /// 每次 Notify/ReplaceLegacy 带上去的显示名（v2 协议字段 `name`）。
+        notified_names: Vec<Vec<String>>,
         removed: Vec<u32>,
         remove_all_calls: usize,
         legacy: bool,
@@ -2025,6 +2051,12 @@ mod tests {
                 )));
             }
             world.notified.push(monitors.iter().map(|m| m.id).collect());
+            world.notified_names.push(
+                monitors
+                    .iter()
+                    .map(|m| m.name.clone().unwrap_or_default())
+                    .collect(),
+            );
             let ids: Vec<u32> = monitors.iter().map(|m| m.id).collect();
             for id in ids {
                 if world.online_ids.contains(&id) {
@@ -2039,6 +2071,9 @@ mod tests {
             world.removed.extend_from_slice(remove_ids);
             let ids: Vec<u32> = add.iter().map(|m| m.id).collect();
             world.notified.push(ids.clone());
+            world.notified_names.push(
+                add.iter().map(|m| m.name.clone().unwrap_or_default()).collect(),
+            );
             for id in ids {
                 if world.online_ids.contains(&id) {
                     world.driver_online(id);
@@ -2161,6 +2196,46 @@ mod tests {
 
         let id = screen.create(ScreenFit::standard()).expect("重启后建屏");
         assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn create_named_sends_the_screen_name_to_the_driver() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen
+            .create_with_name(ScreenFit::standard(), Some("iPad 副屏"))
+            .expect("建屏成功");
+        assert_eq!(id, 0);
+        assert_eq!(
+            shared.lock().unwrap().notified_names,
+            vec![vec!["iPad 副屏".to_string()]],
+            "v2 协议的 Notify 要带上设置里的屏名"
+        );
+        // `device_names` 存的是 Windows 的 GDI 设备名（改分辨率/查模式要用），
+        // 不是驱动的显示名，两者不能混。
+        assert_eq!(
+            lock_maps(&screen.maps).device_names.get(&0).map(String::as_str),
+            Some(r"\\.\DISPLAY2")
+        );
+    }
+
+    #[test]
+    fn blank_or_missing_name_falls_back_to_the_default_monitor_name() {
+        // C#：string.IsNullOrWhiteSpace(displayName) ? PhoneScreenSpec.Name : displayName。
+        let (mut blank_named, shared) = screen(world_with_phone(&[0]));
+        blank_named
+            .create_with_name(ScreenFit::standard(), Some("   "))
+            .expect("建屏成功");
+        assert_eq!(
+            shared.lock().unwrap().notified_names,
+            vec![vec![MONITOR_NAME.to_string()]]
+        );
+
+        let (mut default_named, shared) = screen(world_with_phone(&[0]));
+        default_named.create(ScreenFit::standard()).expect("建屏成功");
+        assert_eq!(
+            shared.lock().unwrap().notified_names,
+            vec![vec![MONITOR_NAME.to_string()]]
+        );
     }
 
     #[test]

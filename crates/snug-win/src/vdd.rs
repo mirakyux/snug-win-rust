@@ -511,6 +511,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_protocol_cannot_carry_a_display_name() {
+        // v0.3.x 的 VddLegacyMonitor 只有 id/modes，没有 name 字段；带名字建屏
+        // 在 legacy 通道上会退化成驱动的默认名（v1.3 C# 的协议定义同样如此）。
+        let json = serialize_legacy_add(&[monitor()]);
+        assert!(!json.contains("\"name\""), "legacy Add 里不该出现 name：{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("合法 JSON");
+        assert_eq!(value["Add"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn remove_and_control_frames() {
         assert_eq!(serialize_remove(&[3, 7]), r#"{"Remove":[3,7]}"#);
         assert_eq!(serialize_remove_all(), "\"RemoveAll\"");
