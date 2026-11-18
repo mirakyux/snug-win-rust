@@ -250,11 +250,16 @@ impl Controller {
                             action(&mut desks);
                         }
                     }
-                    // 状态快照：`idle()` 之前先发一次，之后（可能已经建/撤完屏）再发一次，
-                    // 界面看到的是"最近一次完成的动作"的结果。
+                    // 状态快照：发一份给界面（后台线程是唯一的发布者）。
                     publish_snapshots(&desks_worker, &snapshots_worker);
+                    // **不要在这里调 `DeskSet::idle()`**（砌复查的结论）：
+                    // 它不是"排空队列"，而是"等到所有 desk 都 quiet"——
+                    // 有 watch 在跑时要等到 watch 结束（打开窗口 30s、退出 10s、
+                    // 卡死跟随再 60s），而且期间是忙等、吃满一个核。
+                    // 更糟的是这期间 `set_wishes` 进不去，会话结束时撤屏会被推迟，
+                    // "退出远控后虚拟屏还挂着"那个 bug 会原样复现。
+                    // 重试与 watch 都是独立线程、自己会推进；`check_returns` 只是入队。
                     if let Ok(desks) = desks_worker.lock() {
-                        desks.idle();
                         desks.check_returns();
                     }
                     publish_snapshots(&desks_worker, &snapshots_worker);
@@ -415,19 +420,21 @@ impl Controller {
 
     /// 指定屏的状态快照；`None` 表示"主触控屏"。
     ///
-    /// **只读后台线程发布的快照**，绝不在 `DeskSet` 的锁上等：那把锁在 `idle()` 里
-    /// 可能被建屏占住好几秒，而界面每帧都要读它（见字段上的锁纪律）。
+    /// **只读后台线程发布的快照**，绝不在 `DeskSet` 的锁上等：那把锁属于后台线程，
+    /// 而它可能在等一条慢动作（建屏/等窗口），界面每帧都要读状态（见字段上的锁纪律）。
+    ///
+    /// 指定了 id 却查不到时返回默认值，**不要**退到"随便拿一块屏"：
+    /// `HashMap` 的迭代顺序是随机的，多块 desk 时会静默显示错的那块。
     pub fn state_of(&self, screen_id: Option<&str>) -> DeskState {
         let id = screen_id.map(str::to_string).or_else(|| self.primary_screen_id());
         let Ok(snap) = self.snapshots.lock() else {
             return DeskState::default();
         };
-        if let Some(id) = &id
-            && let Some(state) = snap.get(id)
-        {
-            return state.clone();
+        match id {
+            Some(id) => snap.get(&id).cloned().unwrap_or_default(),
+            // 一张屏配置都没有（异常配置）：只能拿任意一块，总比空白好。
+            None => snap.values().next().cloned().unwrap_or_default(),
         }
-        snap.values().next().cloned().unwrap_or_default()
     }
 
     /// 当前要展示的那块屏的状态快照（主触控屏）。
@@ -762,8 +769,17 @@ fn active_wishes(
     }
     let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, remote, false);
     // 只留当前显示的那块：我们只有一个窗口，多建几块只会得到几块黑屏。
-    match active_screen {
+    //
+    // `None` 必须和 `Controller::state_of(None)` 选同一块——那边用的是
+    // `primary_touch_screen()`（优先竖屏手机），而 `wishes` 是按配置顺序，
+    // 两张表不一致时会出现"建的是电脑副屏、界面却在找手机屏"。
+    let wanted_id = match active_screen {
+        Some(id) => Some(id.to_string()),
+        None => config.primary_touch_screen().map(|screen| screen.id),
+    };
+    match wanted_id {
         Some(id) => wishes.retain(|wish| wish.id == id),
+        // 没有触控屏配置（只有电脑屏）：退回配置里的第一块。
         None => wishes.truncate(1),
     }
     wishes
@@ -844,5 +860,32 @@ mod tests {
         assert_eq!(wishes.len(), 1);
         assert_eq!(wishes[0].id, "tablet-1");
         assert_eq!(wishes[0].fit.kind(), snug_core::DeviceKind::Tablet);
+    }
+
+    /// 配置里第一块是电脑屏、第二块才是手机时，默认（没选屏）要建手机屏——
+    /// 和 `Controller::state_of(None)` 用的 `primary_touch_screen()` 保持同一块。
+    #[test]
+    fn default_screen_matches_primary_touch_screen() {
+        use snug_core::{DeviceKind, ScreenOrientation};
+
+        let mut config = config_with_one_screen();
+        let mut base = config.effective_screens().remove(0);
+
+        let mut computer = base.clone();
+        computer.id = "pc-1".to_string();
+        computer.name = "PC".to_string();
+        computer.device.kind = DeviceKind::Computer;
+        computer.orientation = ScreenOrientation::Landscape;
+
+        base.id = "phone-2".to_string();
+        base.name = "Phone".to_string();
+
+        config.screens = Some(vec![computer.sanitize(), base.sanitize()]);
+        let primary = config.primary_touch_screen().expect("配置里有手机屏");
+
+        let wishes = active_wishes(&config, true, true, None);
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, primary.id, "默认建屏要和 primary_touch_screen 是同一块");
+        assert_eq!(wishes[0].fit.kind(), DeviceKind::Phone);
     }
 }
