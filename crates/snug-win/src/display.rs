@@ -93,6 +93,33 @@ pub struct MonitorSnapshot {
 // 纯逻辑
 // ---------------------------------------------------------------------------
 
+/// 候选连接器编号从「已有虚拟屏数量」的偏移开始轮转（C# `6f548dd` 的
+/// `CandidateIdsStartingAfter`）。
+///
+/// 同机跑 C# 版、或上次崩溃留下孤儿屏时，固定的 `[0,1,2,3]` 会和已有屏撞号：
+/// `wait_for_online` 按「设备名不在 existing 集合里」判断新屏，撞号会导致认错屏
+/// 或白等超时。从偏移开始试就能避开。
+pub fn candidates_starting_after(existing_virtual_count: usize) -> Vec<u32> {
+    let ids = CANDIDATE_IDS;
+    if existing_virtual_count == 0 || ids.len() <= 1 {
+        return ids.to_vec();
+    }
+    let offset = existing_virtual_count % ids.len();
+    if offset == 0 {
+        return ids.to_vec();
+    }
+    (0..ids.len()).map(|i| ids[(i + offset) % ids.len()]).collect()
+}
+
+/// 一块屏算不算「虚拟屏」（C# `6f548dd` 的计数口径）。
+fn is_virtual_monitor(monitor: &MonitorSnapshot) -> bool {
+    let device = monitor.device_string.to_ascii_lowercase();
+    let friendly = monitor.friendly_name.to_ascii_lowercase();
+    device.contains("virtual")
+        || friendly.contains("virtudisplay")
+        || friendly.contains("virtual")
+}
+
 /// C# `GetDpiScalePercent` 的反算：把 CCD 报回的相对档位换成百分比。
 ///
 /// `min_rel` 是「推荐档位相对最小档」的偏移（负数），`cur_rel` 是当前档位相对推荐档位。
@@ -448,16 +475,21 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             ));
         }
 
-        let existing: HashSet<String> = self
-            .api
-            .active_monitors()
+        let before_monitors = self.api.active_monitors();
+        let existing: HashSet<String> = before_monitors
             .iter()
             .map(|m| normalized(&m.device_name))
             .collect();
+        // C# `6f548dd`：已经有几块虚拟屏，就从候选 ID 的对应偏移开始试，避免和
+        // C# 版（或上次崩溃留下的屏）撞同一个 id。撞号会让 wait_for_online 认错屏。
+        let existing_virtual_count = before_monitors
+            .iter()
+            .filter(|m| is_virtual_monitor(m))
+            .count();
         let modes = build_modes(&fit);
         let (base_width, base_height) = fit.pixel_size(fit.base_width());
 
-        for candidate in CANDIDATE_IDS {
+        for candidate in candidates_starting_after(existing_virtual_count) {
             let monitor = VddMonitor {
                 id: candidate,
                 name: Some(MONITOR_NAME.to_string()),
@@ -474,12 +506,13 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 continue;
             }
             let Some(snapshot) = self.wait_for_online(&existing, base_width, base_height) else {
-                // C# `Log.Warn($"手机屏（id={candidateId}）创建后 {OnlineTimeout.TotalSeconds:0}s 内未在 Windows 上线，尝试备用 ID")`
+                // C# `6f548dd`：超时后**不要** Remove 这个 id。那个 id 可能对应 C# 版
+                // 或别的程序建的屏（同机跑两版时很常见），误删会把别人的手机屏拆掉。
+                // 只跳过这个候选，换下一个。
                 crate::warn(&format!(
-                    "手机屏（id={candidate}）创建后 {}s 内未在 Windows 上线，尝试备用 ID",
+                    "手机屏（id={candidate}）创建后 {}s 内未在 Windows 上线，跳过该候选 ID（不移除未知设备）",
                     self.timings.online.as_secs()
                 ));
-                let _ = self.ipc.remove(&[candidate]);
                 continue;
             };
             {
@@ -1535,6 +1568,18 @@ mod tests {
     }
 
     #[test]
+    fn candidate_ids_rotate_past_existing_virtual_screens() {
+        // C# `6f548dd`：已有虚拟屏越多，越要往后跳，避免撞号。
+        assert_eq!(candidates_starting_after(0), vec![0, 1, 2, 3]);
+        assert_eq!(candidates_starting_after(1), vec![1, 2, 3, 0]);
+        assert_eq!(candidates_starting_after(2), vec![2, 3, 0, 1]);
+        assert_eq!(candidates_starting_after(3), vec![3, 0, 1, 2]);
+        // 正好轮满一圈就回到原顺序。
+        assert_eq!(candidates_starting_after(4), vec![0, 1, 2, 3]);
+        assert_eq!(candidates_starting_after(9), vec![1, 2, 3, 0]);
+    }
+
+    #[test]
     fn rounding_matches_dotnet_math_round() {
         // C# Math.Round 默认是银行家舍入（.5 取偶），不是远离零。
         assert_eq!(round_ties_even(300.5), 300.0);
@@ -2057,7 +2102,12 @@ mod tests {
 
         let world = shared.lock().unwrap();
         assert_eq!(world.notified, vec![vec![0], vec![1]]);
-        assert!(world.removed.contains(&0), "失败的候选要被撤掉");
+        // C# `6f548dd`：超时的候选只跳过、**不** Remove —— 那个 id 可能对应
+        // C# 版或别的程序创建的屏，误删会把别人的手机屏拆掉。
+        assert!(
+            !world.removed.contains(&0),
+            "超时的候选不能被撤掉（可能误删别人的屏）"
+        );
     }
 
     #[test]
