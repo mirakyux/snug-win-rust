@@ -20,12 +20,14 @@ pub mod vdd;
 mod wide;
 pub mod window;
 pub mod apps;
+pub mod screenshot;
 pub mod elevation;
 pub mod placement;
 pub mod startup;
 pub mod update;
 
 pub use apps::WinApps;
+pub use screenshot::{WinScreenshot, WinScreens};
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use elevation::{is_elevated, restart_elevated};
 pub use placement::{PlacementRequest, apply as apply_placement};
@@ -38,7 +40,7 @@ pub use window::{find_own_window, WinDesktop, WinWindows};
 
 /// 平台层已接通的模块数（用于界面显示进度）。
 pub fn implemented_modules() -> &'static [&'static str] {
-    &["vdd", "display", "window", "touch", "uia", "startup", "update", "apps"]
+    &["vdd", "display", "window", "touch", "uia", "startup", "update", "apps", "screenshot"]
 }
 
 // ---------------------------------------------------------------------------
