@@ -82,6 +82,8 @@ pub struct PhoneHomeApp {
     pub active_screen: Option<String>,
     /// 用户按下了重入 pill 上的「×」（C# `_reentryPillHidden`）：这次会话里不再弹。
     pub reentry_pill_hidden: bool,
+    /// 点了「⏏ 退出手机屏」，正在等确认（C# `_confirmDismiss`）。
+    pub confirm_dismiss: bool,
 }
 
 /// 桌面预览的运行态。
@@ -158,6 +160,7 @@ impl PhoneHomeApp {
             palette: crate::theme::Palette::DARK,
             active_screen: None,
             reentry_pill_hidden: false,
+            confirm_dismiss: false,
         }
     }
 
@@ -1088,13 +1091,20 @@ impl eframe::App for PhoneHomeApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 原版右上角是「⏏」和「📱」，这里放功能对得上的两个开关。
+                        // 原版右上角是「⏏」（退出手机屏）和「📱」。我们多一个 ⚙ 设置。
                         if ui
                             .add(egui::Button::new("⚙").min_size(egui::vec2(56.0, 44.0)))
                             .on_hover_text("设置与诊断")
                             .clicked()
                         {
                             self.settings.open();
+                        }
+                        if ui
+                            .add(egui::Button::new("⏏").min_size(egui::vec2(56.0, 44.0)))
+                            .on_hover_text("退出手机屏（窗口还回原位，这次远程不再自动开屏）")
+                            .clicked()
+                        {
+                            self.confirm_dismiss = true;
                         }
                         let mut phone_on = self.config.phone_screen;
                         if ui
@@ -1194,6 +1204,62 @@ impl eframe::App for PhoneHomeApp {
         }
         if close_preview {
             self.close_preview(ctx);
+        }
+
+        // ---- 退出手机屏的确认条（C# `DismissBanner`）----
+        let mut dismiss_now = false;
+        let mut dismiss_later = false;
+        if self.confirm_dismiss {
+            egui::TopBottomPanel::top("dismiss-banner")
+                .frame(
+                    egui::Frame::default()
+                        .fill(self.palette.card)
+                        .inner_margin(egui::Margin::symmetric(18, 12)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("退出手机屏？")
+                            .size(18.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(0xFF, 0x3B, 0x30)),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "铺在手机屏上的窗口会还回原位；这次远程里不再自动开屏，\
+                             之后可以点右下角的小胶囊或托盘菜单重进。",
+                        )
+                        .size(13.0)
+                        .color(self.palette.text_weak),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("退出").color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0xFF, 0x3B, 0x30)),
+                            )
+                            .clicked()
+                        {
+                            dismiss_now = true;
+                        }
+                        if ui.button("稍后").clicked() {
+                            dismiss_later = true;
+                        }
+                    });
+                });
+        }
+        if dismiss_later {
+            self.confirm_dismiss = false;
+        }
+        if dismiss_now {
+            crate::info!("界面：确认退出手机屏");
+            self.confirm_dismiss = false;
+            // 收起之后要能看到重入胶囊，所以把"用户已收起胶囊"的标记清掉。
+            self.reentry_pill_hidden = false;
+            self.controller.dismiss_screen_of(self.active_screen.as_deref());
+            ctx.request_repaint();
         }
 
         // ---- 列表：竖向一行一个 App（原版就是这个结构，不是图标网格）----

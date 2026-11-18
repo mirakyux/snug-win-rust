@@ -584,6 +584,16 @@ impl Controller {
         }
     }
 
+    /// 收起手机屏（C# `DismissScreen`）：把铺着的窗口还回去、撤屏，并且**这次远程
+    /// 不再自动弹屏**（`dismissed`），要重进得点重入胶囊或托盘菜单。
+    pub fn dismiss_screen_of(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        crate::info!("收起手机屏：{id}");
+        self.enqueue(move |desks| desks.dismiss_screen(&id));
+    }
+
     /// 取走钩子抛出的选区事件（界面每帧调一次）。
     pub fn take_selection_events(&self) -> Vec<TouchEvent> {
         self.touch_events.take_selection()
