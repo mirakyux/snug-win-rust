@@ -66,6 +66,11 @@ impl Paths {
         self.data_dir.join("left-behind.json")
     }
 
+    /// 虚拟屏归属记录（C# v1.3.0 `SnugPaths.OwnedDisplaysFile`）。
+    pub fn owned_displays_file(&self) -> PathBuf {
+        self.data_dir.join("owned-displays.json")
+    }
+
     pub fn log_directory(&self) -> PathBuf {
         self.data_dir.join("logs")
     }
@@ -108,6 +113,10 @@ mod tests {
         assert_eq!(
             p.log_directory(),
             Path::new(r"C:\Users\test\AppData\Local\SnugWin\logs")
+        );
+        assert_eq!(
+            p.owned_displays_file(),
+            Path::new(r"C:\Users\test\AppData\Local\SnugWin\owned-displays.json")
         );
     }
 

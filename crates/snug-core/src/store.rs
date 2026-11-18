@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 pub struct JsonFileStore<T> {
     path: PathBuf,
@@ -93,6 +94,92 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// 虚拟屏归属记录（C# `OwnedDisplayBook` / `OwnedDisplayStore`）
+// ---------------------------------------------------------------------------
+
+/// 「哪些虚拟屏是本程序建的」记账，启动清理只拆这里记着的屏
+/// （C# `SnugWin.Core.Persistence.OwnedDisplayBook`）。
+///
+/// 同机装着 C# 版时两版共用一个数据目录，所以文件名与 JSON 字段都必须和 C#
+/// 完全一致（`owned-displays.json`、`DisplayIds`），两版才能互相读懂、
+/// 各拆各的屏。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct OwnedDisplayBook {
+    pub display_ids: Vec<u32>,
+}
+
+impl OwnedDisplayBook {
+    /// 加一条归属；已经在书里就原样返回，不产生重复项（C# `WithAdded`）。
+    pub fn with_added(&self, display_id: u32) -> Self {
+        if self.display_ids.contains(&display_id) {
+            return self.clone();
+        }
+        let mut next = self.display_ids.clone();
+        next.push(display_id);
+        Self { display_ids: next }
+    }
+
+    /// 去掉一条归属；本来就不在书里就原样返回（C# `WithRemoved`）。
+    pub fn with_removed(&self, display_id: u32) -> Self {
+        if !self.display_ids.contains(&display_id) {
+            return self.clone();
+        }
+        Self {
+            display_ids: self
+                .display_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != display_id)
+                .collect(),
+        }
+    }
+}
+
+/// 归属记录的落盘（C# `OwnedDisplayStore`）。
+///
+/// 读坏文件走 [`JsonFileStore::load_or_quarantine`]：备份后当作空书，不会让
+/// 启动失败；写失败也只影响下次清理，不影响本次建屏。
+pub struct OwnedDisplayStore {
+    store: JsonFileStore<OwnedDisplayBook>,
+}
+
+impl OwnedDisplayStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { store: JsonFileStore::new(path) }
+    }
+
+    fn load(&self) -> OwnedDisplayBook {
+        self.store.load_or_quarantine().unwrap_or_default()
+    }
+
+    /// 书里记着的屏 id（文件不存在/读坏都返回空）。
+    pub fn load_ids(&self) -> Vec<u32> {
+        self.load().display_ids
+    }
+
+    /// 建屏确认上线后记账（C# `RecordOwned`）。
+    pub fn record_owned(&self, display_id: u32) {
+        let _ = self.store.save(&self.load().with_added(display_id));
+    }
+
+    /// 屏撤掉后销账；最后一条删掉时连文件一起删（C# `ReleaseOwned`）。
+    pub fn release_owned(&self, display_id: u32) {
+        let book = self.load().with_removed(display_id);
+        if book.display_ids.is_empty() {
+            self.store.delete();
+        } else {
+            let _ = self.store.save(&book);
+        }
+    }
+
+    /// 整本清空（C# `ClearAll`）。
+    pub fn clear_all(&self) {
+        self.store.delete();
+    }
+}
+
 fn timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -162,5 +249,86 @@ mod tests {
         store.save(&Demo { value: 3 }).expect("save");
         assert!(path.exists());
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    // ----- 虚拟屏归属记录 -----
+
+    fn owned_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("snug-owned-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir.join("owned-displays.json")
+    }
+
+    #[test]
+    fn owned_book_add_and_remove_are_idempotent() {
+        let empty = OwnedDisplayBook::default();
+        assert_eq!(empty.with_added(2).display_ids, vec![2]);
+        // 重复加不会产生第二条。
+        assert_eq!(empty.with_added(2).with_added(2).display_ids, vec![2]);
+        let book = OwnedDisplayBook { display_ids: vec![1, 2] };
+        assert_eq!(book.with_removed(1).display_ids, vec![2]);
+        // 不在书里的 id 原样返回。
+        assert_eq!(book.with_removed(9).display_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn owned_store_records_and_releases_until_file_is_gone() {
+        let path = owned_path("rotation");
+        let store = OwnedDisplayStore::new(&path);
+        assert!(store.load_ids().is_empty(), "没有文件就是空书");
+
+        store.record_owned(1);
+        store.record_owned(2);
+        store.record_owned(1); // 重复记账不该出现第二次
+        assert_eq!(store.load_ids(), vec![1, 2]);
+
+        store.release_owned(1);
+        assert_eq!(store.load_ids(), vec![2]);
+        // 已经不在书里的再释放一次也不该炸。
+        store.release_owned(1);
+        assert_eq!(store.load_ids(), vec![2]);
+
+        store.release_owned(2);
+        assert!(store.load_ids().is_empty());
+        assert!(!path.exists(), "最后一条销账后文件要删掉");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_store_reads_the_csharp_json_shape() {
+        // C# 的 JsonFileStore 用默认属性名（PascalCase）+ 缩进。
+        let path = owned_path("csharp");
+        fs::create_dir_all(path.parent().unwrap()).expect("dir");
+        fs::write(&path, "{\n  \"DisplayIds\": [2, 3]\n}").expect("write");
+        let store = OwnedDisplayStore::new(&path);
+        assert_eq!(store.load_ids(), vec![2, 3]);
+
+        store.record_owned(4);
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"DisplayIds\""), "写回去也要是 C# 认识的字段名：{text}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_store_survives_corrupt_json_and_keeps_going() {
+        let path = owned_path("corrupt");
+        fs::create_dir_all(path.parent().unwrap()).expect("dir");
+        fs::write(&path, "{ 这不是 json").expect("write");
+        let store = OwnedDisplayStore::new(&path);
+
+        assert!(store.load_ids().is_empty(), "坏文件当作空书，不能炸启动");
+        let quarantined = fs::read_dir(path.parent().unwrap())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt-"));
+        assert!(quarantined, "坏文件应被改名备份");
+
+        // 之后还能正常记账（等同新书）。
+        store.record_owned(7);
+        assert_eq!(store.load_ids(), vec![7]);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
