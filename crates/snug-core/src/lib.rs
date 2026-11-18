@@ -18,6 +18,7 @@ pub mod screenshots;
 pub mod scrolling;
 pub mod store;
 pub mod touch;
+pub mod update;
 pub mod windows;
 pub mod zoom;
 
@@ -38,6 +39,10 @@ pub use store::{JsonFileStore, RestoreRecordStore};
 pub use touch::{
     CloseButton, TouchCommand, TouchInput, TouchInputKind, TouchOptions, TouchRegion,
     TouchResponse, TouchTranslator,
+};
+pub use update::{
+    ReleasePackageKind, UpdateAssetInfo, UpdateReleaseInfo, build_task_xml, is_newer, normalize,
+    parse_latest_release, preferred_asset_name, try_find_sha256, try_parse_semver,
 };
 pub use windows::{AppInfo, DisplayModeInfo, OtherDisplay, RunningApp, WindowInfo, WindowKey};
 pub use zoom::{ZoomBook, ZoomScope};
