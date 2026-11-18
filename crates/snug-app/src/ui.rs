@@ -944,30 +944,106 @@ impl eframe::App for PhoneHomeApp {
                             };
                             ui.label(egui::RichText::new(hint).weak());
                         }
+                        // 手机桌面式图标网格：4 列、大图标、名称在下方。
+                        let columns = 4usize;
+                        let gap = 10.0;
+                        let cell_w =
+                            ((ui.available_width() - gap - gap * columns as f32) / columns as f32)
+                                .max(90.0);
+                        let icon_side = (cell_w * 0.54).clamp(56.0, 116.0);
+                        let cell_h = icon_side + 54.0;
                         for (letter, apps) in &groups {
                             if !letter.is_empty() {
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(letter)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::from_gray(150)),
-                                );
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(gap);
+                                    ui.label(
+                                        egui::RichText::new(letter)
+                                            .size(13.0)
+                                            .strong()
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                });
                             }
-                            for app in apps {
-                                let texture = self.library.icon(ctx, app);
-                                let count = self
-                                    .library
-                                    .running()
-                                    .iter()
-                                    .find(|run| run.app.app_id.eq_ignore_ascii_case(&app.app_id))
-                                    .map(|run| run.windows.len());
-                                if app_row(ui, &app.name, count, texture.as_ref(), false).0 {
-                                    match self.library.action_for(app) {
-                                        AppAction::Pull(window) => pull_window = Some(window),
-                                        AppAction::Open(app) => open_app = Some(app),
+                            for row in (*apps).chunks(columns) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(gap);
+                                    for app in row {
+                                        let texture = self.library.icon(ctx, app);
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            egui::vec2(cell_w, cell_h),
+                                            egui::Sense::click(),
+                                        );
+                                        if response.hovered() {
+                                            ui.painter().rect_filled(
+                                                rect.shrink(2.0),
+                                                16.0,
+                                                egui::Color32::from_rgb(46, 50, 58),
+                                            );
+                                        }
+                                        let icon_rect = egui::Rect::from_center_size(
+                                            egui::pos2(
+                                                rect.center().x,
+                                                rect.top() + 8.0 + icon_side / 2.0,
+                                            ),
+                                            egui::vec2(icon_side, icon_side),
+                                        );
+                                        match &texture {
+                                            Some(texture) => {
+                                                ui.painter().image(
+                                                    texture.id(),
+                                                    icon_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+                                            None => {
+                                                ui.painter().rect_filled(
+                                                    icon_rect,
+                                                    icon_side * 0.22,
+                                                    egui::Color32::from_rgb(58, 62, 72),
+                                                );
+                                                let initial = app
+                                                    .name
+                                                    .chars()
+                                                    .next()
+                                                    .map(|c| c.to_uppercase().to_string())
+                                                    .unwrap_or_else(|| "?".to_string());
+                                                ui.painter().text(
+                                                    icon_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    initial,
+                                                    egui::FontId::proportional(icon_side * 0.42),
+                                                    egui::Color32::from_gray(200),
+                                                );
+                                            }
+                                        }
+                                        let label = if app.name.chars().count() > 10 {
+                                            format!(
+                                                "{}…",
+                                                app.name.chars().take(9).collect::<String>()
+                                            )
+                                        } else {
+                                            app.name.clone()
+                                        };
+                                        ui.painter().text(
+                                            egui::pos2(rect.center().x, rect.top() + icon_side + 16.0),
+                                            egui::Align2::CENTER_TOP,
+                                            label,
+                                            egui::FontId::proportional(14.0),
+                                            egui::Color32::from_gray(215),
+                                        );
+                                        if response.clicked() {
+                                            match self.library.action_for(app) {
+                                                AppAction::Pull(window) => pull_window = Some(window),
+                                                AppAction::Open(target) => open_app = Some(target),
+                                            }
+                                        }
                                     }
-                                }
+                                });
                             }
                         }
                     }
