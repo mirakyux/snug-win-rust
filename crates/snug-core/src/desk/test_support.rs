@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 use crate::desk::engine::{Desk, DeskEvents, DeskOptions};
-use crate::desk::model::DeskState;
+use crate::desk::model::{DeskGone, DeskState};
 use crate::desk::services::{
     AppControl, CancelToken, PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException, Timeline,
     WindowControl, WindowLook,
@@ -250,9 +250,11 @@ impl PhoneDisplays for FakeDisplays {
     }
 }
 
-/// 假窗口服务，对应 C# `FakeWindows`。
+/// 假窗口服务，对应 C# `FakeWindows`（并补上 C# 测试里没用到的"列出窗口"能力）。
 pub struct FakeWindows {
     frames: Mutex<HashMap<WindowKey, Rect>>,
+    infos: Mutex<HashMap<WindowKey, WindowInfo>>,
+    asking: Mutex<Option<WindowInfo>>,
     zoom_delta_total: AtomicI32,
     min_logical_width: Mutex<f64>,
     zoom_ok: AtomicBool,
@@ -267,6 +269,8 @@ impl Default for FakeWindows {
     fn default() -> Self {
         Self {
             frames: Mutex::new(HashMap::new()),
+            infos: Mutex::new(HashMap::new()),
+            asking: Mutex::new(None),
             zoom_delta_total: AtomicI32::new(0),
             min_logical_width: Mutex::new(0.0),
             zoom_ok: AtomicBool::new(true),
@@ -282,6 +286,17 @@ impl Default for FakeWindows {
 impl FakeWindows {
     pub fn insert(&self, key: WindowKey, frame: Rect) {
         self.frames.lock().expect("frames").insert(key, frame);
+    }
+
+    /// 连窗口信息一起登记（`shown_windows` 会返回它）。
+    pub fn insert_window(&self, info: WindowInfo, frame: Rect) {
+        self.frames.lock().expect("frames").insert(info.key, frame);
+        self.infos.lock().expect("infos").insert(info.key, info);
+    }
+
+    /// 模拟"某个进程正在弹询问窗口"。
+    pub fn set_asking(&self, window: Option<WindowInfo>) {
+        *self.asking.lock().expect("asking") = window;
     }
 
     pub fn remove(&self, key: WindowKey) {
@@ -379,15 +394,28 @@ impl WindowControl for FakeWindows {
         true
     }
 
-    fn shown_windows(&self, _pid: i32) -> Vec<WindowInfo> {
-        Vec::new()
+    fn shown_windows(&self, pid: i32) -> Vec<WindowInfo> {
+        let frames = self.frames.lock().expect("frames");
+        self.infos
+            .lock()
+            .expect("infos")
+            .values()
+            .filter(|info| info.key.pid == pid && frames.contains_key(&info.key))
+            .cloned()
+            .collect()
     }
 
-    fn asking_window(&self, _pid: i32) -> Option<WindowInfo> {
-        None
+    fn asking_window(&self, pid: i32) -> Option<WindowInfo> {
+        self.asking
+            .lock()
+            .expect("asking")
+            .as_ref()
+            .filter(|info| info.key.pid == pid)
+            .cloned()
     }
 
     fn close(&self, window: WindowKey) -> bool {
+        self.infos.lock().expect("infos").remove(&window);
         self.frames.lock().expect("frames").remove(&window).is_some()
     }
 
@@ -411,37 +439,125 @@ impl WindowControl for FakeWindows {
     }
 }
 
-/// 假 App 服务，对应 C# `FakeApps`。
-#[derive(Default)]
-pub struct FakeApps;
+/// 假 App 服务，对应 C# `FakeApps`（补上可配置的打开 / 退出结果）。
+pub struct FakeApps {
+    /// 没登记的 pid 视为"在运行"（C# FakeApps 恒为 true）。
+    running: Mutex<HashMap<i32, bool>>,
+    quit_result: AtomicBool,
+    /// quit 成功但进程还在（模拟"请它退出了，用户没确认"）。
+    quit_keeps_running: AtomicBool,
+    force_quit_result: AtomicBool,
+    open_result: Mutex<Option<i32>>,
+    new_window_result: AtomicBool,
+    pids_by_app: Mutex<HashMap<String, Vec<i32>>>,
+    windows_by_app: Mutex<HashMap<String, Vec<WindowInfo>>>,
+    /// 新建窗口时回调（测试用它模拟"新窗口出现了"）。
+    on_new_window: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Default for FakeApps {
+    fn default() -> Self {
+        Self {
+            running: Mutex::new(HashMap::new()),
+            quit_result: AtomicBool::new(true),
+            quit_keeps_running: AtomicBool::new(false),
+            force_quit_result: AtomicBool::new(true),
+            open_result: Mutex::new(None),
+            new_window_result: AtomicBool::new(false),
+            pids_by_app: Mutex::new(HashMap::new()),
+            windows_by_app: Mutex::new(HashMap::new()),
+            on_new_window: Mutex::new(None),
+        }
+    }
+}
+
+impl FakeApps {
+    pub fn set_running(&self, pid: i32, running: bool) {
+        self.running.lock().expect("running").insert(pid, running);
+    }
+
+    pub fn set_quit_result(&self, ok: bool) {
+        self.quit_result.store(ok, Ordering::SeqCst);
+    }
+
+    /// quit 返回成功但进程继续跑（模拟用户还没确认退出）。
+    pub fn set_quit_keeps_running(&self, keeps_running: bool) {
+        self.quit_keeps_running.store(keeps_running, Ordering::SeqCst);
+    }
+
+    pub fn set_force_quit_result(&self, ok: bool) {
+        self.force_quit_result.store(ok, Ordering::SeqCst);
+    }
+
+    pub fn set_open_result(&self, pid: Option<i32>) {
+        *self.open_result.lock().expect("open result") = pid;
+    }
+
+    pub fn set_new_window_result(&self, ok: bool) {
+        self.new_window_result.store(ok, Ordering::SeqCst);
+    }
+
+    pub fn set_pids(&self, app_id: &str, pids: Vec<i32>) {
+        self.pids_by_app.lock().expect("pids").insert(app_id.to_string(), pids);
+    }
+
+    pub fn set_app_windows(&self, app_id: &str, windows: Vec<WindowInfo>) {
+        self.windows_by_app.lock().expect("app windows").insert(app_id.to_string(), windows);
+    }
+
+    pub fn set_on_new_window(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_new_window.lock().expect("hook") = Some(Arc::new(hook));
+    }
+}
 
 impl AppControl for FakeApps {
     fn pid_of(&self, _app: &AppInfo) -> Option<i32> {
         None
     }
 
-    fn pids(&self, _app_id: &str) -> Vec<i32> {
-        Vec::new()
+    fn pids(&self, app_id: &str) -> Vec<i32> {
+        self.pids_by_app.lock().expect("pids").get(app_id).cloned().unwrap_or_default()
     }
 
     fn open(&self, _app: &AppInfo) -> Option<i32> {
-        None
+        *self.open_result.lock().expect("open result")
     }
 
     fn new_window(&self, _pid: i32) -> bool {
-        false
+        let hook = self.on_new_window.lock().expect("hook").clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.new_window_result.load(Ordering::SeqCst)
     }
 
-    fn quit(&self, _pid: i32) -> bool {
-        true
+    fn quit(&self, pid: i32) -> bool {
+        let ok = self.quit_result.load(Ordering::SeqCst);
+        if ok && !self.quit_keeps_running.load(Ordering::SeqCst) {
+            self.running.lock().expect("running").insert(pid, false);
+        }
+        ok
     }
 
-    fn force_quit(&self, _pid: i32) -> bool {
-        true
+    fn force_quit(&self, pid: i32) -> bool {
+        let ok = self.force_quit_result.load(Ordering::SeqCst);
+        if ok {
+            self.running.lock().expect("running").insert(pid, false);
+        }
+        ok
     }
 
-    fn is_running(&self, _pid: i32) -> bool {
-        true
+    fn is_running(&self, pid: i32) -> bool {
+        self.running.lock().expect("running").get(&pid).copied().unwrap_or(true)
+    }
+
+    fn app_windows(&self, app: &AppInfo, _launched_pid: Option<i32>) -> Vec<WindowInfo> {
+        self.windows_by_app
+            .lock()
+            .expect("app windows")
+            .get(&app.app_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -455,6 +571,7 @@ pub struct Harness {
     pub paths: Paths,
     pub dir: PathBuf,
     states: Arc<Mutex<Vec<DeskState>>>,
+    gones: Arc<Mutex<Vec<DeskGone>>>,
 }
 
 impl Harness {
@@ -469,14 +586,19 @@ impl Harness {
 
         let displays = Arc::new(FakeDisplays::default());
         let windows = Arc::new(FakeWindows::default());
-        let apps = Arc::new(FakeApps);
+        let apps = Arc::new(FakeApps::default());
         let timeline = Arc::new(FakeTimeline::default());
 
         let states = Arc::new(Mutex::new(Vec::<DeskState>::new()));
         let sink = Arc::clone(&states);
+        let gones = Arc::new(Mutex::new(Vec::<DeskGone>::new()));
+        let gone_sink = Arc::clone(&gones);
         let events = DeskEvents {
             state_changed: Some(Arc::new(move |state: &DeskState| {
                 sink.lock().expect("states").push(state.clone());
+            })),
+            gone: Some(Arc::new(move |gone: &DeskGone| {
+                gone_sink.lock().expect("gones").push(gone.clone());
             })),
             ..DeskEvents::default()
         };
@@ -493,11 +615,15 @@ impl Harness {
             },
         );
 
-        Self { desk, displays, windows, apps, timeline, paths, dir, states }
+        Self { desk, displays, windows, apps, timeline, paths, dir, states, gones }
     }
 
     pub fn states(&self) -> Vec<DeskState> {
         self.states.lock().expect("states").clone()
+    }
+
+    pub fn gones(&self) -> Vec<DeskGone> {
+        self.gones.lock().expect("gones").clone()
     }
 }
 
