@@ -80,6 +80,8 @@ pub struct PhoneHomeApp {
     /// **与 C# 的差别**：C# 是"一块屏一个 `PhoneHomeWindow`"，我们只有一块窗口，
     /// 所以同一时刻只画一块屏。理由见 `docs/multi-screen.md`。
     pub active_screen: Option<String>,
+    /// 用户按下了重入 pill 上的「×」（C# `_reentryPillHidden`）：这次会话里不再弹。
+    pub reentry_pill_hidden: bool,
 }
 
 /// 桌面预览的运行态。
@@ -155,7 +157,82 @@ impl PhoneHomeApp {
             dark: false,
             palette: crate::theme::Palette::DARK,
             active_screen: None,
+            reentry_pill_hidden: false,
         }
+    }
+
+    /// 现在是不是"重入 pill"形态：手机屏被收起、还能重进、没开预览、用户没按过 ×。
+    ///
+    /// 对应 C# `PhoneReentryWindow`：屏收起时在**主屏右下角**留一个小胶囊，
+    /// 点一下就回到手机屏。C# 那是独立的置顶窗口；我们只有一块窗口，
+    /// 收起时就把它本身缩成这个胶囊（不新开视口，见 `docs/multi-screen.md`）。
+    fn pill_mode(&self) -> bool {
+        self.preview.is_none()
+            && !self.reentry_pill_hidden
+            && !self.settings.is_open()
+            && self.state().screen_phase != PhoneScreenPhase::Ready
+            && self.controller.can_reenter()
+    }
+
+    /// 胶囊该摆在哪、多大（物理像素）。照 C# `ShowAtBottomRight`：
+    /// 主屏工作区右下角、留 18 点边距，尺寸取 260×52 点。
+    fn pill_rect(&self, ctx: &egui::Context) -> Option<snug_core::Rect> {
+        const WIDTH_POINTS: f64 = 260.0;
+        const HEIGHT_POINTS: f64 = 52.0;
+        const MARGIN_POINTS: f64 = 18.0;
+        let area = self.controller.main_area()?;
+        let native = (ctx.pixels_per_point() / ctx.zoom_factor()) as f64;
+        let width = WIDTH_POINTS * native;
+        let height = HEIGHT_POINTS * native;
+        let margin = MARGIN_POINTS * native;
+        Some(snug_core::Rect::new(
+            (area.x + area.width - width - margin).max(area.x + margin),
+            (area.y + area.height - height - margin).max(area.y + margin),
+            width,
+            height,
+        ))
+    }
+
+    /// 画重入胶囊（只有 [`Self::pill_mode`] 为真时才走这里）。
+    fn draw_pill(&mut self, ctx: &egui::Context) {
+        let palette = self.palette;
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(palette.card)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let enter = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("📱 进入手机屏")
+                                .size(15.0)
+                                .color(palette.text),
+                        )
+                        .frame(false),
+                    );
+                    if enter.clicked() {
+                        crate::info!("重入胶囊：进入手机屏");
+                        self.reentry_pill_hidden = false;
+                        self.last_phone_rect = None;
+                        self.controller.reenter();
+                        ctx.request_repaint();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("×").size(15.0)).frame(false))
+                            .on_hover_text("收起这个按钮（仍可从托盘菜单重进）")
+                            .clicked()
+                        {
+                            crate::info!("重入胶囊：用户收起");
+                            self.reentry_pill_hidden = true;
+                            self.last_offscreen = None;
+                            ctx.request_repaint();
+                        }
+                    });
+                });
+            });
     }
 
     /// 当前显示的这块屏的状态（`active_screen` 为空时是主触控屏）。
@@ -443,15 +520,28 @@ impl PhoneHomeApp {
             ctx.set_zoom_factor(1.0);
             crate::info!("预览：手机屏已就绪，预览窗口让位");
         }
-        let preview_rect = if ready { None } else { self.preview_rect(ctx) };
         let bounds = if ready {
             if showing_bar {
                 self.controller.home_bar_area_of(self.active_screen.as_deref())
             } else {
                 self.controller.phone_bounds_of(self.active_screen.as_deref())
             }
+        } else if self.preview.is_some() {
+            self.preview_rect(ctx)
+        } else if self.settings.is_open() {
+            // 手机屏收起/没连，但用户从托盘打开了设置：设置是画在窗口里的，
+            // 窗口只有胶囊那么大就会被裁掉，所以临时按"主屏上的整块手机界面"显示。
+            match self.desktop_layout(ctx) {
+                Some((rect, scale)) => {
+                    self.apply_ui_scale(ctx, scale, "设置（无手机屏）");
+                    Some(rect)
+                }
+                None => None,
+            }
+        } else if self.pill_mode() {
+            self.pill_rect(ctx)
         } else {
-            preview_rect
+            None
         };
 
         let Some(bounds) = bounds else {
@@ -501,11 +591,19 @@ impl PhoneHomeApp {
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
                     "{}：{}，搬到 ({}, {}) {}×{}",
-                    if self.preview.is_some() { "预览窗" } else { "手机屏界面" },
+                    if self.preview.is_some() {
+                        "预览窗"
+                    } else if self.pill_mode() {
+                        "重入胶囊"
+                    } else {
+                        "手机屏界面"
+                    },
                     if showing_bar {
                         "收成底部指示条"
                     } else if self.preview.is_some() {
                         "预览（只读）"
+                    } else if self.pill_mode() {
+                        "主屏右下角"
                     } else {
                         "铺满资源库"
                     },
@@ -529,7 +627,7 @@ impl PhoneHomeApp {
     /// `zoom_factor` 达到同样效果——窗口物理尺寸 = 设计点 × 缩放 × 屏幕原生 DPI。
     ///
     /// 返回 `None` 表示拿不到主屏区域，调用方按"没有手机屏"处理（窗口挪到屏幕外）。
-    fn preview_rect(&mut self, ctx: &egui::Context) -> Option<snug_core::Rect> {
+    fn desktop_layout(&self, ctx: &egui::Context) -> Option<(snug_core::Rect, f32)> {
         let area = self.controller.main_area()?;
         let fit = snug_core::ScreenFit::from_phone(&self.config.phone.screen.to_fit_spec());
         let (design_width, design_height, scale) = snug_core::ScreenFit::compute_preview_layout(
@@ -546,11 +644,22 @@ impl PhoneHomeApp {
             width,
             height,
         );
-        if (ctx.zoom_factor() - scale as f32).abs() > 0.01 {
-            ctx.set_zoom_factor(scale as f32);
-            crate::info!("预览：界面缩放 {:.2}", scale);
+        Some((rect, scale as f32))
+    }
+
+    /// 把缩放应用到 egui（窗口尺寸另算）。
+    fn apply_ui_scale(&self, ctx: &egui::Context, scale: f32, why: &str) {
+        if (ctx.zoom_factor() - scale).abs() > 0.01 {
+            ctx.set_zoom_factor(scale);
+            crate::info!("{why}：界面缩放 {scale:.2}");
         }
-        self.preview = Some(PreviewState { scale: scale as f32 });
+    }
+
+    /// 预览模式的窗口矩形（会把 `preview` 状态置上）。
+    fn preview_rect(&mut self, ctx: &egui::Context) -> Option<snug_core::Rect> {
+        let (rect, scale) = self.desktop_layout(ctx)?;
+        self.apply_ui_scale(ctx, scale, "预览");
+        self.preview = Some(PreviewState { scale });
         Some(rect)
     }
 
@@ -922,6 +1031,12 @@ impl eframe::App for PhoneHomeApp {
             return;
         }
 
+        // 手机屏被收起、还能重进：窗口缩成主屏右下角的小胶囊（C# `PhoneReentryWindow`）。
+        if self.pill_mode() {
+            self.draw_pill(ctx);
+            return;
+        }
+
         // 有窗口铺在手机屏上时，界面只剩底部指示条（C#：PhoneHomeWindow 隐、HomeBarWindow 显）。
         // 和 `sync_window` 同一个条件：点了「‹ 资源库」之后 `list_visible=true`，即使窗口
         // 还铺在手机屏上，也必须回到资源库列表。
@@ -1151,8 +1266,10 @@ impl eframe::App for PhoneHomeApp {
                             };
                             ui.label(egui::RichText::new(hint).weak());
                         }
-                        // 手机桌面式图标网格：4 列、大图标、名称在下方。
-                        let columns = 4usize;
+                        // 手机桌面式图标网格：竖屏 4 列、横屏 6 列
+                        // （C# `UpdateResponsiveLayout`：`Columns = landscape ? 6 : 4`）。
+                        let landscape = ui.available_width() > ui.available_height();
+                        let columns = grid_columns(landscape);
                         let gap = 10.0;
                         let cell_w =
                             ((ui.available_width() - gap - gap * columns as f32) / columns as f32)
@@ -1299,6 +1416,11 @@ impl eframe::App for PhoneHomeApp {
 }
 
     /// 从程序目录往上找 `driver/Install-SnugDriver.ps1`（C# `LocateBundledDriverScript`：最多 5 层）。
+/// 资源库图标网格的列数：横屏 6 列、竖屏 4 列（C# `UpdateResponsiveLayout` 同）。
+fn grid_columns(landscape: bool) -> usize {
+    if landscape { 6 } else { 4 }
+}
+
 fn locate_driver_script() -> Option<std::path::PathBuf> {
     let mut dir = std::env::current_exe().ok()?.parent().map(|dir| dir.to_path_buf())?;
     for _ in 0..5 {
@@ -1396,4 +1518,16 @@ fn app_row(
     });
 
     (clicked, plus, cross)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grid_columns;
+
+    /// 原版 `UpdateResponsiveLayout`：横屏 6 列、竖屏 4 列。
+    #[test]
+    fn grid_columns_follow_orientation() {
+        assert_eq!(grid_columns(false), 4, "竖屏手机屏应该是 4 列");
+        assert_eq!(grid_columns(true), 6, "横屏（平板/电脑）应该是 6 列");
+    }
 }
