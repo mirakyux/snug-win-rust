@@ -12,7 +12,7 @@
 //! 由 `snug-core` 的串行队列（`SerialLane`）负责不卡界面线程，语义与 C# 一致。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use snug_core::desk::{PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException};
@@ -358,18 +358,47 @@ fn sleep_for(duration: Duration) {
 // 手机屏（可注入假实现的逻辑本体）
 // ---------------------------------------------------------------------------
 
+/// 手机屏的映射状态：逻辑宽度档位与 GDI 设备名。
+///
+/// 这把锁**只**保护这两个 map，锁内不做任何系统调用；建/改/撤那些会睡几秒的
+/// 慢操作由调用方另用一把「操作锁」串行，查询不会被它们挡住。
+#[derive(Debug, Default)]
+struct ScreenMaps {
+    fits: HashMap<u32, ScreenFit>,
+    device_names: HashMap<u32, String>,
+}
+
+impl ScreenMaps {
+    fn phone_names(&self) -> HashSet<String> {
+        self.device_names.values().map(|name| normalized(name)).collect()
+    }
+}
+
+/// 锁中毒（上一次调用 panic）也照常继续：这两个 map 没有会因此破坏的不变量。
+fn lock_maps(maps: &Mutex<ScreenMaps>) -> std::sync::MutexGuard<'_, ScreenMaps> {
+    match maps.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// 手机屏的建/改/撤逻辑，对应 C# `PhoneDisplayService` 的正体。
 struct PhoneScreen<A: DisplayApi, V: VirtualDisplays> {
     api: A,
     ipc: V,
     timings: Timings,
-    fits: HashMap<u32, ScreenFit>,
-    device_names: HashMap<u32, String>,
+    maps: Arc<Mutex<ScreenMaps>>,
 }
 
 impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
+    /// 测试里直接建一个完整对象；真机走 [`Self::with_maps`]，与查询共享 map。
+    #[cfg(test)]
     fn new(api: A, ipc: V, timings: Timings) -> Self {
-        Self { api, ipc, timings, fits: HashMap::new(), device_names: HashMap::new() }
+        Self::with_maps(api, ipc, timings, Arc::new(Mutex::new(ScreenMaps::default())))
+    }
+
+    fn with_maps(api: A, ipc: V, timings: Timings, maps: Arc<Mutex<ScreenMaps>>) -> Self {
+        Self { api, ipc, timings, maps }
     }
 
     /// 启动时清掉上次崩溃留下的虚拟屏（C# `CleanupOrphansAsync`）。
@@ -417,8 +446,11 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 let _ = self.ipc.remove(&[candidate]);
                 continue;
             };
-            self.fits.insert(candidate, fit.clone());
-            self.device_names.insert(candidate, snapshot.device_name.clone());
+            {
+                let mut maps = lock_maps(&self.maps);
+                maps.fits.insert(candidate, fit.clone());
+                maps.device_names.insert(candidate, snapshot.device_name.clone());
+            }
             self.set_width(candidate, fit.base_width());
             return Ok(candidate);
         }
@@ -472,7 +504,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 换比例（C# `ReshapeAsync`）。
     fn reshape(&mut self, display_id: u32, fit: ScreenFit) -> bool {
-        let Some(device_name) = self.device_names.get(&display_id).cloned() else {
+        let Some(device_name) = lock_maps(&self.maps).device_names.get(&display_id).cloned() else {
             return false;
         };
         let monitor = VddMonitor {
@@ -490,7 +522,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             return false;
         }
 
-        self.fits.insert(display_id, fit.clone());
+        lock_maps(&self.maps).fits.insert(display_id, fit.clone());
         let (base_width, base_height) = fit.pixel_size(fit.base_width());
         let start = Instant::now();
         while start.elapsed() < self.timings.reshape {
@@ -503,14 +535,13 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         true
     }
 
-    fn fit_of(&self, display_id: u32) -> Option<ScreenFit> {
-        self.fits.get(&display_id).cloned()
-    }
-
     /// 撤屏（C# `RetireAsync`）：等它真的下线，顺手把走丢的光标捞回来。
     fn retire(&mut self, display_id: u32) -> bool {
-        self.fits.remove(&display_id);
-        let device_name = self.device_names.remove(&display_id);
+        let device_name = {
+            let mut maps = lock_maps(&self.maps);
+            maps.fits.remove(&display_id);
+            maps.device_names.remove(&display_id)
+        };
         let _ = self.ipc.remove(&[display_id]);
 
         let Some(device_name) = device_name else {
@@ -547,48 +578,6 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         }
     }
 
-    fn is_online(&self, display_id: u32) -> bool {
-        let Some(device_name) = self.device_names.get(&display_id) else {
-            return false;
-        };
-        let wanted = normalized(device_name);
-        self.api
-            .active_monitors()
-            .iter()
-            .any(|m| normalized(&m.device_name) == wanted)
-    }
-
-    fn width_of(&self, display_id: u32) -> Option<i32> {
-        let monitor = self.find_monitor(display_id)?;
-        Some(width_for_mode(monitor.mode.width, self.fits.get(&display_id)))
-    }
-
-    fn bounds_of(&self, display_id: u32) -> Option<Rect> {
-        Some(self.find_monitor(display_id)?.bounds)
-    }
-
-    fn window_area_of(&self, display_id: u32) -> Option<Rect> {
-        let monitor = self.find_monitor(display_id)?;
-        let logical_width = self
-            .width_of(display_id)
-            .unwrap_or(DESIGN_WIDTH as i32);
-        Some(window_area(&monitor, logical_width))
-    }
-
-    fn home_bar_area_of(&self, display_id: u32) -> Option<Rect> {
-        let monitor = self.find_monitor(display_id)?;
-        let area = window_area(&monitor, self.width_of(display_id).unwrap_or(DESIGN_WIDTH as i32));
-        Some(home_bar_area(&monitor, area))
-    }
-
-    fn main_area(&self) -> Option<Rect> {
-        main_area(&self.api.active_monitors(), &self.phone_names())
-    }
-
-    fn other_displays(&self) -> Vec<OtherDisplay> {
-        other_displays(&self.api.active_monitors(), &self.phone_names())
-    }
-
     /// 把某块屏切到给定模式（C# `SetModeAsync`，`permanently` 在 C# 里也没用）。
     fn set_mode(&mut self, display_id: u32, mode: DisplayModeInfo) {
         let Some(target) = self
@@ -621,15 +610,19 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 切到某个逻辑宽度：先改分辨率，再把 DPI 拉到 200%（C# `SetWidthAsync`）。
     fn set_width(&mut self, display_id: u32, width: i32) {
-        let (Some(fit), Some(device_name)) = (
-            self.fits.get(&display_id).cloned(),
-            self.device_names.get(&display_id).cloned(),
-        ) else {
-            return;
+        let (fit, device_name) = {
+            let maps = lock_maps(&self.maps);
+            let (Some(fit), Some(name)) = (
+                maps.fits.get(&display_id).cloned(),
+                maps.device_names.get(&display_id).cloned(),
+            ) else {
+                return;
+            };
+            (fit, name)
         };
 
         let (pixel_width, pixel_height) = fit.pixel_size(width);
-        let current = self.find_monitor(display_id);
+        let current = find_monitor_of(&self.api, &self.maps, display_id);
         let needs_resolution = match &current {
             Some(m) => m.mode.width != pixel_width || m.mode.height != pixel_height,
             None => true,
@@ -644,7 +637,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             sleep_for(self.timings.resolution_settle);
         }
 
-        if let Some(after) = self.find_monitor(display_id)
+        if let Some(after) = find_monitor_of(&self.api, &self.maps, display_id)
             && after.mode.dpi_scale_percent != TARGET_DPI_PERCENT
         {
             self.api.set_dpi_scale(
@@ -654,19 +647,73 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             );
         }
     }
+}
 
-    fn find_monitor(&self, display_id: u32) -> Option<MonitorSnapshot> {
-        let device_name = self.device_names.get(&display_id)?;
-        let wanted = normalized(device_name);
-        self.api
-            .active_monitors()
-            .into_iter()
-            .find(|m| normalized(&m.device_name) == wanted)
-    }
+// ---------------------------------------------------------------------------
+// 查询（不碰慢操作锁：界面每帧调用的路径）
+// ---------------------------------------------------------------------------
 
-    fn phone_names(&self) -> HashSet<String> {
-        self.device_names.values().map(|name| normalized(name)).collect()
-    }
+fn find_monitor_of<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<MonitorSnapshot> {
+    let device_name = lock_maps(maps).device_names.get(&display_id).cloned()?;
+    let wanted = normalized(&device_name);
+    api.active_monitors()
+        .into_iter()
+        .find(|m| normalized(&m.device_name) == wanted)
+}
+
+fn is_online_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>, display_id: u32) -> bool {
+    let Some(device_name) = lock_maps(maps).device_names.get(&display_id).cloned() else {
+        return false;
+    };
+    let wanted = normalized(&device_name);
+    api.active_monitors()
+        .iter()
+        .any(|m| normalized(&m.device_name) == wanted)
+}
+
+fn width_of_display<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<i32> {
+    let monitor = find_monitor_of(api, maps, display_id)?;
+    let fit = lock_maps(maps).fits.get(&display_id).cloned();
+    Some(width_for_mode(monitor.mode.width, fit.as_ref()))
+}
+
+fn window_area_of_display<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<Rect> {
+    let monitor = find_monitor_of(api, maps, display_id)?;
+    let logical_width = width_of_display(api, maps, display_id)
+        .unwrap_or(DESIGN_WIDTH as i32);
+    Some(window_area(&monitor, logical_width))
+}
+
+fn home_bar_area_of_display<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<Rect> {
+    let monitor = find_monitor_of(api, maps, display_id)?;
+    let area = window_area(&monitor, width_of_display(api, maps, display_id).unwrap_or(DESIGN_WIDTH as i32));
+    Some(home_bar_area(&monitor, area))
+}
+
+fn main_area_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>) -> Option<Rect> {
+    let names = lock_maps(maps).phone_names();
+    main_area(&api.active_monitors(), &names)
+}
+
+fn other_displays_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>) -> Vec<OtherDisplay> {
+    let names = lock_maps(maps).phone_names();
+    other_displays(&api.active_monitors(), &names)
 }
 
 /// 供 `home_bar_area_of` 复用「窗口区域」的算式，但不重复查两次显示器列表。
@@ -1254,7 +1301,16 @@ fn multi_sz(bytes: &[u8]) -> Vec<String> {
 
 /// 真机手机屏服务：`snug_core::desk::PhoneDisplays` 的 Windows 实现。
 pub struct WinPhoneDisplays {
-    inner: Mutex<PhoneScreen<WinDisplay, VddClient>>,
+    /// 查询用。`WinDisplay` 无状态，每次现查系统，不与慢操作抢锁。
+    api: WinDisplay,
+    /// 只保护 `fits` / `device_names`，锁内没有系统调用。
+    maps: Arc<Mutex<ScreenMaps>>,
+    /// 慢操作串行：create / reshape / retire / set_width / cleanup 才拿这把锁。
+    ///
+    /// C# 这些方法是 async，等待时把线程让出去；Rust 用「慢操作锁 + 短查询锁」
+    /// 达到同样效果：查询（界面每帧调 `home_bar_area`/`phone_bounds`）不会
+    /// 被几秒的轮询挡住。
+    ops: Mutex<PhoneScreen<WinDisplay, VddClient>>,
 }
 
 impl Default for WinPhoneDisplays {
@@ -1273,24 +1329,26 @@ impl WinPhoneDisplays {
     }
 
     pub fn with_parts(api: WinDisplay, ipc: VddClient, timings: Timings) -> Self {
-        Self { inner: Mutex::new(PhoneScreen::new(api, ipc, timings)) }
+        let maps = Arc::new(Mutex::new(ScreenMaps::default()));
+        let screen = PhoneScreen::with_maps(api, ipc, timings, maps.clone());
+        Self { api, maps, ops: Mutex::new(screen) }
     }
 
     /// 启动时清掉残留的虚拟屏（C# `CleanupOrphansAsync`）。
     pub fn cleanup_orphans(&self) {
-        self.with_screen(|screen| screen.cleanup_orphans());
+        self.with_ops(|screen| screen.cleanup_orphans());
     }
 
     /// Home Bar 区域（C# `PhoneDisplayService.HomeBarAreaOf`）。
     ///
     /// C# 的 `IPhoneDisplays` 里没有这个方法，界面那边用的是具体类型，所以这里也放在具体类型上。
     pub fn home_bar_area_of(&self, display_id: u32) -> Option<Rect> {
-        self.with_screen(|screen| screen.home_bar_area_of(display_id))
+        home_bar_area_of_display(&self.api, &self.maps, display_id)
     }
 
-    fn with_screen<T>(&self, body: impl FnOnce(&mut PhoneScreen<WinDisplay, VddClient>) -> T) -> T {
-        // 锁中毒（上一次调用 panic）也照常继续：这里的状态没有不变量会因此破坏。
-        let mut guard = match self.inner.lock() {
+    /// 慢操作串行入口；锁中毒（上一次调用 panic）也照常继续。
+    fn with_ops<T>(&self, body: impl FnOnce(&mut PhoneScreen<WinDisplay, VddClient>) -> T) -> T {
+        let mut guard = match self.ops.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1300,52 +1358,54 @@ impl WinPhoneDisplays {
 
 impl PhoneDisplays for WinPhoneDisplays {
     fn create(&self, fit: ScreenFit) -> Result<u32, PhoneScreenException> {
-        self.with_screen(|screen| screen.create(fit))
+        self.with_ops(|screen| screen.create(fit))
     }
 
     fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool {
-        self.with_screen(|screen| screen.reshape(display_id, fit))
+        self.with_ops(|screen| screen.reshape(display_id, fit))
     }
 
     fn fit_of(&self, display_id: u32) -> Option<ScreenFit> {
-        self.with_screen(|screen| screen.fit_of(display_id))
+        lock_maps(&self.maps).fits.get(&display_id).cloned()
     }
 
     fn retire(&self, display_id: u32) -> bool {
-        self.with_screen(|screen| screen.retire(display_id))
+        self.with_ops(|screen| screen.retire(display_id))
     }
 
+    // TODO(取消)：C# 每个等待循环都带 CancellationToken，这里没有 token，
+    // 建屏/换比例/撤屏的轮询最长 8s/4s/10s 不可中断（见 docs/display-parity.md）。
     fn is_online(&self, display_id: u32) -> bool {
-        self.with_screen(|screen| screen.is_online(display_id))
+        is_online_of(&self.api, &self.maps, display_id)
     }
 
     fn width_of(&self, display_id: u32) -> Option<i32> {
-        self.with_screen(|screen| screen.width_of(display_id))
+        width_of_display(&self.api, &self.maps, display_id)
     }
 
     fn set_width(&self, display_id: u32, width: i32) {
-        self.with_screen(|screen| screen.set_width(display_id, width));
+        self.with_ops(|screen| screen.set_width(display_id, width));
     }
 
     fn bounds_of(&self, display_id: u32) -> Option<Rect> {
-        self.with_screen(|screen| screen.bounds_of(display_id))
+        Some(find_monitor_of(&self.api, &self.maps, display_id)?.bounds)
     }
 
     fn window_area_of(&self, display_id: u32) -> Option<Rect> {
-        self.with_screen(|screen| screen.window_area_of(display_id))
+        window_area_of_display(&self.api, &self.maps, display_id)
     }
 
     fn main_area(&self) -> Option<Rect> {
-        self.with_screen(|screen| screen.main_area())
+        main_area_of(&self.api, &self.maps)
     }
 
     fn other_displays(&self) -> Vec<OtherDisplay> {
-        self.with_screen(|screen| screen.other_displays())
+        other_displays_of(&self.api, &self.maps)
     }
 
     fn set_mode(&self, display_id: u32, mode: DisplayModeInfo, permanently: bool) {
         let _ = permanently; // C# 版本同样忽略这个参数。
-        self.with_screen(|screen| screen.set_mode(display_id, mode));
+        self.with_ops(|screen| screen.set_mode(display_id, mode));
     }
 }
 
@@ -1836,9 +1896,9 @@ mod tests {
             assert_eq!(world.dpi_calls.len(), 1);
             assert_eq!(world.dpi_calls[0].2, TARGET_DPI_PERCENT);
         }
-        assert!(screen.is_online(id));
-        assert_eq!(screen.width_of(id), Some(540));
-        assert_eq!(screen.fit_of(id), Some(ScreenFit::standard()));
+        assert!(is_online_of(&screen.api, &screen.maps, id));
+        assert_eq!(width_of_display(&screen.api, &screen.maps, id), Some(540));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), Some(ScreenFit::standard()));
     }
 
     #[test]
@@ -1904,7 +1964,7 @@ mod tests {
             let world = shared.lock().unwrap();
             assert_eq!(world.notified, vec![vec![id]], "legacy 走 ReplaceLegacy 也要把新模式发出去");
         }
-        assert_eq!(screen.fit_of(id), Some(iphone8));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), Some(iphone8));
     }
 
     #[test]
@@ -1923,8 +1983,8 @@ mod tests {
             assert!(world.removed.contains(&id));
             assert_eq!(world.moves, vec![Point::new(960.0, 540.0)], "光标挪回主屏中央");
         }
-        assert!(!screen.is_online(id));
-        assert_eq!(screen.fit_of(id), None);
+        assert!(!is_online_of(&screen.api, &screen.maps, id));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), None);
     }
 
     #[test]
