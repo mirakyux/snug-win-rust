@@ -91,3 +91,77 @@ pub fn warn(message: &str) {
         None => eprintln!("[Warn] {message}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 系统明暗主题
+// ---------------------------------------------------------------------------
+
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+    REG_VALUE_TYPE,
+};
+use windows::core::PCWSTR;
+
+/// 系统「应用」主题的注册表位置（C# `AppController.IsSystemAppsDarkTheme`）。
+const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+const APPS_USE_LIGHT_THEME: &str = "AppsUseLightTheme";
+
+/// 纯映射：注册表值 → 是否浅色。读不到/类型不对都按 Windows 默认浅色。
+fn light_theme_from_value(value: Option<u32>) -> bool {
+    value != Some(0)
+}
+
+/// 系统（应用）当前是否使用浅色主题。
+///
+/// 只读 `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
+/// （DWORD：1=浅色、0=深色），不写任何东西；读不到时返回 `true`——Windows 默认
+/// 浅色，也和界面默认一致（C# 读不到时按"非深色"处理）。
+pub fn system_uses_light_theme() -> bool {
+    let key_path = crate::wide::to_wide(PERSONALIZE_KEY);
+    let value_name = crate::wide::to_wide(APPS_USE_LIGHT_THEME);
+    let mut key = HKEY(std::ptr::null_mut());
+    unsafe {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .0 != 0
+        {
+            return true;
+        }
+
+        let mut kind = REG_VALUE_TYPE::default();
+        let mut data = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut kind),
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(key);
+
+        let value = (status == ERROR_SUCCESS && kind == REG_DWORD).then_some(data);
+        light_theme_from_value(value)
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::light_theme_from_value;
+
+    #[test]
+    fn missing_or_non_zero_registry_value_is_light() {
+        assert!(light_theme_from_value(None), "读不到按 Windows 默认浅色");
+        assert!(light_theme_from_value(Some(1)));
+        assert!(!light_theme_from_value(Some(0)));
+        // 其它值 C# 也只把 0 当深色。
+        assert!(light_theme_from_value(Some(2)));
+    }
+}
