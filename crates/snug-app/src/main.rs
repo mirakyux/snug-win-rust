@@ -18,6 +18,9 @@ fn main() -> eframe::Result<()> {
         eprintln!("无法创建数据目录 {}：{err}", paths.data_dir().display());
     }
     logging::init(paths.log_directory());
+    // 平台层（snug-win）是库，没有日志后端：不接这一行，它的告警只会进 stderr，
+    // 而 GUI 程序没有控制台，等于把这些告警丢掉。
+    snug_win::set_warn_sink(|message| crate::warn!("{message}"));
     crate::info!("SnugWin (Rust) 启动 v{}", env!("CARGO_PKG_VERSION"));
 
     let _instance_guard = match acquire_single_instance(&paths) {
