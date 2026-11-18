@@ -41,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 
 use crate::vdd::{is_driver_pipe_available, VddClient, VddError, VddMode, VddMonitor};
+use crate::wide::{contains_ignore_case, from_wide, to_wide};
 
 /// 驱动里这块虚拟屏的名字（C# `PhoneScreenSpec.Name`）。
 pub const MONITOR_NAME: &str = "Snug 手机屏";
@@ -254,11 +255,6 @@ pub fn build_modes(fit: &ScreenFit) -> Vec<VddMode> {
 
 fn normalized(name: &str) -> String {
     name.to_lowercase()
-}
-
-/// `str::contains` 的大小写不敏感版本（对应 C# `StringComparison.OrdinalIgnoreCase`）。
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +849,7 @@ impl DisplayApi for WinDisplay {
             let mut width = bounds.width as i32;
             let mut height = bounds.height as i32;
             let mut refresh_rate = 60.0;
-            let wide_name: Vec<u16> = device_name.encode_utf16().chain([0u16]).collect();
+            let wide_name = to_wide(&device_name);
             let mut dev_mode = DEVMODEW::default();
             dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
             if unsafe {
@@ -913,7 +909,7 @@ impl DisplayApi for WinDisplay {
     }
 
     fn has_display_mode(&self, device_name: &str, width: i32, height: i32) -> bool {
-        let wide_name: Vec<u16> = device_name.encode_utf16().chain([0u16]).collect();
+        let wide_name = to_wide(device_name);
         let name = PCWSTR(wide_name.as_ptr());
         let mut index = 0u32;
         loop {
@@ -939,7 +935,7 @@ impl DisplayApi for WinDisplay {
     }
 
     fn set_resolution(&self, device_name: &str, width: i32, height: i32, refresh_rate: f64) -> bool {
-        let wide_name: Vec<u16> = device_name.encode_utf16().chain([0u16]).collect();
+        let wide_name = to_wide(device_name);
         let name = PCWSTR(wide_name.as_ptr());
         let mut dev_mode = DEVMODEW::default();
         dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
@@ -1032,7 +1028,7 @@ impl DisplayApi for WinDisplay {
             }
 
             // 确认这块适配器下确实挂着一个显示器。
-            let wide_name: Vec<u16> = device_name.encode_utf16().chain([0u16]).collect();
+            let wide_name = to_wide(&device_name);
             let mut attached = DISPLAY_DEVICEW::default();
             attached.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
             if !unsafe {
@@ -1148,12 +1144,6 @@ fn rect_of(rect: RECT) -> Rect {
     )
 }
 
-/// 从定长 UTF-16 缓冲区取字符串（到第一个 `0` 为止）。
-fn from_wide(buffer: &[u16]) -> String {
-    let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
-    String::from_utf16_lossy(&buffer[..len])
-}
-
 /// 在注册表 `HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY` 下找虚拟屏设备实例
 /// （C# `FindVirtualDisplayInstanceId`）。
 fn find_virtual_display_instance_id() -> Option<String> {
@@ -1197,7 +1187,7 @@ fn find_virtual_display_instance_id() -> Option<String> {
             }
 
             let mut device = HKEY(std::ptr::null_mut());
-            let subkey_wide: Vec<u16> = subkey.encode_utf16().chain([0u16]).collect();
+            let subkey_wide = to_wide(&subkey);
             if RegOpenKeyExW(root, PCWSTR(subkey_wide.as_ptr()), None, KEY_READ, &mut device).0 != 0 {
                 continue;
             }

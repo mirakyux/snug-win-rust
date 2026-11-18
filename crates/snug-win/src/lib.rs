@@ -15,16 +15,18 @@
 
 pub mod display;
 pub mod touch;
+pub mod uia;
 pub mod vdd;
 mod wide;
 pub mod window;
 
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use touch::{HookEngine, TouchHook, WinInput};
+pub use uia::{Uia, UiaCloseButtons};
 pub use vdd::{VddClient, VddError, VddMode, VddMonitor, VddProtocol};
 pub use window::{WinDesktop, WinWindows};
 
 /// 平台层已接通的模块数（用于界面显示进度）。
 pub fn implemented_modules() -> &'static [&'static str] {
-    &["vdd", "display", "window", "touch"]
+    &["vdd", "display", "window", "touch", "uia"]
 }
