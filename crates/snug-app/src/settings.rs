@@ -777,8 +777,10 @@ impl SettingsWindow {
                 }
             });
             if pick_model {
+                // 机型选择器画在「多屏与设备」页里，所以要跟着跳过去。
                 self.model_picker = Some(0);
                 self.model_search.clear();
+                self.tab = SettingsTab::Screens;
             }
             ui.add_space(4.0);
             if ui

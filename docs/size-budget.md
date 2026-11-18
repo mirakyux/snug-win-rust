@@ -7,11 +7,15 @@
 
 | 项 | 大小 | 时间 |
 | --- | --- | --- |
-| `target/release/snug.exe` | 6,565,376 B（6.26 MiB） | 2026-11-18 |
-| `dist/Snug-v1.2.0-win-x64-selfcontained.zip` | 3,079,597 B（2.94 MiB） | 2026-11-18 |
+| `target/release/snug.exe` | 6,880,768 B（6.56 MiB） | 2026-11-19 |
+| `dist/Snug-v1.2.0-win-x64-selfcontained.zip` | 3,079,597 B（2.94 MiB） | 2026-11-18（上一版，未重新打包） |
 
-历史：5.09 MiB → 6.13 MiB（加了托盘、截图、UU 探测、App 资源库），
-→ 6.26 MiB（后续修 bug 的净增）。
+历史：5.09 MiB → 6.13 MiB（加托盘、截图、UU 探测、App 资源库）
+→ 6.26 MiB（修 bug）→ 6.56 MiB（多屏 `DeskSet`、主题、控制中心设置页、重入胶囊）。
+
+> 注意：`target/release/snug.exe` 正在运行时无法被覆盖，release 构建会报
+> `failed to remove file`。要么先退出程序，要么用独立目录验证：
+> `cargo build --release -p snug-app --offline --target-dir target\release-check`。
 
 ## 预算
 
