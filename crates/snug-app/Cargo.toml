@@ -11,5 +11,7 @@ name = "snug"
 path = "src/main.rs"
 
 [dependencies]
+eframe = "0.32.3"
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 snug-core = { path = "../snug-core" }
 snug-win = { path = "../snug-win" }
