@@ -3,6 +3,7 @@
 //! 阶段：核心逻辑层与虚拟屏管道已移植；显示配置、搬窗、钩子等平台层由 `snug-win` 逐步补齐。
 //! 当前这个二进制已经能：加载配置与机型库、单实例、写日志、把手机屏界面按机型比例显示出来。
 
+mod controller;
 mod logging;
 mod ui;
 
@@ -63,11 +64,20 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
+            let repaint_ctx = cc.egui_ctx.clone();
+            let controller = controller::Controller::start(
+                &config,
+                &paths,
+                move || repaint_ctx.request_repaint(),
+                |line: &str| crate::info!("desk: {line}"),
+            );
+            crate::info!("控制器已启动（手机屏 {}）", if pipe_ready { "可用" } else { "不可用" });
             Ok(Box::new(ui::PhoneHomeApp::new(
                 config,
                 catalog,
                 paths.clone(),
                 pipe_ready,
+                controller,
                 logical.width as f32,
             )))
         }),

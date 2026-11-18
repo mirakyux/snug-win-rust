@@ -5,7 +5,10 @@
 
 use eframe::egui;
 
+use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
+
+use crate::controller::Controller;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeTab {
@@ -19,6 +22,7 @@ pub struct PhoneHomeApp {
     pub paths: Paths,
     /// 虚拟屏驱动管道是否就绪（平台层尚未接通时只用于界面提示）。
     pub pipe_ready: bool,
+    pub controller: Controller,
     pub tab: HomeTab,
     pub search: String,
     /// 手机屏的逻辑宽度（点），用于把界面元素按屏宽等比放大。
@@ -31,6 +35,7 @@ impl PhoneHomeApp {
         catalog: Option<PhoneCatalog>,
         paths: Paths,
         pipe_ready: bool,
+        controller: Controller,
         screen_width: f32,
     ) -> Self {
         Self {
@@ -38,9 +43,20 @@ impl PhoneHomeApp {
             catalog,
             paths,
             pipe_ready,
+            controller,
             tab: HomeTab::Running,
             search: String::new(),
             screen_width,
+        }
+    }
+
+    /// 手机屏当前阶段的简短文案。
+    fn phase_text(phase: PhoneScreenPhase) -> &'static str {
+        match phase {
+            PhoneScreenPhase::Off => "手机屏：关",
+            PhoneScreenPhase::Preparing => "手机屏：准备中",
+            PhoneScreenPhase::Ready => "手机屏：在线",
+            PhoneScreenPhase::Failed => "手机屏：失败",
         }
     }
 
@@ -61,6 +77,8 @@ impl PhoneHomeApp {
 
 impl eframe::App for PhoneHomeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
+        self.controller.shutdown();
         let file = self.paths.config_file();
         let json = self.config.to_json();
         match std::fs::write(&file, json) {
@@ -76,6 +94,14 @@ impl eframe::App for PhoneHomeApp {
                 ui.horizontal(|ui| {
                     ui.label("‹");
                     ui.strong(self.phone_label());
+                    let state = self.controller.state();
+                    ui.label(egui::RichText::new(Self::phase_text(state.screen_phase)).weak());
+                    if let Some(placed) = &state.placed {
+                        ui.label(
+                            egui::RichText::new(format!("· {}", placed.window.label()))
+                                .color(egui::Color32::from_rgb(140, 200, 255)),
+                        );
+                    }
                     if !self.pipe_ready {
                         ui.label(egui::RichText::new("驱动未就绪").color(egui::Color32::LIGHT_RED));
                     }
@@ -97,6 +123,11 @@ impl eframe::App for PhoneHomeApp {
                         ui.label("📷");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut wanted = self.config.phone_screen;
+                        if ui.checkbox(&mut wanted, "手机屏").changed() {
+                            self.config.phone_screen = wanted;
+                            self.controller.set_phone_screen(wanted);
+                        }
                         if ui.small_button("全部").clicked() {
                             self.tab = HomeTab::All;
                         }
