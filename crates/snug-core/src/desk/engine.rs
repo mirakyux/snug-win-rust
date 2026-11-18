@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
 use std::time::Duration;
 
 use crate::config::ScreenConfig;
@@ -301,6 +302,8 @@ impl DeskSlot {
         });
     }
 
+    /// 只给 `idle()`（测试）用：生产路径不等队列，见 `docs/desk-threading.md`。
+    #[cfg(test)]
     fn drain(&self) {
         self.lane.drain();
     }
@@ -842,13 +845,20 @@ impl Desk {
     }
 
     /// 此刻这块屏是否真的静止（没有挂着的重试、没有 watch）。
+    #[cfg(test)]
     pub(crate) fn is_quiet(&self) -> bool {
         self.inner.shared.pending_retry.lock().expect("retry").is_none()
             && self.inner.shared.watches.lock().expect("watches").is_empty()
     }
 
     /// 对应 C# `IdleAsync`：等重试跑完、队列排空、所有 watch 结束。
-    /// 供测试使用，也是"此刻桌面真的静止了"的判据。
+    ///
+    /// **只给测试用**（`#[cfg(test)]` 之外不存在）。它等的是"所有 desk 都 quiet"，
+    /// watch 最长能挂 30s/10s/60s，而且是忙等吃满一个核；更要紧的是这期间别的
+    /// 动作入不了队——生产路径每拍调它，会让"会话结束撤屏"被推迟到 watch 结束。
+    /// 真机撞过一次"退出远控虚拟屏还挂着"，就是这类调用引起的。
+    /// 生产代码要推进时间驱动的动作，靠 retry/watch 自己的线程。
+    #[cfg(test)]
     pub fn idle(&self) {
         loop {
             let retry = self.inner.shared.pending_retry.lock().expect("retry").clone();

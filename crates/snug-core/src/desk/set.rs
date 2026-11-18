@@ -440,6 +440,11 @@ impl DeskSet {
     }
 
     /// 测试用：等所有屏的动作、重试与 watch 都静止（对应 C# 的 `IdleAsync`）。
+    ///
+    /// **只在测试里存在**。生产路径调它会把界面和状态更新一起卡住：它等的
+    /// "静止"包含 watch（最长 30s/10s/60s），而这期间 `set_wishes` 进不了队列。
+    /// 详见 `docs/desk-threading.md`。
+    #[cfg(test)]
     pub fn idle(&self) {
         loop {
             for desk in self.desks.values() {

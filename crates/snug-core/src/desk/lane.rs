@@ -85,6 +85,10 @@ impl<T: Send + 'static> SerialLane<T> {
     }
 
     /// 等此前入队的动作全部执行完（对应 C# `DrainAsync`）。
+    ///
+    /// 只给测试和 `idle()` 用：生产路径不需要等队列（等它就会把界面和状态更新
+    /// 一起卡住，见 `docs/desk-threading.md`）。
+    #[cfg(test)]
     pub(crate) fn drain(&self) {
         self.call(|_| {});
     }
