@@ -462,6 +462,20 @@ impl Desk {
         });
     }
 
+    /// 对应 C# `ReenterScreen`（`DeskSet.ReenterAllDismissedTouch` 的单屏版）：
+    /// 同一次远程里用户点「重新进入手机屏」，清掉 dismissed 并立刻恢复建屏。
+    /// 没标记 dismissed（没退出过）或这块屏本来就不该有（`wanted == false`）时什么也不做。
+    pub fn reenter(&self) {
+        if !self.inner.shared.wanted.load(Ordering::SeqCst) || !self.state().dismissed {
+            return;
+        }
+        self.inner.lane.run(|core: &mut DeskCore| {
+            core.set_state(core.state().with_dismissed(false).with_notice(None));
+            core.log("同会话重新进入手机屏：恢复建屏");
+            core.reconcile();
+        });
+    }
+
     /// 对应 C# `VerifyPlacement`：确认手机屏上的窗口还在。
     pub fn verify_placement(&self) {
         self.inner.lane.run(|core: &mut DeskCore| core.verify_placement());
@@ -2480,6 +2494,40 @@ mod tests {
         assert!(state.placed.is_none());
         assert_eq!(harness.windows.frame_of(key), Some(original));
         assert!(!harness.paths.phone_record_file().exists());
+    }
+
+    #[test]
+    fn reenter_after_dismiss_rebuilds_the_screen_in_the_same_episode() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        assert!(harness.desk.state().display_id.is_some());
+
+        harness.desk.dismiss_screen();
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Off);
+        assert!(harness.desk.state().dismissed);
+
+        // 同一次远程里点「重新进入手机屏」：清 dismissed 并立刻重新建屏。
+        harness.desk.reenter();
+        harness.desk.idle();
+
+        let state = harness.desk.state();
+        assert!(!state.dismissed, "重新进入后要清掉标记");
+        assert_eq!(state.screen_phase, PhoneScreenPhase::Ready);
+        assert!(state.display_id.is_some(), "应该重新建了一块屏");
+    }
+
+    #[test]
+    fn reenter_without_a_dismissed_screen_is_a_no_op() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let id = harness.desk.state().display_id;
+
+        harness.desk.reenter();
+        harness.desk.idle();
+
+        assert_eq!(harness.desk.state().display_id, id, "没有 dismissed 就不该动屏");
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
     }
 
     // ---- 打开 / 退出 / 关闭与 watch 分块 ----

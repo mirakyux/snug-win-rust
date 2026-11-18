@@ -14,6 +14,7 @@ pub mod phone_models;
 pub mod pinyin;
 pub mod record;
 pub mod screen_fit;
+pub mod screen_plan;
 pub mod screenshots;
 pub mod selection;
 pub mod session;
@@ -35,6 +36,7 @@ pub use phone_models::{
 };
 pub use record::PhoneRecord;
 pub use screen_fit::{PhoneSpec, ScreenFit};
+pub use screen_plan::{ScreenBehavior, ScreenPlan, ScreenWish};
 pub use screenshots::{
     CaptureError, CaptureFailure, CapturedImage, ScreenshotControl, ScreenshotNotice,
     ScreenshotOverlay, Screenshots,
