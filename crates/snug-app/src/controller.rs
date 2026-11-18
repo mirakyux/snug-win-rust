@@ -103,6 +103,12 @@ pub struct Controller {
     pending: Arc<std::sync::Mutex<Vec<DeskAction>>>,
     /// 最近一次屏配置（wishes 由它算，写屏列表时更新）。
     config: Arc<std::sync::Mutex<AppConfig>>,
+    /// 界面当前显示哪块屏（`None` = 主触控屏）。
+    ///
+    /// 多屏时**只有这块屏会真的建出来**：我们只有一个窗口，建成 N 块虚拟屏的话
+    /// 其余几块是纯黑屏，比"看不到"更糟。所以同一时刻只保留一块，
+    /// 切换就是换一台设备（旧屏撤、新屏建）。见 `docs/multi-screen.md`。
+    active_screen: Arc<std::sync::Mutex<Option<String>>>,
     /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
     displays: Arc<WinPhoneDisplays>,
     /// 手势钩子（C# `TouchHookService`）。
@@ -202,6 +208,9 @@ impl Controller {
         let session_worker = session.clone();
         let config = Arc::new(std::sync::Mutex::new(config.clone()));
         let config_worker = config.clone();
+        let active_screen: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let active_screen_worker = active_screen.clone();
         let snapshots_worker = snapshots.clone();
         let pending_worker = pending.clone();
         // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
@@ -316,10 +325,14 @@ impl Controller {
                         // 启发式已经不准了），只看"有没有会话/手动强制"，屏列表自己带 enabled。
                         let remote = in_episode || uu_worker.manual_override();
                         let enabled = phone_enabled_worker.load(Ordering::Relaxed);
+                        let active = active_screen_worker
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
                         let wishes = {
                             let config =
                                 config_worker.lock().unwrap_or_else(|e| e.into_inner());
-                            active_wishes(&config, enabled, remote)
+                            active_wishes(&config, enabled, remote, active.as_deref())
                         };
                         if let Ok(mut desks) = desks_worker.lock() {
                             desks.set_wishes(wishes);
@@ -366,6 +379,7 @@ impl Controller {
             snapshots,
             pending,
             config,
+            active_screen,
             displays,
             touch,
             uu,
@@ -430,7 +444,8 @@ impl Controller {
         }
         let enabled = self.phone_enabled.load(Ordering::Relaxed);
         let remote = self.in_session() || self.manual_override();
-        let wishes = active_wishes(config, enabled, remote);
+        let active = self.active_screen.lock().ok().and_then(|guard| guard.clone());
+        let wishes = active_wishes(config, enabled, remote, active.as_deref());
         let zoom = config.zoom_steps;
         crate::info!(
             "屏配置变化：{} 块屏愿望（remote={remote} 总开关={enabled}）",
@@ -440,6 +455,28 @@ impl Controller {
             desks.set_wishes(wishes);
             desks.set_default_zoom(zoom);
         });
+    }
+
+    /// 切换界面当前显示哪块屏（`None` = 主触控屏）。
+    ///
+    /// 只保留这块屏的愿望：旧屏会被撤掉、新屏建出来，等于换一台设备。
+    pub fn set_active_screen(&self, screen_id: Option<String>) {
+        if let Ok(mut active) = self.active_screen.lock() {
+            if *active == screen_id {
+                return;
+            }
+            *active = screen_id.clone();
+        }
+        crate::info!(
+            "切换屏幕：{}",
+            screen_id.clone().unwrap_or_else(|| "主触控屏".to_string())
+        );
+        let enabled = self.phone_enabled.load(Ordering::Relaxed);
+        let remote = self.in_session() || self.manual_override();
+        if let Ok(config) = self.config.lock() {
+            let wishes = active_wishes(&config, enabled, remote, screen_id.as_deref());
+            self.enqueue(move |desks| desks.set_wishes(wishes));
+        }
     }
 
     /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
@@ -708,11 +745,18 @@ fn active_wishes(
     config: &AppConfig,
     enabled: bool,
     remote: bool,
+    active_screen: Option<&str>,
 ) -> Vec<snug_core::screen_plan::ScreenWish> {
     if !enabled {
         return Vec::new();
     }
-    snug_core::screen_plan::ScreenPlan::wishes(config, remote, false)
+    let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, remote, false);
+    // 只留当前显示的那块：我们只有一个窗口，多建几块只会得到几块黑屏。
+    match active_screen {
+        Some(id) => wishes.retain(|wish| wish.id == id),
+        None => wishes.truncate(1),
+    }
+    wishes
 }
 
 #[cfg(test)]
@@ -726,39 +770,8 @@ mod tests {
         config
     }
 
-    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `remote` 这一段。
-    #[test]
-    fn no_screen_outside_a_session() {
-        let config = config_with_one_screen();
-        assert!(active_wishes(&config, true, false).is_empty());
-    }
-
-    #[test]
-    fn one_screen_during_a_session() {
-        let config = config_with_one_screen();
-        assert_eq!(active_wishes(&config, true, true).len(), 1);
-    }
-
-    #[test]
-    fn master_switch_off_wins() {
-        let config = config_with_one_screen();
-        assert!(active_wishes(&config, false, true).is_empty());
-    }
-
-    /// 关掉某块屏就不该再有这个愿望。
-    #[test]
-    fn disabled_screen_drops_its_wish() {
-        let mut config = config_with_one_screen();
-        let mut screens = config.effective_screens();
-        screens[0].enabled = false;
-        config.screens = Some(screens);
-        assert!(active_wishes(&config, true, true).is_empty());
-    }
-
-    /// 多屏：两块启用的屏 → 两个愿望，顺序照配置。
-    #[test]
-    fn two_screens_give_two_wishes() {
-        use snug_core::{DeviceKind, ScreenConfig, ScreenOrientation};
+    fn config_with_two_screens() -> AppConfig {
+        use snug_core::{DeviceKind, ScreenOrientation};
 
         let mut config = config_with_one_screen();
         let mut screens = config.effective_screens();
@@ -769,10 +782,57 @@ mod tests {
         tablet.orientation = ScreenOrientation::Landscape;
         screens.push(tablet.sanitize());
         config.screens = Some(screens);
+        config
+    }
 
-        let wishes = active_wishes(&config, true, true);
-        assert_eq!(wishes.len(), 2, "两块屏应该有两个愿望");
+    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `remote` 这一段。
+    #[test]
+    fn no_screen_outside_a_session() {
+        let config = config_with_one_screen();
+        assert!(active_wishes(&config, true, false, None).is_empty());
+    }
+
+    #[test]
+    fn one_screen_during_a_session() {
+        let config = config_with_one_screen();
+        assert_eq!(active_wishes(&config, true, true, None).len(), 1);
+    }
+
+    #[test]
+    fn master_switch_off_wins() {
+        let config = config_with_one_screen();
+        assert!(active_wishes(&config, false, true, None).is_empty());
+    }
+
+    /// 关掉某块屏就不该再有这个愿望。
+    #[test]
+    fn disabled_screen_drops_its_wish() {
+        let mut config = config_with_one_screen();
+        let mut screens = config.effective_screens();
+        screens[0].enabled = false;
+        config.screens = Some(screens);
+        assert!(active_wishes(&config, true, true, None).is_empty());
+    }
+
+    /// 配了两块屏，但同一时刻只建一块（只画一块屏，多建就是黑屏）：
+    /// 不指定时取配置里的第一块。
+    #[test]
+    fn only_one_screen_is_built_at_a_time() {
+        use snug_core::ScreenConfig;
+
+        let config = config_with_two_screens();
+        let wishes = active_wishes(&config, true, true, None);
+        assert_eq!(wishes.len(), 1, "同一时刻只该建一块屏");
         assert_eq!(wishes[0].id, ScreenConfig::LEGACY_PHONE_ID);
-        assert_eq!(wishes[1].id, "tablet-1");
+    }
+
+    /// 切到第二块屏：愿望只剩它（旧屏会被撤掉）。
+    #[test]
+    fn selecting_a_screen_drops_the_other() {
+        let config = config_with_two_screens();
+        let wishes = active_wishes(&config, true, true, Some("tablet-1"));
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, "tablet-1");
+        assert_eq!(wishes[0].fit.kind(), snug_core::DeviceKind::Tablet);
     }
 }

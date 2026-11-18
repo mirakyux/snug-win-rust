@@ -1177,6 +1177,7 @@ impl eframe::App for PhoneHomeApp {
                             let selected = current.as_deref() == Some(id.as_str());
                             if ui.selectable_label(selected, name).clicked() {
                                 self.active_screen = Some(id.clone());
+                                self.controller.set_active_screen(Some(id.clone()));
                                 // 换了屏要重新摆窗口。
                                 self.last_phone_rect = None;
                                 self.last_offscreen = None;
