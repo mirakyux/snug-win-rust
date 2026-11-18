@@ -134,6 +134,8 @@ pub fn round_ties_even(value: f64) -> f64 {
 ///
 /// C# 用 `HashCode.Combine(LUID, sourceId)`（进程内随机化）或设备名哈希；
 /// 这里改成确定性的 FNV-1a，让同一个编号跨进程也不变（界面持久化更可靠）。
+/// 注意：若将来把 display_id 持久化，这些编号与 C# 版不通用，届时要么与 C#
+/// 对齐，要么明确「不跨版本通用」。
 pub fn stable_id(device_name: &str, adapter_id: AdapterLuid, source_id: u32) -> u32 {
     if !adapter_id.is_zero() {
         let mut hash = FNV_OFFSET_BASIS;
@@ -257,6 +259,8 @@ pub fn pick_new_monitor(
             || contains_ignore_case(&m.friendly_name, "Virtual")
             || has_mode(&m.device_name, base_width, base_height)
     });
+    // C4：没有任何线索时退回"新出现的第一个"——建屏同时用户插了显示器会误认
+    // （C# 同样，见 docs/display-parity.md）。
     virtual_like.or_else(|| fresh.first()).map(|m| (*m).clone())
 }
 
@@ -479,6 +483,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 maps.device_names.insert(candidate, snapshot.device_name.clone());
             }
             self.set_width(candidate, fit.base_width());
+            // C2：与 C# 一致——SetWidth 失败时这里仍返回成功、fits 已记，
+            // 屏在线但分辨率/DPI 可能不对（见 docs/display-parity.md）。
             return Ok(candidate);
         }
 
@@ -549,6 +555,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             return false;
         }
 
+        // C2：与 C# 一致——新模式 4s 内没出现也照样更新 fits 并返回 true，
+        // 状态说新比例、实际可能还是旧比例（见 docs/display-parity.md）。
         lock_maps(&self.maps).fits.insert(display_id, fit.clone());
         let (base_width, base_height) = fit.pixel_size(fit.base_width());
         let start = Instant::now();
@@ -611,6 +619,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
     }
 
     /// 把某块屏切到给定模式（C# `SetModeAsync`，`permanently` 在 C# 里也没用）。
+    ///
+    /// C4：C# 用 `StableId` 匹配 `displayId`；手机屏的 id 是候选编号（0..3），
+    /// 理论上可能与某块真实屏的 StableId 撞号而改错屏（照抄不修）。
     fn set_mode(&mut self, display_id: u32, mode: DisplayModeInfo) {
         let Some(target) = self
             .api
@@ -782,6 +793,54 @@ struct DpiScaleSet {
 const DEVICE_INFO_GET_DPI_SCALE: i32 = -3;
 const DEVICE_INFO_SET_DPI_SCALE: i32 = -4;
 
+/// 查当前激活的 CCD 路径；拓扑在两次调用之间变化时重试（C# 不重试，见
+/// `docs/display-parity.md` 的 C1）。
+fn query_active_paths() -> Option<Vec<DISPLAYCONFIG_PATH_INFO>> {
+    // QueryDisplayConfig：183 = ERROR_INSUFFICIENT_BUFFER，87 = ERROR_INVALID_PARAMETER。
+    const RETRYABLE: [u32; 2] = [183, 87];
+    const RETRIES: u32 = 2;
+
+    for attempt in 0..=RETRIES {
+        let mut path_count = 0u32;
+        let mut mode_count = 0u32;
+        if unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        }
+        .0
+            != 0
+        {
+            return None;
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let status = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if status.0 == 0 {
+            paths.truncate(path_count as usize);
+            return Some(paths);
+        }
+        if !RETRYABLE.contains(&status.0) || attempt == RETRIES {
+            return None;
+        }
+        crate::warn(&format!(
+            "QueryDisplayConfig 返回 {}（拓扑可能刚变化），重取缓冲区重试 {}/{}",
+            status.0,
+            attempt + 1,
+            RETRIES
+        ));
+    }
+    None
+}
+
 /// 真机显示子系统（C# `DisplayConfigService`）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WinDisplay;
@@ -793,34 +852,13 @@ impl WinDisplay {
 
     fn ccd_sources(&self) -> HashMap<String, CcdSource> {
         let mut map = HashMap::new();
-        let mut path_count = 0u32;
-        let mut mode_count = 0u32;
-        if unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-        }
-        .0
-            != 0
-        {
+        // 对 C# 的有意偏离：C# 只查一次；如果 GetDisplayConfigBufferSizes 与
+        // QueryDisplayConfig 之间正好热插拔，整次采样会失败——所有屏的
+        // adapter/source 归零、DPI 掉回 100。这里遇 183/87 重取尺寸重试两次，
+        // 每次重试记一条 warn，仍失败才返回空表（见 docs/display-parity.md）。
+        let Some(paths) = query_active_paths() else {
             return map;
-        }
-        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-        if unsafe {
-            QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut path_count,
-                paths.as_mut_ptr(),
-                &mut mode_count,
-                modes.as_mut_ptr(),
-                None,
-            )
-        }
-        .0
-            != 0
-        {
-            return map;
-        }
-        paths.truncate(path_count as usize);
+        };
 
         for path in &paths {
             let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
@@ -1149,6 +1187,9 @@ impl DisplayApi for WinDisplay {
             dev_mode.dmPelsHeight = height.max(0) as u32;
             dev_mode.dmDisplayFrequency = 60;
 
+            // C2：第一次调用成功、apply 失败时会在注册表里留下 CDS_NORESET 的
+            // 挂起模式；若随后的 SetDisplayConfig 也失败，挂起变更会留到下次
+            // （C# 同样，见 docs/display-parity.md）。
             let r1 = unsafe {
                 ChangeDisplaySettingsExW(
                     PCWSTR(wide_name.as_ptr()),
