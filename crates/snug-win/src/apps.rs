@@ -1177,7 +1177,9 @@ unsafe fn enumerate_apps_folder() -> Vec<(String, String)> {
     use windows::Win32::UI::Shell::KF_FLAG_DEFAULT;
     let mut entries = Vec::new();
     // 与 C# 一样跑在 STA 线程：shell 命名空间在单线程套间里最稳。
-    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let Some(_com) = ComApartment::enter() else {
+        return entries;
+    };
     if let Ok(folder) = unsafe {
         SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
     } && let Ok(items) = unsafe {
@@ -1208,10 +1210,40 @@ unsafe fn enumerate_apps_folder() -> Vec<(String, String)> {
             }
         }
     }
-    if initialized {
-        unsafe { CoUninitialize() };
-    }
     entries
+}
+
+/// COM 套间守卫（对应 C# WPF 里"UI 线程自动是 STA"这件事）。
+///
+/// `SHCreateItemFromParsingName` / `ShellExecuteExW` 这类 shell 调用要求调用线程
+/// 进过 COM。egui/winit 的界面线程不一定做过，所以每次进 COM 路径时自己申请：
+/// 拿到 S_OK/S_FALSE 的在这里配对 `CoUninitialize`；线程本来就在 MTA 里
+/// （`RPC_E_CHANGED_MODE`）就沿用它、不配对。别的失败返回 `None`，调用方降级。
+struct ComApartment(bool);
+
+impl ComApartment {
+    fn enter() -> Option<Self> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // 只有 S_OK（本次真正初始化）才配对 CoUninitialize；S_FALSE 表示线程早就
+        // 初始化过，多减一次会把别人的 COM 拆了。已经在 MTA 里的线程沿用它。
+        if hr == windows::Win32::Foundation::S_OK {
+            Some(Self(true))
+        } else if hr == windows::Win32::Foundation::S_FALSE
+            || hr == windows::Win32::Foundation::RPC_E_CHANGED_MODE
+        {
+            Some(Self(false))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
 }
 
 impl AppSystem for WinSystem {
@@ -1260,6 +1292,7 @@ impl AppSystem for WinSystem {
         arguments: Option<&str>,
         working_directory: Option<&str>,
     ) -> Option<i32> {
+        let _com = ComApartment::enter()?;
         let file = to_wide(program);
         let parameters = arguments.map(to_wide);
         let directory = working_directory.map(to_wide);
@@ -1511,6 +1544,8 @@ impl AppSystem for WinSystem {
         if parsing_path.trim().is_empty() {
             return None;
         }
+        // 界面线程每帧都可能来取图标，这里按调用配对进出 COM 套间。
+        let _com = ComApartment::enter()?;
         let wide = to_wide(parsing_path);
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItemImageFactory>(
@@ -1536,6 +1571,7 @@ impl AppSystem for WinSystem {
         if exe_path.is_empty() || !Path::new(exe_path).is_file() {
             return None;
         }
+        let _com = ComApartment::enter()?;
         let wide = to_wide(exe_path);
         let mut icon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
         let count = unsafe {
