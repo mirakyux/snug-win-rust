@@ -1,0 +1,6 @@
+/target
+/references
+*.user
+*.pdb
+*.log
+/dist

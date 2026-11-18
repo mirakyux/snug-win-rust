@@ -1,0 +1,12 @@
+[package]
+name = "snug-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SnugWin 的纯逻辑层：屏幕适配、窗口几何、手势状态机、会话状态机（不含任何 Win32 依赖）"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

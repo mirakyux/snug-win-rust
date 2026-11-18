@@ -1,0 +1,15 @@
+[package]
+name = "snug-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SnugWin 的托盘程序与手机屏界面（Rust 版）"
+
+[[bin]]
+name = "snug"
+path = "src/main.rs"
+
+[dependencies]
+snug-core = { path = "../snug-core" }
+snug-win = { path = "../snug-win" }
