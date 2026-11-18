@@ -13,11 +13,13 @@
 //! | `screenshot` | `ScreenshotService` | `PrintWindow` / `BitBlt` |
 //! | `uu` | `UUSensor` | 覆盖窗口、UIA 控制端表、TCP peer、GameViewerServer 日志 |
 
+pub mod display;
 pub mod vdd;
 
+pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use vdd::{VddClient, VddError, VddMode, VddMonitor, VddProtocol};
 
 /// 平台层已接通的模块数（用于界面显示进度）。
 pub fn implemented_modules() -> &'static [&'static str] {
-    &["vdd"]
+    &["vdd", "display"]
 }

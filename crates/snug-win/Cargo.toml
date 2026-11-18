@@ -10,3 +10,13 @@ description = "SnugWin 的 Windows 平台层：虚拟屏驱动 IPC、CCD 显示�
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+snug-core = { path = "../snug-core" }
+
+# Win32 绑定。feature 按模块增量打开，避免把整个元数据都编译进来。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
