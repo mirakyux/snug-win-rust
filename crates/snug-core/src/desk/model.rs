@@ -152,6 +152,36 @@ impl DeskState {
         self
     }
 
+    pub fn with_screen_phase(mut self, phase: PhoneScreenPhase) -> Self {
+        self.screen_phase = phase;
+        self
+    }
+
+    pub fn with_display(mut self, display_id: Option<u32>) -> Self {
+        self.display_id = display_id;
+        self
+    }
+
+    pub fn with_placed(mut self, placed: Option<PlacedWindow>) -> Self {
+        self.placed = placed;
+        self
+    }
+
+    pub fn with_list_visible(mut self, visible: bool) -> Self {
+        self.list_visible = visible;
+        self
+    }
+
+    pub fn with_dismissed(mut self, dismissed: bool) -> Self {
+        self.dismissed = dismissed;
+        self
+    }
+
+    pub fn with_close_button(mut self, close_button: Option<CloseButton>) -> Self {
+        self.close_button = close_button;
+        self
+    }
+
     /// 对应 `new HashSet<int>(State.Quitting) { pid }`：总是新建实例。
     pub fn with_quitting_added(mut self, pid: i32) -> Self {
         let mut set: HashSet<i32> = (*self.quitting).clone();

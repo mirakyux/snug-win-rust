@@ -13,10 +13,14 @@
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
-struct LaneJob<T> {
-    run: Box<dyn FnOnce(&mut T) + Send>,
-    /// `call()` 用来等这一条执行完；`run()` 不填。
-    done: Option<Sender<()>>,
+enum LaneJob<T> {
+    Run {
+        run: Box<dyn FnOnce(&mut T) + Send>,
+        /// `call()` 用来等这一条执行完；`run()` 不填。
+        done: Option<Sender<()>>,
+    },
+    /// 关闭工作线程。桌面状态自己攥着发送端，靠这条消息才能停下来。
+    Stop,
 }
 
 pub(crate) struct SerialLane<T: Send + 'static> {
@@ -30,28 +34,42 @@ impl<T: Send + 'static> Clone for SerialLane<T> {
 }
 
 impl<T: Send + 'static> SerialLane<T> {
-    /// 起工作线程并把状态交给它独占。
-    pub(crate) fn spawn(state: T) -> (Self, JoinHandle<()>) {
+    /// 起工作线程。`make_state` 可以用传进来的 lane 构造状态（状态需要反向投递时用）。
+    ///
+    /// 工作线程是"分离"的：句柄被丢掉，队列关闭或收到 [`Self::stop`] 后自行退出。
+    pub(crate) fn start(make_state: impl FnOnce(Self) -> T) -> Self {
         let (tx, rx) = channel::<LaneJob<T>>();
-        let handle = std::thread::Builder::new()
+        let lane = Self { tx };
+        let state = make_state(lane.clone());
+        let _worker: JoinHandle<()> = std::thread::Builder::new()
             .name("snug-desk".to_string())
             .spawn(move || {
                 let mut state = state;
-                // 所有发送端都消失后队列关闭，线程退出。
                 while let Ok(job) = rx.recv() {
-                    (job.run)(&mut state);
-                    if let Some(done) = job.done {
-                        let _ = done.send(());
+                    match job {
+                        LaneJob::Run { run, done } => {
+                            run(&mut state);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                        }
+                        LaneJob::Stop => break,
                     }
                 }
             })
             .expect("创建 PhoneDesk 工作线程失败");
-        (Self { tx }, handle)
+        lane
+    }
+
+    /// 等价于给 `start` 传一个现成状态（测试用）。
+    #[cfg(test)]
+    pub(crate) fn spawn(state: T) -> Self {
+        Self::start(|_| state)
     }
 
     /// 入队一个动作，不等它执行（对应 C# `_lane.Run`）。
     pub(crate) fn run(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
-        let _ = self.tx.send(LaneJob { run: Box::new(operation), done: None });
+        let _ = self.tx.send(LaneJob::Run { run: Box::new(operation), done: None });
     }
 
     /// 入队并等它执行完；供 watch 线程等一次桌面动作返回。
@@ -59,7 +77,7 @@ impl<T: Send + 'static> SerialLane<T> {
     /// 不要在队列里的动作内部调用，否则工作线程会等自己（死锁）。
     pub(crate) fn call(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
         let (done, wait) = channel();
-        if self.tx.send(LaneJob { run: Box::new(operation), done: Some(done) }).is_err() {
+        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done) }).is_err() {
             // 工作线程已经退出，不再等待。
             return;
         }
@@ -69,6 +87,11 @@ impl<T: Send + 'static> SerialLane<T> {
     /// 等此前入队的动作全部执行完（对应 C# `DrainAsync`）。
     pub(crate) fn drain(&self) {
         self.call(|_| {});
+    }
+
+    /// 关掉工作线程（以及这条队列上还没跑的动作）。
+    pub(crate) fn stop(&self) {
+        let _ = self.tx.send(LaneJob::Stop);
     }
 }
 
@@ -80,26 +103,25 @@ mod tests {
 
     #[test]
     fn jobs_run_in_enqueue_order() {
-        let (lane, handle) = SerialLane::spawn(Vec::<u32>::new());
+        let lane = SerialLane::spawn(Vec::<u32>::new());
         for i in 0..100u32 {
             lane.run(move |state: &mut Vec<u32>| state.push(i));
         }
         lane.drain();
         let seen = Arc::new(AtomicUsize::new(0));
-        let seen2 = seen.clone();
+        let sink = seen.clone();
         lane.call(move |state: &mut Vec<u32>| {
             assert_eq!(state.len(), 100);
             assert!(state.windows(2).all(|w| w[0] < w[1]), "顺序错乱：{:?}", state);
-            seen2.store(state.len(), Ordering::SeqCst);
+            sink.store(state.len(), Ordering::SeqCst);
         });
         assert_eq!(seen.load(Ordering::SeqCst), 100);
-        drop(lane);
-        handle.join().expect("工作线程应正常退出");
+        lane.stop();
     }
 
     #[test]
     fn call_blocks_until_the_job_has_run() {
-        let (lane, handle) = SerialLane::spawn(0u32);
+        let lane = SerialLane::spawn(0u32);
         lane.run(|state: &mut u32| *state += 1);
         let observed = Arc::new(AtomicUsize::new(0));
         let sink = observed.clone();
@@ -108,13 +130,12 @@ mod tests {
             sink.store(*state as usize, Ordering::SeqCst);
         });
         assert_eq!(observed.load(Ordering::SeqCst), 11, "call 返回时动作必须已经执行");
-        drop(lane);
-        handle.join().expect("join");
+        lane.stop();
     }
 
     #[test]
     fn drain_waits_for_previously_enqueued_work() {
-        let (lane, handle) = SerialLane::spawn(0u32);
+        let lane = SerialLane::spawn(0u32);
         let done = Arc::new(AtomicUsize::new(0));
         for _ in 0..50 {
             let done = done.clone();
@@ -127,17 +148,25 @@ mod tests {
         }
         lane.drain();
         assert_eq!(done.load(Ordering::SeqCst), 50);
-        drop(lane);
-        handle.join().expect("join");
+        lane.stop();
     }
 
     #[test]
-    fn worker_stops_when_every_sender_is_gone() {
-        let (lane, handle) = SerialLane::spawn(0u32);
-        let alias = lane.clone();
-        alias.run(|state: &mut u32| *state += 1);
-        drop(lane);
-        drop(alias);
-        handle.join().expect("发送端全部释放后工作线程应退出");
+    fn stop_runs_after_queued_work_and_ends_the_worker() {
+        let lane = SerialLane::spawn(0u32);
+        let (done, arrived) = channel::<u32>();
+        lane.run(move |state: &mut u32| {
+            *state += 1;
+            let _ = done.send(*state);
+        });
+        lane.stop();
+        // stop 之前排队的动作先跑完：这里能收到就是证明。
+        assert_eq!(arrived.recv().ok(), Some(1));
+        // stop 之后再投递也不会执行（队列已关）。
+        let (late, late_rx) = channel::<()>();
+        lane.run(move |_state: &mut u32| {
+            let _ = late.send(());
+        });
+        assert!(late_rx.try_recv().is_err(), "队列关闭后不应再执行动作");
     }
 }

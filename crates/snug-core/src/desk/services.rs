@@ -48,6 +48,11 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// 两个令牌是否是同一份（对应 C# 里 `ReferenceEquals` 比较令牌源）。
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// 手机屏创建失败的原因（对应 C# `PhoneScreenErrorKind`）。
