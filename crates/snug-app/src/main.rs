@@ -3,6 +3,7 @@
 //! 阶段：核心逻辑层与虚拟屏管道已移植；显示配置、搬窗、钩子等平台层由 `snug-win` 逐步补齐。
 //! 当前这个二进制已经能：加载配置与机型库、单实例、写日志、把手机屏界面按机型比例显示出来。
 
+mod bubble;
 mod controller;
 mod library;
 mod logging;

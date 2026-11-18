@@ -19,6 +19,62 @@ use snug_win::{WinPhoneDisplays, WinWindows};
 /// （`apps.rs` 的 `impl<S: AppSystem> AppControl for Apps<S>`），控制器直接用真机实现。
 use snug_win::WinApps;
 
+/// 手势钩子抛给**界面**的事件（对应 C# `TouchHookService` 的选区两个事件）。
+///
+/// 关闭窗口那一路不在这里：它由后台线程直接 `desk.close_placed(handle)` 处理，
+/// 不经过界面（界面关掉也没关系）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchEvent {
+    /// 选区结束（物理像素坐标）→ 界面在选区上方弹"复制"气泡。
+    SelectionCompleted(snug_core::Point),
+    /// 选区被取消 → 收起气泡。
+    SelectionDismissed,
+}
+
+/// 钩子线程把事件塞进队列，应用侧每帧取走（对应 C# 里 `Dispatcher.BeginInvoke`）。
+#[derive(Default)]
+struct TouchEventQueue {
+    close: std::sync::Mutex<Vec<u64>>,
+    selection: std::sync::Mutex<Vec<TouchEvent>>,
+}
+
+impl TouchEventQueue {
+    fn push_close(&self, handle: u64) {
+        self.close.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+    }
+
+    fn push(&self, event: TouchEvent) {
+        self.selection.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+    }
+
+    fn take_close(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.close.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn take_selection(&self) -> Vec<TouchEvent> {
+        std::mem::take(&mut *self.selection.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// 给 `TouchHook` 用的事件接收端。
+struct HookEvents {
+    queue: Arc<TouchEventQueue>,
+}
+
+impl snug_win::touch::TouchEvents for HookEvents {
+    fn close_window_requested(&self, handle: u64) {
+        self.queue.push_close(handle);
+    }
+
+    fn selection_completed(&self, at: snug_core::Point) {
+        self.queue.push(TouchEvent::SelectionCompleted(at));
+    }
+
+    fn selection_dismissed(&self) {
+        self.queue.push(TouchEvent::SelectionDismissed);
+    }
+}
+
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
     desk: Desk,
@@ -30,6 +86,10 @@ pub struct Controller {
     uu: Arc<snug_win::UuSensor>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: std::sync::Mutex<Option<TouchRegion>>,
+    /// 钩子抛出的事件队列（关闭窗口 / 选区结束 / 选区取消）。
+    touch_events: Arc<TouchEventQueue>,
+    /// "选后复制"真正按快捷键的那一层（C# `WindowService.PerformSelectionActionAsync`）。
+    selection_actions: Arc<snug_win::WinSelectionActions>,
     #[allow(dead_code)] // 后续设置界面/诊断要用
     paths: Paths,
     running: Arc<AtomicBool>,
@@ -75,6 +135,13 @@ impl Controller {
         let desk_worker = desk.clone();
         let uu = Arc::new(snug_win::UuSensor::new());
         let uu_worker = uu.clone();
+        // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
+        let touch_events = Arc::new(TouchEventQueue::default());
+        let touch = Arc::new(snug_win::TouchHook::with_parts(
+            Arc::new(snug_win::touch::WinInput),
+            Arc::new(HookEvents { queue: touch_events.clone() }),
+        ));
+        let touch_events_worker = touch_events.clone();
         let worker = std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
@@ -94,6 +161,11 @@ impl Controller {
                 while stop.load(Ordering::Relaxed) {
                     desk_worker.idle();
                     desk_worker.check_returns();
+                    // 用户点了窗口自带的关闭按钮（C# `_desk.ClosePlaced(handle)`）。
+                    for handle in touch_events_worker.take_close() {
+                        crate::info!("手势：点了窗口关闭按钮，关掉 {handle:#x}");
+                        desk_worker.close_placed(handle);
+                    }
                     let now = started.elapsed().as_secs_f64();
                     if now - last_sample >= 1.0 {
                         last_sample = now;
@@ -160,7 +232,6 @@ impl Controller {
             })
             .ok();
 
-        let touch = Arc::new(snug_win::TouchHook::new());
 
         Self {
             desk,
@@ -168,6 +239,8 @@ impl Controller {
             touch,
             uu,
             touch_region: std::sync::Mutex::new(None),
+            touch_events,
+            selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
             paths: paths.clone(),
             running,
             worker,
@@ -230,6 +303,20 @@ impl Controller {
     /// 回到资源库（C# `ShowList`）：把铺开的窗口归位。
     pub fn show_list(&self) {
         self.desk.show_list();
+    }
+
+    /// 取走钩子抛出的选区事件（界面每帧调一次）。
+    pub fn take_selection_events(&self) -> Vec<TouchEvent> {
+        self.touch_events.take_selection()
+    }
+
+    /// 在选区处按一次"复制"（C# `CopySelectionAtAsync`）。
+    ///
+    /// 走平台层的 `perform_selection_action`：它会先确认前台已经是目标窗口，
+    /// 不是就拒发——选区在别人窗口里，乱按 Ctrl+C 是有副作用的。
+    pub fn copy_selection_at(&self, point: snug_core::Point) -> bool {
+        self.selection_actions
+            .perform_selection_action(point, snug_core::selection::SelectionBubbleAction::Copy)
     }
 
     /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。

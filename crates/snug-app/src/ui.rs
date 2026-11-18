@@ -8,7 +8,7 @@ use eframe::egui;
 use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
 
-use crate::controller::Controller;
+use crate::controller::{Controller, TouchEvent};
 use crate::library::{Library, TILE};
 use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsTab, SettingsWindow, StatusInfo};
 use crate::tray::{Tray, TrayCommand};
@@ -59,6 +59,8 @@ pub struct PhoneHomeApp {
     pub library: Library,
     /// 截图覆盖层（相机键）。
     pub shots: crate::shots::Shots,
+    /// "选后复制"的气泡（选区结束才弹）。
+    pub bubble: crate::bubble::CopyBubble,
 }
 
 /// 后台检查更新的结果。
@@ -114,6 +116,7 @@ impl PhoneHomeApp {
             install_rx: None,
             library: Library::new(),
             shots: crate::shots::Shots::new(std::sync::Arc::new(|| {})),
+            bubble: crate::bubble::CopyBubble::new(),
         }
     }
 
@@ -598,6 +601,30 @@ impl eframe::App for PhoneHomeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 手势钩子跟着手机屏与配置走（区域没变时什么都不做）。
         self.controller.sync_touch(&self.config);
+
+        // 选区结束 → 在选区上方弹"复制"气泡（C# `ShowCopySelectionBubble`）。
+        for event in self.controller.take_selection_events() {
+            match event {
+                TouchEvent::SelectionCompleted(at) => {
+                    let state = self.controller.state();
+                    if self.config.copy_after_selection
+                        && !state.list_visible
+                        && state.screen_phase == PhoneScreenPhase::Ready
+                    {
+                        crate::info!("手势：选区结束，弹复制气泡");
+                        self.bubble.show_at(at);
+                    }
+                }
+                TouchEvent::SelectionDismissed => self.bubble.hide(),
+            }
+        }
+        if let Some(at) = self.bubble.poll(ctx) {
+            let copied = self.controller.copy_selection_at(at);
+            crate::info!(
+                "复制气泡：{}",
+                if copied { "已发送复制快捷键" } else { "未能复制（前台窗口不符或注入被挡）" }
+            );
+        }
 
         // 托盘事件：菜单点击、双击。先把事件收齐再处理，避免与 `apply_setting` 抢借用。
         let tray_commands = self.tray.as_mut().map(|tray| tray.poll()).unwrap_or_default();
