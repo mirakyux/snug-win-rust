@@ -43,8 +43,11 @@ fn sink() -> &'static Mutex<Option<Sink>> {
 pub fn init(directory: impl AsRef<Path>) {
     let directory = directory.as_ref().to_path_buf();
     let _ = std::fs::create_dir_all(&directory);
-    let mut guard = sink().lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(Sink { directory, file: None, date: (0, 0, 0) });
+    {
+        let mut guard = sink().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Sink { directory, file: None, date: (0, 0, 0) });
+    }
+    // 注意：必须放开锁之后再写第一行，否则 write() 会再次加锁而死锁。
     write(Level::Info, "日志已启动");
 }
 
@@ -174,14 +177,14 @@ mod tests {
     fn civil_date_conversion_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
-        // 2026-11-18 => 自 1970-01-01 起 20793 天
-        assert_eq!(civil_from_days(20_793), (2026, 11, 18));
+        // 2026-11-18 = 自 1970-01-01 起 20775 天（56 年 + 14 个闰日 + 321 天）
+        assert_eq!(civil_from_days(20_775), (2026, 11, 18));
     }
 
     #[test]
     fn local_time_adds_timezone_offset() {
         // 2026-11-18T00:00:00Z => 本地 08:00
-        let unix = 20_793i64 * 86_400;
+        let unix = 20_775i64 * 86_400;
         let now = from_unix_with_offset(unix);
         assert_eq!((now.year, now.month, now.day), (2026, 11, 18));
         assert_eq!((now.hour, now.minute, now.second), (8, 0, 0));
