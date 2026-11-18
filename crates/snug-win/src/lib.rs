@@ -14,15 +14,17 @@
 //! | `uu` | `UUSensor` | 覆盖窗口、UIA 控制端表、TCP peer、GameViewerServer 日志 |
 
 pub mod display;
+pub mod touch;
 pub mod vdd;
 mod wide;
 pub mod window;
 
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
+pub use touch::{HookEngine, TouchHook, WinInput};
 pub use vdd::{VddClient, VddError, VddMode, VddMonitor, VddProtocol};
 pub use window::{WinDesktop, WinWindows};
 
 /// 平台层已接通的模块数（用于界面显示进度）。
 pub fn implemented_modules() -> &'static [&'static str] {
-    &["vdd", "display", "window"]
+    &["vdd", "display", "window", "touch"]
 }
