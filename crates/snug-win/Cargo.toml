@@ -7,5 +7,6 @@ license.workspace = true
 description = "SnugWin 的 Windows 平台层：虚拟屏驱动 IPC、CCD 显示配置、DWM 窗口搬运、底层输入钩子、UIA、截图"
 
 [dependencies]
-snug-core = { path = "../snug-core" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
