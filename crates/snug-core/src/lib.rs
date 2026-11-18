@@ -29,7 +29,10 @@ pub use config::AppConfig;
 pub use geometry::{Point, Rect, Size};
 pub use left_behind::{LeftBehindBook, LeftBehindEntry};
 pub use paths::Paths;
-pub use phone_models::{PhoneCatalog, PhoneChoice, PhoneModel, PhoneScreenSpec};
+pub use phone_models::{
+    DeviceKind, PHONE_SCREEN_NAME, PhoneCatalog, PhoneChoice, PhoneModel, PhoneScreenSpec,
+    ScreenOrientation,
+};
 pub use record::PhoneRecord;
 pub use screen_fit::{PhoneSpec, ScreenFit};
 pub use screenshots::{

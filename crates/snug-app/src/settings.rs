@@ -871,7 +871,11 @@ mod tests {
 
     #[test]
     fn model_text_falls_back_to_custom() {
-        let choice = PhoneChoice { model: None, screen: snug_core::PhoneScreenSpec::new(1080, 2400, None) };
+        let choice = PhoneChoice {
+            model: None,
+            screen: snug_core::PhoneScreenSpec::new(1080, 2400, None),
+            kind: snug_core::DeviceKind::Phone,
+        };
         assert_eq!(model_text(&choice), "自定义（1080 × 2400）");
         assert!(model_text(&PhoneChoice::standard()).starts_with("Apple iPhone 17 Pro Max（1320 × 2868"));
     }
@@ -943,6 +947,7 @@ mod tests {
         by_model.phone = PhoneChoice {
             model: Some("Xiaomi 15".to_string()),
             screen: snug_core::PhoneScreenSpec::new(1200, 2400, Some(400)),
+            kind: snug_core::DeviceKind::Phone,
         };
         assert_eq!(classify_change(&before, &by_model), ChangeImpact::RebuildPhoneScreen);
 

@@ -1,6 +1,8 @@
-//! 机型库，移植自 C# 版 `SnugWin.Core.PhoneScreen.PhoneModels`。
+//! 机型库，移植自 C# v1.3.0 `SnugWin.Core.PhoneScreen.PhoneModels`。
 //!
-//! 数据源就是 `assets/phone-models.json`（17 个品牌、约 800 款机型），
+//! 数据源是 `assets/phone-models.json`：除了老的 `{ "brands": [...] }` 结构，
+//! 现在还支持 v1.3 的 `{ "phone": [...], "tablet": [...], "computer": [...] }`
+//! 三段式（上游 `device-models.json` 的写法），每段里的机型自动带上设备种类。
 //! 竖握书写：短边在前。校验规则与 C# 版一致，出错时给出中文原因。
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,96 @@ use thiserror::Error;
 use crate::geometry::Size;
 use crate::screen_fit::{PhoneSpec, ScreenFit};
 
+/// 虚拟手机屏的显示名（C# `PhoneScreenSpec.Name`）。
+pub const PHONE_SCREEN_NAME: &str = "Snug 手机屏";
+
+/// 设备种类，对应 C# `DeviceKind`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceKind {
+    #[default]
+    Phone,
+    Tablet,
+    Computer,
+}
+
+impl DeviceKind {
+    /// 触屏设备（手机、平板）；电脑屏不接管触摸。
+    pub fn is_touch(self) -> bool {
+        matches!(self, Self::Phone | Self::Tablet)
+    }
+
+    /// 这个种类最常见的握持方向：手机竖屏，其余横屏。
+    pub fn usual_orientation(self) -> ScreenOrientation {
+        match self {
+            Self::Phone => ScreenOrientation::Portrait,
+            _ => ScreenOrientation::Landscape,
+        }
+    }
+
+    /// 这个种类允许的方向（电脑只能横屏）。
+    pub fn allowed_orientations(self) -> &'static [ScreenOrientation] {
+        match self {
+            Self::Computer => &[ScreenOrientation::Landscape],
+            _ => &[ScreenOrientation::Portrait, ScreenOrientation::Landscape],
+        }
+    }
+
+    /// 能互相「换种类」的集合：手机↔平板（都是触屏），电脑只能和电脑互换。
+    pub fn swappable_kinds(self) -> &'static [DeviceKind] {
+        if self.is_touch() {
+            &[DeviceKind::Phone, DeviceKind::Tablet]
+        } else {
+            &[DeviceKind::Computer]
+        }
+    }
+
+    /// 界面上的中文名（C# `DisplayName()`）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Phone => "手机",
+            Self::Tablet => "平板",
+            Self::Computer => "电脑",
+        }
+    }
+
+    /// C# 枚举名，只用于写日志/错误文案（C# 里 `$"{kind}"` 就是这几个词）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Phone => "Phone",
+            Self::Tablet => "Tablet",
+            Self::Computer => "Computer",
+        }
+    }
+}
+
+/// 屏幕方向，对应 C# `ScreenOrientation`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenOrientation {
+    #[default]
+    Portrait,
+    Landscape,
+}
+
+impl ScreenOrientation {
+    /// 界面上的中文名（C# `DisplayName()`）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Portrait => "竖屏",
+            Self::Landscape => "横屏",
+        }
+    }
+
+    /// 与 C# 枚举同名，写配置/日志时用。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Portrait => "Portrait",
+            Self::Landscape => "Landscape",
+        }
+    }
+}
+
 /// 机型条目里的屏幕规格。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhoneScreenSpec {
@@ -16,19 +108,29 @@ pub struct PhoneScreenSpec {
     pub height: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub points: Option<i32>,
+    /// 挖孔/刘海占掉的像素（电脑屏横屏时从宽度里扣掉）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notch: Option<i32>,
 }
 
 impl PhoneScreenSpec {
     pub const fn new(width: i32, height: i32, points: Option<i32>) -> Self {
-        Self { width, height, points }
+        Self { width, height, points, notch: None }
     }
 
-    /// 分辨率要是正数、竖握书写（短边在前），有逻辑宽度时也要为正。
+    /// 带挖孔宽度的规格（C# `PhoneScreenSpecData(width, height, points, notch)`）。
+    pub const fn with_notch(mut self, notch: Option<i32>) -> Self {
+        self.notch = notch;
+        self
+    }
+
+    /// 分辨率要是正数、竖握书写（短边在前），逻辑宽度与挖孔宽度也不能为负。
     pub fn is_valid(&self) -> bool {
         self.width > 0
             && self.height > 0
             && self.width <= self.height
             && self.points.unwrap_or(1) > 0
+            && self.notch.unwrap_or(0) >= 0
     }
 
     /// 自定义分辨率：横向填写的自动转成竖向；越界返回 None。
@@ -43,13 +145,13 @@ impl PhoneScreenSpec {
     /// 转成档位计算用的规格。
     pub fn to_fit_spec(&self) -> PhoneSpec {
         PhoneSpec::new(self.width as f64, self.height as f64, self.points.map(|p| p as f64))
+            .with_notch(self.notch.map(|n| n as f64))
     }
 
-    /// 该规格对应的逻辑尺寸（基准宽度）。
+    /// 该规格按竖屏手机算出来的逻辑尺寸（基准宽度）。
     pub fn base_size(&self) -> Size {
-        ScreenFit::from_phone(&self.to_fit_spec()).size(
-            ScreenFit::from_phone(&self.to_fit_spec()).base_width(),
-        )
+        let fit = ScreenFit::from_phone(&self.to_fit_spec());
+        fit.size(fit.base_width())
     }
 }
 
@@ -58,6 +160,9 @@ pub struct PhoneModel {
     pub brand: String,
     pub name: String,
     pub screen: PhoneScreenSpec,
+    /// 来自机型库的哪一段（`phone` / `tablet` / `computer`）。
+    #[serde(default)]
+    pub kind: DeviceKind,
 }
 
 impl PhoneModel {
@@ -66,12 +171,14 @@ impl PhoneModel {
     }
 }
 
-/// 用户选中的机型：机型名 + 当时的分辨率（机型库改名或删除后仍能沿用数值）。
+/// 用户选中的机型：机型名 + 当时的分辨率（机型库改名或删除后仍能沿用数值）+ 设备种类。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhoneChoice {
     #[serde(default)]
     pub model: Option<String>,
     pub screen: PhoneScreenSpec,
+    #[serde(default)]
+    pub kind: DeviceKind,
 }
 
 impl Default for PhoneChoice {
@@ -85,11 +192,36 @@ impl PhoneChoice {
         Self {
             model: Some("Apple iPhone 17 Pro Max".to_string()),
             screen: PhoneScreenSpec::new(1320, 2868, Some(440)),
+            kind: DeviceKind::Phone,
+        }
+    }
+
+    /// C# `PhoneChoice.StandardTablet`。
+    pub fn standard_tablet() -> Self {
+        Self {
+            model: Some("Apple iPad Pro 11 (M4)".to_string()),
+            screen: PhoneScreenSpec::new(1668, 2420, Some(834)),
+            kind: DeviceKind::Tablet,
+        }
+    }
+
+    /// C# `PhoneChoice.StandardComputer`。
+    pub fn standard_computer() -> Self {
+        Self {
+            model: Some("通用 1080p".to_string()),
+            screen: PhoneScreenSpec::new(1080, 1920, None),
+            kind: DeviceKind::Computer,
         }
     }
 
     pub fn from_model(model: &PhoneModel) -> Self {
-        Self { model: Some(model.id()), screen: model.screen }
+        Self { model: Some(model.id()), screen: model.screen, kind: model.kind }
+    }
+
+    /// 换设备种类但保留机型名与分辨率（C# 的 `phone with { Kind = … }`）。
+    pub fn with_kind(mut self, kind: DeviceKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
@@ -102,6 +234,14 @@ pub struct Brand {
     pub name: String,
     pub aliases: Vec<String>,
     pub models: Vec<PhoneModel>,
+    pub kind: DeviceKind,
+}
+
+impl Brand {
+    /// 机型库里这段品牌的唯一键（C# `SectionId`）。
+    pub fn section_id(&self) -> String {
+        format!("{}/{}", self.kind.label(), self.name)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +253,19 @@ pub struct PhoneCatalog {
 struct RawFile {
     #[serde(default)]
     brands: Option<Vec<RawBrand>>,
+    #[serde(default)]
+    phone: Option<Vec<RawBrand>>,
+    #[serde(default)]
+    tablet: Option<Vec<RawBrand>>,
+    #[serde(default)]
+    computer: Option<Vec<RawBrand>>,
+}
+
+impl RawFile {
+    /// C# `file.Phone is not null || file.Tablet is not null || file.Computer is not null`。
+    fn has_sections(&self) -> bool {
+        self.phone.is_some() || self.tablet.is_some() || self.computer.is_some()
+    }
 }
 
 #[derive(Deserialize)]
@@ -133,68 +286,35 @@ struct RawModel {
     screen: Option<Vec<i32>>,
     #[serde(default)]
     points: Option<i32>,
+    #[serde(default)]
+    notch: Option<i32>,
 }
 
 impl PhoneCatalog {
+    /// 一台设备都没有的空库（C# `PhoneCatalog.Empty`）。
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     pub fn from_json(json: &str) -> Result<Self, PhoneCatalogError> {
         let file: RawFile = serde_json::from_str(json)
             .map_err(|e| PhoneCatalogError(format!("解不开：{e}")))?;
-        let raw_brands = file
-            .brands
-            .ok_or_else(|| PhoneCatalogError("缺少 brands 字段".to_string()))?;
 
         let mut seen_models = std::collections::HashSet::new();
-        let mut seen_brands = std::collections::HashSet::new();
-        let mut brands = Vec::with_capacity(raw_brands.len());
+        let mut brands = Vec::new();
 
-        for raw in raw_brands {
-            let brand_name = raw.name.unwrap_or_default();
-            let raw_models = raw.models.unwrap_or_default();
-            if brand_name.is_empty() || raw_models.is_empty() {
-                return Err(PhoneCatalogError(format!(
-                    "品牌「{brand_name}」没有名字或没有机型"
-                )));
-            }
-            if !seen_brands.insert(normalize(&brand_name)) {
-                return Err(PhoneCatalogError(format!("品牌「{brand_name}」重复了")));
-            }
-
-            let mut models = Vec::with_capacity(raw_models.len());
-            for entry in raw_models {
-                let screen_pair = entry
-                    .screen
-                    .ok_or_else(|| PhoneCatalogError(format!("{brand_name}：缺少 screen 字段")))?;
-                if screen_pair.len() != 2 {
-                    let name = entry.name.clone().unwrap_or_default();
-                    return Err(PhoneCatalogError(format!(
-                        "{brand_name} {name}：screen 要写成 [宽, 高]"
-                    )));
-                }
-                let screen = PhoneScreenSpec::new(screen_pair[0], screen_pair[1], entry.points);
-                let model = PhoneModel {
-                    brand: brand_name.clone(),
-                    name: entry.name.unwrap_or_default(),
-                    screen,
-                };
-                if model.name.is_empty() || !screen.is_valid() {
-                    return Err(PhoneCatalogError(format!(
-                        "{}：分辨率要是正数、按竖握写（短边在前）",
-                        model.id()
-                    )));
-                }
-                if !seen_models.insert(normalize(&model.id())) {
-                    return Err(PhoneCatalogError(format!("{}：重复了", model.id())));
-                }
-                models.push(model);
-            }
-
-            brands.push(Brand {
-                name: brand_name,
-                aliases: raw.aliases.unwrap_or_default(),
-                models,
-            });
+        // 上游 v2.6 的 device-models.json 是分段结构，优先按段解析。
+        if file.has_sections() {
+            parse_section(file.phone, DeviceKind::Phone, &mut seen_models, &mut brands)?;
+            parse_section(file.tablet, DeviceKind::Tablet, &mut seen_models, &mut brands)?;
+            parse_section(file.computer, DeviceKind::Computer, &mut seen_models, &mut brands)?;
+            return Ok(Self { brands });
         }
 
+        // 老的 phone-models.json 只有 brands，全部按手机处理。
+        let raw_brands =
+            file.brands.ok_or_else(|| PhoneCatalogError("缺少 phone / brands 字段".to_string()))?;
+        parse_section(Some(raw_brands), DeviceKind::Phone, &mut seen_models, &mut brands)?;
         Ok(Self { brands })
     }
 
@@ -208,8 +328,22 @@ impl PhoneCatalog {
         self.brands.iter().flat_map(|b| b.models.iter())
     }
 
+    /// C# `BrandsIn(kinds)`：空参数表示全部。
+    pub fn brands_in(&self, kinds: &[DeviceKind]) -> Vec<&Brand> {
+        if kinds.is_empty() {
+            return self.brands.iter().collect();
+        }
+        self.brands.iter().filter(|b| kinds.contains(&b.kind)).collect()
+    }
+
+    /// 按机型名找（C# `FindModel(id)`，不限种类）。
     pub fn find_model(&self, id: &str) -> Option<&PhoneModel> {
         self.models().find(|m| m.id() == id)
+    }
+
+    /// 按机型名 + 种类找（C# `FindModel(id, kind)`）。
+    pub fn find_model_of_kind(&self, id: &str, kind: DeviceKind) -> Option<&PhoneModel> {
+        self.models().find(|m| m.id() == id && m.kind == kind)
     }
 
     /// 启动时按机型名核对机型库，命中就用库里的数值（机型库改名/删除时沿用存下的）。
@@ -222,14 +356,23 @@ impl PhoneCatalog {
         choice
     }
 
-    /// 按品牌名/别名 + 机型名做包含匹配（忽略大小写与空白）。
+    /// 按品牌名/别名 + 机型名做包含匹配（忽略大小写与空白），不限种类。
     pub fn search(&self, query: &str) -> Vec<Brand> {
+        self.search_in(query, None)
+    }
+
+    /// C# `Search(query, kinds)`：`kinds` 为 None 时搜全部。
+    pub fn search_in(&self, query: &str, kinds: Option<&[DeviceKind]>) -> Vec<Brand> {
+        let source: Vec<&Brand> = match kinds {
+            Some(kinds) => self.brands.iter().filter(|b| kinds.contains(&b.kind)).collect(),
+            None => self.brands.iter().collect(),
+        };
         let q = normalize(query);
         if q.is_empty() {
-            return self.brands.clone();
+            return source.into_iter().cloned().collect();
         }
         let mut matched = Vec::new();
-        for brand in &self.brands {
+        for brand in source {
             let mut brand_names: Vec<String> = vec![normalize(&brand.name)];
             brand_names.extend(brand.aliases.iter().map(|a| normalize(a)));
             let models: Vec<PhoneModel> = brand
@@ -242,11 +385,80 @@ impl PhoneCatalog {
                 .cloned()
                 .collect();
             if !models.is_empty() {
-                matched.push(Brand { name: brand.name.clone(), aliases: brand.aliases.clone(), models });
+                matched.push(Brand {
+                    name: brand.name.clone(),
+                    aliases: brand.aliases.clone(),
+                    models,
+                    kind: brand.kind,
+                });
             }
         }
         matched
     }
+}
+
+/// 解析一段品牌列表（C# `ParseSection`）。
+fn parse_section(
+    section: Option<Vec<RawBrand>>,
+    kind: DeviceKind,
+    seen_models: &mut std::collections::HashSet<String>,
+    output: &mut Vec<Brand>,
+) -> Result<(), PhoneCatalogError> {
+    let Some(raw_brands) = section else { return Ok(()) };
+    let mut seen_brands = std::collections::HashSet::new();
+
+    for raw in raw_brands {
+        let brand_name = raw.name.unwrap_or_default();
+        let raw_models = raw.models.unwrap_or_default();
+        if brand_name.is_empty() || raw_models.is_empty() {
+            return Err(PhoneCatalogError(format!("品牌「{brand_name}」没有名字或没有机型")));
+        }
+        if !seen_brands.insert(normalize(&brand_name)) {
+            return Err(PhoneCatalogError(format!(
+                "{} 里品牌「{brand_name}」重复了",
+                kind.label()
+            )));
+        }
+
+        let mut models = Vec::with_capacity(raw_models.len());
+        for entry in raw_models {
+            let screen_pair = entry
+                .screen
+                .ok_or_else(|| PhoneCatalogError(format!("{brand_name}：缺少 screen 字段")))?;
+            if screen_pair.len() != 2 {
+                let name = entry.name.clone().unwrap_or_default();
+                return Err(PhoneCatalogError(format!(
+                    "{brand_name} {name}：screen 要写成 [短边, 长边]"
+                )));
+            }
+            let screen = PhoneScreenSpec::new(screen_pair[0], screen_pair[1], entry.points)
+                .with_notch(entry.notch);
+            let model = PhoneModel {
+                brand: brand_name.clone(),
+                name: entry.name.unwrap_or_default(),
+                screen,
+                kind,
+            };
+            if model.name.is_empty() || !screen.is_valid() {
+                return Err(PhoneCatalogError(format!(
+                    "{}：分辨率要是正数、短边在前",
+                    model.id()
+                )));
+            }
+            if !seen_models.insert(normalize(&format!("{}/{}", kind.label(), model.id()))) {
+                return Err(PhoneCatalogError(format!("{}：重复了", model.id())));
+            }
+            models.push(model);
+        }
+
+        output.push(Brand {
+            name: brand_name,
+            aliases: raw.aliases.unwrap_or_default(),
+            models,
+            kind,
+        });
+    }
+    Ok(())
 }
 
 /// 小写 + 去掉所有空白（对应 C# `PhoneCatalog.Normalize`）。
@@ -280,6 +492,26 @@ mod tests {
       ]
     }"#;
 
+    /// v1.3 的三段式结构：每种设备一段，机型自动带 kind。
+    const SECTIONS: &str = r#"{
+      "phone": [
+        {"name": "Apple", "aliases": ["苹果"], "models": [
+          { "name": "iPhone 17 Pro Max", "screen": [1320, 2868], "points": 440 }
+        ]}
+      ],
+      "tablet": [
+        {"name": "Apple", "models": [
+          { "name": "iPad Pro 11 (M4)", "screen": [1668, 2420], "points": 834 }
+        ]}
+      ],
+      "computer": [
+        {"name": "通用", "aliases": ["Windows"], "models": [
+          { "name": "1920 × 1080", "screen": [1080, 1920] },
+          { "name": "带挖孔 1920 × 1080", "screen": [1080, 1920], "notch": 60 }
+        ]}
+      ]
+    }"#;
+
     #[test]
     fn catalog_parses_and_indexes_models() {
         let cat = PhoneCatalog::from_json(CATALOG).expect("catalog");
@@ -288,6 +520,39 @@ mod tests {
         let model = cat.find_model("Apple iPhone 17 Pro Max").expect("model");
         assert_eq!(model.screen.width, 1320);
         assert_eq!(model.screen.points, Some(440));
+        assert_eq!(model.kind, DeviceKind::Phone, "旧 brands 结构默认按手机处理");
+    }
+
+    #[test]
+    fn sectioned_catalog_tags_each_brand_with_its_device_kind() {
+        let cat = PhoneCatalog::from_json(SECTIONS).expect("sections");
+        assert_eq!(cat.models().count(), 4);
+        assert_eq!(cat.brands_in(&[DeviceKind::Phone]).len(), 1);
+        assert_eq!(cat.brands_in(&[DeviceKind::Tablet]).len(), 1);
+        assert_eq!(cat.brands_in(&[DeviceKind::Computer]).len(), 1);
+        assert_eq!(cat.brands_in(&[]).len(), 3, "空参数表示全部");
+
+        let tablet = cat.find_model("Apple iPad Pro 11 (M4)").expect("tablet");
+        assert_eq!(tablet.kind, DeviceKind::Tablet);
+        assert!(cat.find_model_of_kind("Apple iPad Pro 11 (M4)", DeviceKind::Tablet).is_some());
+        assert!(cat.find_model_of_kind("Apple iPad Pro 11 (M4)", DeviceKind::Phone).is_none());
+
+        let notched = cat.find_model("通用 带挖孔 1920 × 1080").expect("notched");
+        assert_eq!(notched.kind, DeviceKind::Computer);
+        assert_eq!(notched.screen.notch, Some(60));
+    }
+
+    #[test]
+    fn search_can_be_limited_to_one_device_kind() {
+        let cat = PhoneCatalog::from_json(SECTIONS).expect("sections");
+        let tablets = cat.search_in("iPad", Some(&[DeviceKind::Tablet]));
+        assert_eq!(tablets.len(), 1);
+        assert!(tablets.iter().all(|b| b.kind == DeviceKind::Tablet));
+        assert!(cat.search_in("iPad", Some(&[DeviceKind::Phone])).is_empty());
+        assert_eq!(
+            cat.search_in("1080", Some(&[DeviceKind::Computer]))[0].models.len(),
+            2
+        );
     }
 
     #[test]
@@ -296,6 +561,7 @@ mod tests {
         let resolved = cat.resolve(PhoneChoice::standard());
         assert_eq!(resolved.screen, PhoneScreenSpec::new(1320, 2868, Some(440)));
         assert_eq!(resolved.model.as_deref(), Some("Apple iPhone 17 Pro Max"));
+        assert_eq!(resolved.kind, DeviceKind::Phone);
     }
 
     #[test]
@@ -304,6 +570,7 @@ mod tests {
         let choice = PhoneChoice {
             model: Some("Apple iPhone 99".to_string()),
             screen: PhoneScreenSpec::new(1080, 2400, None),
+            kind: DeviceKind::Phone,
         };
         assert_eq!(cat.resolve(choice.clone()), choice);
     }
@@ -330,14 +597,55 @@ mod tests {
 
         let empty_models = r#"{"brands":[{"name":"A","models":[]}]}"#;
         assert!(PhoneCatalog::from_json(empty_models).is_err());
+
+        // 同一机型不能同时出现在两段里（C# 用 "{Kind}/{Id}" 做去重键）。
+        let across_sections = r#"{"phone":[{"name":"A","models":[{"name":"M","screen":[10,20]}]}],"tablet":[{"name":"A","models":[{"name":"M","screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(across_sections).is_ok(), "不同种类同名不算重复");
+
+        let duplicated_in_section = r#"{"tablet":[{"name":"A","models":[{"name":"M","screen":[10,20]},{"name":"m","screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(duplicated_in_section).is_err());
     }
 
     #[test]
     fn custom_resolution_normalises_orientation_and_bounds() {
-        assert_eq!(PhoneScreenSpec::custom(Some(2400), Some(1080)), Some(PhoneScreenSpec::new(1080, 2400, None)));
+        assert_eq!(
+            PhoneScreenSpec::custom(Some(2400), Some(1080)),
+            Some(PhoneScreenSpec::new(1080, 2400, None))
+        );
         assert_eq!(PhoneScreenSpec::custom(Some(0), Some(1080)), None);
         assert_eq!(PhoneScreenSpec::custom(Some(30000), Some(1080)), None);
         assert_eq!(PhoneScreenSpec::custom(None, Some(1080)), None);
+    }
+
+    #[test]
+    fn negative_notch_makes_the_spec_invalid() {
+        assert!(!PhoneScreenSpec::new(1080, 1920, None).with_notch(Some(-1)).is_valid());
+        assert!(PhoneScreenSpec::new(1080, 1920, None).with_notch(Some(0)).is_valid());
+    }
+
+    #[test]
+    fn device_kind_helpers_match_csharp_tables() {
+        assert!(DeviceKind::Phone.is_touch());
+        assert!(DeviceKind::Tablet.is_touch());
+        assert!(!DeviceKind::Computer.is_touch());
+
+        assert_eq!(DeviceKind::Phone.usual_orientation(), ScreenOrientation::Portrait);
+        assert_eq!(DeviceKind::Tablet.usual_orientation(), ScreenOrientation::Landscape);
+        assert_eq!(DeviceKind::Computer.usual_orientation(), ScreenOrientation::Landscape);
+
+        assert_eq!(DeviceKind::Computer.allowed_orientations(), &[ScreenOrientation::Landscape]);
+        assert_eq!(
+            DeviceKind::Tablet.allowed_orientations(),
+            &[ScreenOrientation::Portrait, ScreenOrientation::Landscape]
+        );
+        assert_eq!(DeviceKind::Phone.swappable_kinds(), &[DeviceKind::Phone, DeviceKind::Tablet]);
+        assert_eq!(DeviceKind::Computer.swappable_kinds(), &[DeviceKind::Computer]);
+
+        assert_eq!(DeviceKind::Phone.display_name(), "手机");
+        assert_eq!(DeviceKind::Tablet.display_name(), "平板");
+        assert_eq!(DeviceKind::Computer.display_name(), "电脑");
+        assert_eq!(ScreenOrientation::Portrait.display_name(), "竖屏");
+        assert_eq!(ScreenOrientation::Landscape.display_name(), "横屏");
     }
 
     #[test]
@@ -345,7 +653,21 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/phone-models.json");
         let cat = PhoneCatalog::load_from_file(path).expect("real catalog");
         assert!(cat.brands.len() >= 10, "brands={}", cat.brands.len());
-        assert!(cat.models().count() >= 700, "models={}", cat.models().count());
+        assert!(cat.models().count() >= 800, "models={}", cat.models().count());
         assert!(cat.find_model("Apple iPhone 17 Pro Max").is_some());
+
+        // v1.3 的机型库分段：手机 / 平板 / 电脑都要有，否则 C# 那边选不到平板/副屏。
+        let phones = cat.brands_in(&[DeviceKind::Phone]);
+        let tablets = cat.brands_in(&[DeviceKind::Tablet]);
+        let computers = cat.brands_in(&[DeviceKind::Computer]);
+        assert!(!phones.is_empty() && !tablets.is_empty() && !computers.is_empty());
+        assert!(
+            cat.models().filter(|m| m.kind == DeviceKind::Tablet).count() > 20,
+            "平板机型太少"
+        );
+        assert!(
+            cat.models().filter(|m| m.kind == DeviceKind::Computer).count() > 5,
+            "电脑机型太少"
+        );
     }
 }
