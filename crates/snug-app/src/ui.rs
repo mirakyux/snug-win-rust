@@ -397,9 +397,14 @@ impl PhoneHomeApp {
         let ready = state.screen_phase == PhoneScreenPhase::Ready;
         // 有窗口铺在手机屏上时，我们只留底部那条指示条（C# 里 `PhoneHomeWindow` 隐、
         // `HomeBarWindow` 显）；没有窗口铺着时，整块手机屏都是资源库。
-        let placed = state.placed.is_some();
+        //
+        // 注意条件必须是「铺着 **且** 不在看列表」：点了指示条上的「‹ 资源库」之后
+        // `list_visible` 变 true，但窗口还在手机屏上（`placed` 仍有值）。如果只看
+        // `placed`，界面就永远停在指示条，用户怎么点都回不到资源库——真机反馈的
+        // 「打开后没法返回那个列表」就是这条。
+        let showing_bar = state.placed.is_some() && !state.list_visible;
         let bounds = if ready {
-            if placed {
+            if showing_bar {
                 self.controller.home_bar_area()
             } else {
                 self.controller.phone_bounds()
@@ -450,7 +455,7 @@ impl PhoneHomeApp {
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
                     "手机屏界面：{}，搬到 ({}, {}) {}×{}",
-                    if placed { "收成底部指示条" } else { "铺满资源库" },
+                    if showing_bar { "收成底部指示条" } else { "铺满资源库" },
                     bounds.x,
                     bounds.y,
                     bounds.width,
@@ -771,13 +776,18 @@ impl eframe::App for PhoneHomeApp {
         }
 
         // 有窗口铺在手机屏上时，界面只剩底部指示条（C#：PhoneHomeWindow 隐、HomeBarWindow 显）。
-        if self.controller.state().placed.is_some() {
+        // 和 `sync_window` 同一个条件：点了「‹ 资源库」之后 `list_visible=true`，即使窗口
+        // 还铺在手机屏上，也必须回到资源库列表。
+        let bar_state = self.controller.state();
+        if bar_state.placed.is_some() && !bar_state.list_visible {
             self.draw_home_bar(ctx);
             self.shots.poll();
             self.shots.show(ctx);
             return;
         }
 
+        // 从列表回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
+        let mut back_to_placed = false;
         egui::TopBottomPanel::top("search")
             .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ctx, |ui| {
@@ -787,10 +797,20 @@ impl eframe::App for PhoneHomeApp {
                     let state = self.controller.state();
                     ui.label(egui::RichText::new(Self::phase_text(state.screen_phase)).weak());
                     if let Some(placed) = &state.placed {
-                        ui.label(
-                            egui::RichText::new(format!("· {}", placed.window.label()))
-                                .color(egui::Color32::from_rgb(140, 200, 255)),
-                        );
+                        // 铺着的窗口仍然在手机屏上（只是被列表盖住了），点这里回去。
+                        let label = format!("· {}", placed.window.label());
+                        let response = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .color(egui::Color32::from_rgb(140, 200, 255)),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("回到手机屏上的这个窗口");
+                        if response.clicked() {
+                            back_to_placed = true;
+                        }
                     }
                     if !self.pipe_ready {
                         ui.label(egui::RichText::new("驱动未就绪").color(egui::Color32::LIGHT_RED));
@@ -813,6 +833,11 @@ impl eframe::App for PhoneHomeApp {
                     });
                 });
             });
+
+        if back_to_placed {
+            crate::info!("资源库：回到手机屏上的窗口");
+            self.controller.return_to_placed();
+        }
 
         egui::TopBottomPanel::bottom("home_bar")
             .exact_height(self.home_bar_height().max(20.0))

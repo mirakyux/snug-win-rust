@@ -303,9 +303,15 @@ impl Controller {
         self.displays.home_bar_area_of(id)
     }
 
-    /// 回到资源库（C# `ShowList`）：把铺开的窗口归位。
+    /// 回到资源库（C# `ShowList`）：界面切回列表，但铺着的窗口**仍留在手机屏上**
+    /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
     pub fn show_list(&self) {
         self.desk.show_list();
+    }
+
+    /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
+    pub fn return_to_placed(&self) {
+        self.desk.return_to_placed();
     }
 
     /// 取走钩子抛出的选区事件（界面每帧调一次）。
