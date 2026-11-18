@@ -1456,6 +1456,36 @@ mod tests {
     }
 
     #[test]
+    fn release_checksums_txt_format_is_accepted_by_try_find_sha256() {
+        // scripts/build-release.ps1 写的是 sha256sum 文本模式：
+        // `<64 位小写十六进制><两个空格><文件名>`，哈希是 zip 的（更新器验的是下载下来的 zip）。
+        let hash = "ab".repeat(32);
+        let upper = hash.to_ascii_uppercase();
+        let asset = "Snug-v1.2.0-win-x64-selfcontained.zip";
+
+        let canonical = format!("{hash}  {asset}\n");
+        assert_eq!(try_find_sha256(&canonical, asset).as_deref(), Some(upper.as_str()));
+
+        // sha256sum -b 的星号变体：C# 会 TrimStart('*')，必须仍指到同一个文件，
+        // 而不是被当成"别的文件名"（这行只是容忍，不是发布脚本的写出格式）。
+        let binary_mode = format!("{hash} *{asset}\n");
+        assert_eq!(try_find_sha256(&binary_mode, asset).as_deref(), Some(upper.as_str()));
+
+        // 单空格变体：解析器按"第 65 个字符是空白"切，所以同样能认出来；
+        // 发布脚本仍固定写两个空格，跟 sha256sum 一致。
+        let single_space = format!("{hash} {asset}\n");
+        assert_eq!(try_find_sha256(&single_space, asset).as_deref(), Some(upper.as_str()));
+
+        // 名字对不上、哈希长度不对、不是十六进制，都必须匹配失败（不能糊里糊涂放行）。
+        assert_eq!(
+            try_find_sha256(&format!("{hash}  Snug-v9.9.9-win-x64-selfcontained.zip\n"), asset),
+            None
+        );
+        assert_eq!(try_find_sha256(&format!("{}  {asset}\n", &hash[..62]), asset), None);
+        assert_eq!(try_find_sha256(&format!("{}  {asset}\n", "zz".repeat(32)), asset), None);
+    }
+
+    #[test]
     fn missing_checksum_warning_names_the_asset() {
         // 名字对不上时行为不变（继续、不校验），但必须留一行日志说明"校验没生效"。
         let message = missing_checksum_warning("Snug-v1.3.0-win-x64-selfcontained.zip");
