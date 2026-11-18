@@ -78,8 +78,14 @@ impl Controller {
                 // UU 采样：一路读不到不该影响状态机，`sample` 自己保证只返回"读不到"。
                 // 采样节奏照 C# 的 1 秒一次；`idle`/`check_returns` 保持 500ms。
                 let mut tracker = snug_core::session::ConnectionTracker::new();
+                // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
+                // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
+                use snug_win::display::DisplayApi;
+                let display = snug_win::WinDisplay::new();
+                let mut last_topology: Option<Vec<(u32, i32, i32, i32, i32)>> = None;
                 let started = std::time::Instant::now();
                 let mut last_sample = -1.0_f64;
+                let mut last_topology_check = -1.0_f64;
                 while stop.load(Ordering::Relaxed) {
                     desk_worker.idle();
                     desk_worker.check_returns();
@@ -89,6 +95,33 @@ impl Controller {
                         let signals = uu_worker.sample(now);
                         tracker.update(&signals.to_signals(), now);
                         desk_worker.set_remote(tracker.is_connected());
+                    }
+                    if now - last_topology_check >= 2.0 {
+                        last_topology_check = now;
+                        let topology: Vec<(u32, i32, i32, i32, i32)> = display
+                            .active_monitors()
+                            .iter()
+                            .map(|monitor| {
+                                (
+                                    monitor.stable_id,
+                                    monitor.bounds.x as i32,
+                                    monitor.bounds.y as i32,
+                                    monitor.bounds.width as i32,
+                                    monitor.bounds.height as i32,
+                                )
+                            })
+                            .collect();
+                        if let Some(previous) = &last_topology
+                            && *previous != topology
+                        {
+                            crate::info!(
+                                "显示器拓扑变化（{} → {} 块屏），通知状态机重新核对",
+                                previous.len(),
+                                topology.len()
+                            );
+                            desk_worker.displays_changed();
+                        }
+                        last_topology = Some(topology);
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
