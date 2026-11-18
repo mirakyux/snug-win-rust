@@ -13,3 +13,6 @@ tools/refdump/obj/
 # 几何对拍生成器的构建产物（TSV 真值要提交，bin/obj 不提交）
 tools/refdump/geometry/bin/
 tools/refdump/geometry/obj/
+
+# 提交用的临时消息文件（每笔提交前写这里，别进仓库）
+.commitmsg.txt

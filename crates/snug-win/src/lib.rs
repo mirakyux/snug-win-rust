@@ -50,13 +50,28 @@ pub fn implemented_modules() -> &'static [&'static str] {
 }
 
 // ---------------------------------------------------------------------------
-// 告警输出
+// 日志输出（告警 / 信息）
 // ---------------------------------------------------------------------------
 
 /// 应用层装的告警接收端（库本身不持有日志文件）。
 type WarnSink = Box<dyn Fn(&str) + Send + Sync>;
 
 static WARN_SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
+
+/// 应用层装的信息接收端（对应 C# 的 `Log.Info`）；库自己不开日志文件。
+type InfoSink = Box<dyn Fn(&str) + Send + Sync>;
+
+static INFO_SINK: std::sync::OnceLock<InfoSink> = std::sync::OnceLock::new();
+
+/// 测试构建里额外记一份信息日志；生产构建不存在。
+#[cfg(test)]
+static TEST_INFOS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 取测试构建里累计的信息日志（跨测试共享，断言请用 `iter().any(...)`）。
+#[cfg(test)]
+pub(crate) fn test_infos() -> Vec<String> {
+    TEST_INFOS.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
 
 /// 测试构建里额外记一份告警，方便断言“这条日志真的会出来”；生产构建不存在。
 #[cfg(test)]
@@ -89,6 +104,30 @@ pub fn warn(message: &str) {
     match WARN_SINK.get() {
         Some(sink) => sink(message),
         None => eprintln!("[Warn] {message}"),
+    }
+}
+
+/// 把平台层的信息日志接到应用自己的日志（通常是 `crate::logging::Info`）。
+///
+/// 和 [`set_warn_sink`] 同型：只认第一次安装，没装时 [`info`] 写 stderr。
+pub fn set_info_sink(sink: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = INFO_SINK.set(Box::new(sink));
+}
+
+/// 平台层信息日志，对应 C# 的 `Log.Info`（如"已按归属记录清理残留手机屏"）。
+///
+/// 成功路径也要留痕：真机排障时"这次启动到底清没清屏"是最常看的一条。
+pub fn info(message: &str) {
+    #[cfg(test)]
+    {
+        TEST_INFOS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(message.to_string());
+    }
+    match INFO_SINK.get() {
+        Some(sink) => sink(message),
+        None => eprintln!("[Info] {message}"),
     }
 }
 

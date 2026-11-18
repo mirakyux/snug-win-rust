@@ -413,6 +413,18 @@ fn sleep_for(duration: Duration) {
     }
 }
 
+/// 启动清理成功后的 C# 原文案：`已按归属记录清理残留手机屏：#1, #2`。
+///
+/// 单独抽成纯函数，单测可以直接盯格式（`#{string.Join(", #", ids)}`）。
+fn cleanup_log_line(ids: &[u32]) -> String {
+    let joined = ids
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("已按归属记录清理残留手机屏：{joined}")
+}
+
 // ---------------------------------------------------------------------------
 // 手机屏（可注入假实现的逻辑本体）
 // ---------------------------------------------------------------------------
@@ -491,6 +503,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             Ok(()) => {
                 sleep_for(self.timings.cleanup_settle);
                 store.clear_all();
+                // C# 文案：`已按归属记录清理残留手机屏：#{string.Join(", #", ownedIds)}`。
+                crate::info(&cleanup_log_line(&owned_ids));
             }
             Err(error) => crate::warn(&format!(
                 "启动清理残留虚拟屏时异常：{error}（保留归属记录）"
@@ -2507,6 +2521,57 @@ mod tests {
         assert!(
             OwnedDisplayStore::new(&path).load_ids().is_empty(),
             "清理成功后账要清空"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cleanup_logs_the_ids_it_removed() {
+        // C# 成功分支的 `Log.Info("已按归属记录清理残留手机屏：#…")`：成功路径也要留痕。
+        let path = owned_path("cleanup-log");
+        OwnedDisplayStore::new(&path).record_owned(1);
+
+        let (mut screen, _shared) = screen_with_owned(world_with_phone(&[1]), &path);
+        screen.cleanup_orphans();
+
+        assert!(
+            crate::test_infos()
+                .iter()
+                .any(|line| line == "已按归属记录清理残留手机屏：#1"),
+            "清理成功要按 C# 文案记一条 info"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cleanup_log_line_matches_csharp_format() {
+        // `$"已按归属记录清理残留手机屏：#{string.Join(", #", ownedIds)}"`
+        assert_eq!(cleanup_log_line(&[1]), "已按归属记录清理残留手机屏：#1");
+        assert_eq!(
+            cleanup_log_line(&[2, 3]),
+            "已按归属记录清理残留手机屏：#2, #3"
+        );
+    }
+
+    #[test]
+    fn cleanup_without_leftovers_logs_nothing() {
+        // 账本空/管道没就绪都走不到成功分支，不该冒出一条"已清理"。
+        // 用 #7 这种别处不会出现的 id，避免并行测试互相干扰。
+        let path = owned_path("cleanup-quiet");
+        OwnedDisplayStore::new(&path).record_owned(7);
+
+        let mut world = world_with_phone(&[0]);
+        world.pipe_available = false;
+        let (mut screen, _shared) = screen_with_owned(world, &path);
+        screen.cleanup_orphans();
+
+        assert!(
+            !crate::test_infos()
+                .iter()
+                .any(|line| line.contains("#7")),
+            "没清成就不该记这条 info"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

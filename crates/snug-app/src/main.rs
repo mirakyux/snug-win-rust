@@ -31,6 +31,8 @@ fn main() -> eframe::Result<()> {
     // 平台层（snug-win）是库，没有日志后端：不接这一行，它的告警只会进 stderr，
     // 而 GUI 程序没有控制台，等于把这些告警丢掉。
     snug_win::set_warn_sink(|message| crate::warn!("{message}"));
+    // 信息通道同理：平台层的成功路径（如"已按归属记录清理残留手机屏"）也要进日志。
+    snug_win::set_info_sink(|message| crate::info!("{message}"));
     // 主线程要调 shell COM（App 图标走 IShellItemImageFactory）：先初始化 STA。
     // 返回 true 表示这次是我们初始化的，退出前必须配对释放；false 表示线程早已初始化过。
     let com_owned = snug_win::init_sta();
