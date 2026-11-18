@@ -65,6 +65,9 @@ impl Controller {
         };
 
         let desk = Desk::new(displays.clone(), windows, apps, paths, options);
+        // 先还上次没还回去的窗口（C# `AppController.Start` 里 `_desk.Recover()` 在
+        // 第一条 `SetWanted` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
+        desk.recover();
         desk.set_wanted(config.phone_screen);
 
         let running = Arc::new(AtomicBool::new(true));
