@@ -77,13 +77,30 @@ impl snug_win::touch::TouchEvents for HookEvents {
     }
 }
 
+/// 界面线程排给后台线程的 desk 操作。
+///
+/// 界面线程不直接 `lock()` 那个 `DeskSet`（后台可能正在里面建屏），
+/// 而是把要做的动作塞进队列，由后台线程在两次 `idle()` 之间执行。
+type DeskAction = Box<dyn FnOnce(&mut DeskSet) + Send>;
+
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
     /// 多屏管理器（对应 C# `DeskSet`）：一块屏一个 desk，共用一条串行队列。
     ///
     /// `DeskSet` 的写操作（`set_wishes`/`set_remote`/`shutdown`）要 `&mut self`，
-    /// 所以外面套了 `Mutex`；锁只做很短的入队，不跨任何等待。
+    /// 所以外面套了 `Mutex`。
+    ///
+    /// **锁的纪律**（很重要，别破坏）：
+    /// - 后台线程在 `idle()` 里会**执行队列里的慢操作**（建屏最长 8 秒 × 4 个候选），
+    ///   这段期间锁是被它占着的；
+    /// - 所以界面线程**绝不能**在锁上等：读走 [`Self::snapshots`]（后台每拍刷新），
+    ///   写走 [`Self::pending`] 队列由后台线程代劳。
+    ///   之前直接在界面线程 `lock()` 过一次，结果是建屏期间界面整块卡死。
     desks: Arc<std::sync::Mutex<snug_core::desk::DeskSet>>,
+    /// 后台线程每拍刷新的状态快照（屏 id → 状态），界面读它就不必碰 `desks` 的锁。
+    snapshots: Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>>,
+    /// 界面线程排给后台线程的 desk 操作（`pull`/`open`/`set_wishes` …）。
+    pending: Arc<std::sync::Mutex<Vec<DeskAction>>>,
     /// 最近一次屏配置（wishes 由它算，写屏列表时更新）。
     config: Arc<std::sync::Mutex<AppConfig>>,
     /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
@@ -158,6 +175,10 @@ impl Controller {
             paths,
             options,
         )));
+        let snapshots: Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<std::sync::Mutex<Vec<DeskAction>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         // 先把上次没撤干净的虚拟屏清掉（C# `CleanupOrphansAsync`）。真机上撞到过：
         // 进程被强杀后虚拟屏留在桌面上，下次启动必须先收尸。
         displays.cleanup_orphans();
@@ -181,6 +202,8 @@ impl Controller {
         let session_worker = session.clone();
         let config = Arc::new(std::sync::Mutex::new(config.clone()));
         let config_worker = config.clone();
+        let snapshots_worker = snapshots.clone();
+        let pending_worker = pending.clone();
         // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
         let touch_events = Arc::new(TouchEventQueue::default());
         let touch = Arc::new(snug_win::TouchHook::with_parts(
@@ -205,10 +228,27 @@ impl Controller {
                 let mut last_connected = false;
                 let mut last_signals: Option<(bool, bool, Option<bool>, bool)> = None;
                 while stop.load(Ordering::Relaxed) {
+                    // 界面排过来的动作先做（只是入队，很快）：这样界面线程永远不用在
+                    // `DeskSet` 的锁上等——那把锁在 `idle()` 里可能被建屏占住好几秒。
+                    let actions: Vec<DeskAction> = pending_worker
+                        .lock()
+                        .map(|mut queue| std::mem::take(&mut *queue))
+                        .unwrap_or_default();
+                    if !actions.is_empty()
+                        && let Ok(mut desks) = desks_worker.lock()
+                    {
+                        for action in actions {
+                            action(&mut desks);
+                        }
+                    }
+                    // 状态快照：`idle()` 之前先发一次，之后（可能已经建/撤完屏）再发一次，
+                    // 界面看到的是"最近一次完成的动作"的结果。
+                    publish_snapshots(&desks_worker, &snapshots_worker);
                     if let Ok(desks) = desks_worker.lock() {
                         desks.idle();
                         desks.check_returns();
                     }
+                    publish_snapshots(&desks_worker, &snapshots_worker);
                     // 用户点了窗口自带的关闭按钮（C# `_desks.ClosePlaced(handle)`）。
                     for handle in touch_events_worker.take_close() {
                         crate::info!("手势：点了窗口关闭按钮，关掉 {handle:#x}");
@@ -323,6 +363,8 @@ impl Controller {
 
         Self {
             desks,
+            snapshots,
+            pending,
             config,
             displays,
             touch,
@@ -358,20 +400,20 @@ impl Controller {
     }
 
     /// 指定屏的状态快照；`None` 表示"主触控屏"。
+    ///
+    /// **只读后台线程发布的快照**，绝不在 `DeskSet` 的锁上等：那把锁在 `idle()` 里
+    /// 可能被建屏占住好几秒，而界面每帧都要读它（见字段上的锁纪律）。
     pub fn state_of(&self, screen_id: Option<&str>) -> DeskState {
-        let Ok(desks) = self.desks.lock() else {
+        let id = screen_id.map(str::to_string).or_else(|| self.primary_screen_id());
+        let Ok(snap) = self.snapshots.lock() else {
             return DeskState::default();
         };
-        let id = match screen_id {
-            Some(id) => Some(id.to_string()),
-            None => self.primary_screen_id(),
-        };
         if let Some(id) = &id
-            && let Some(state) = desks.state_of(id)
+            && let Some(state) = snap.get(id)
         {
-            return state;
+            return state.clone();
         }
-        desks.desk_for_screen(screen_id).map(|desk| desk.state()).unwrap_or_default()
+        snap.values().next().cloned().unwrap_or_default()
     }
 
     /// 当前要展示的那块屏的状态快照（主触控屏）。
@@ -381,7 +423,7 @@ impl Controller {
 
     /// 屏列表变了（设置里增删改屏，对应 C# `_desks.SetWishes(ScreenPlan.Wishes(...))`）。
     ///
-    /// 这里可以立刻生效：`DeskSet` 的写操作只是把动作排进共享队列，很短。
+    /// 配置当场存下，`set_wishes` 交给后台线程执行（界面线程不在那把锁上等）。
     pub fn apply_screens(&self, config: &AppConfig) {
         if let Ok(mut stored) = self.config.lock() {
             *stored = config.clone();
@@ -389,14 +431,15 @@ impl Controller {
         let enabled = self.phone_enabled.load(Ordering::Relaxed);
         let remote = self.in_session() || self.manual_override();
         let wishes = active_wishes(config, enabled, remote);
+        let zoom = config.zoom_steps;
         crate::info!(
             "屏配置变化：{} 块屏愿望（remote={remote} 总开关={enabled}）",
             wishes.len()
         );
-        if let Ok(mut desks) = self.desks.lock() {
+        self.enqueue(move |desks| {
             desks.set_wishes(wishes);
-            desks.set_default_zoom(config.zoom_steps);
-        }
+            desks.set_default_zoom(zoom);
+        });
     }
 
     /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
@@ -406,9 +449,7 @@ impl Controller {
             return;
         }
         crate::info!("重新进入手机屏");
-        if let Ok(desks) = self.desks.lock() {
-            desks.reenter_screen(None);
-        }
+        self.enqueue(|desks| desks.reenter_screen(None));
     }
 
     /// 当前这一段远程会话还在不在（对应 C# `_session.InEpisode`）。
@@ -418,11 +459,13 @@ impl Controller {
 
     /// 能不能"重新进入手机屏"（C# `CanReenterPhoneScreen`）：
     /// 会话中（或手动强制）**且**有触控屏被用户收起过。
+    ///
+    /// 读快照（`dismissed` 是屏状态的一部分），不碰 `DeskSet` 的锁。
     pub fn can_reenter(&self) -> bool {
         let dismissed = self
-            .desks
+            .snapshots
             .lock()
-            .map(|desks| desks.has_any_dismissed_touch())
+            .map(|snap| snap.values().any(|state| state.dismissed))
             .unwrap_or(false);
         dismissed && (self.in_session() || self.manual_override())
     }
@@ -433,15 +476,21 @@ impl Controller {
     /// 关掉时立刻把屏愿望清空，不等下一拍。
     pub fn set_phone_screen(&self, on: bool) {
         self.phone_enabled.store(on, Ordering::Relaxed);
-        if !on && let Ok(mut desks) = self.desks.lock() {
-            desks.set_wishes(Vec::new());
+        if !on {
+            self.enqueue(|desks| desks.set_wishes(Vec::new()));
         }
     }
 
     /// 默认字号档位（设置窗的 zoom 滑杆）。
     pub fn set_default_zoom(&self, steps: i32) {
-        if let Ok(mut desks) = self.desks.lock() {
-            desks.set_default_zoom(steps);
+        self.enqueue(move |desks| desks.set_default_zoom(steps));
+    }
+
+    /// 把一个 desk 操作排给后台线程（界面线程不在这把锁上等）。
+    fn enqueue(&self, action: impl FnOnce(&mut DeskSet) + Send + 'static) {
+        match self.pending.lock() {
+            Ok(mut queue) => queue.push(Box::new(action)),
+            Err(poisoned) => poisoned.into_inner().push(Box::new(action)),
         }
     }
 
@@ -486,15 +535,15 @@ impl Controller {
     /// 回到资源库（C# `ShowList`）：界面切回列表，但铺着的窗口**仍留在手机屏上**
     /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
     pub fn show_list_of(&self, screen_id: Option<&str>) {
-        if let Ok(desks) = self.desks.lock() {
-            desks.show_list(screen_id);
+        if let Some(id) = self.resolve_screen(screen_id) {
+            self.enqueue(move |desks| desks.show_list(Some(&id)));
         }
     }
 
     /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
     pub fn return_to_placed_of(&self, screen_id: Option<&str>) {
-        if let Ok(desks) = self.desks.lock() {
-            desks.return_to_placed(screen_id);
+        if let Some(id) = self.resolve_screen(screen_id) {
+            self.enqueue(move |desks| desks.return_to_placed(Some(&id)));
         }
     }
 
@@ -514,53 +563,43 @@ impl Controller {
 
     /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
     pub fn pull(&self, screen_id: Option<&str>, window: WindowInfo) {
-        let Some(screen_id) = self.resolve_screen(screen_id) else {
+        let Some(id) = self.resolve_screen(screen_id) else {
             crate::warn!("资源库：当前没有屏幕，忽略铺窗");
             return;
         };
-        if let Ok(desks) = self.desks.lock() {
-            desks.pull(&screen_id, window);
-        }
+        self.enqueue(move |desks| desks.pull(&id, window));
     }
 
     /// 启动一个 App（资源库里点没在跑的 App）。
     pub fn open(&self, screen_id: Option<&str>, app: AppInfo) {
-        let Some(screen_id) = self.resolve_screen(screen_id) else {
+        let Some(id) = self.resolve_screen(screen_id) else {
             return;
         };
-        if let Ok(desks) = self.desks.lock() {
-            desks.open(&screen_id, app);
-        }
+        self.enqueue(move |desks| desks.open(&id, app));
     }
 
     /// 给一个已经在跑的 App 再开一个窗口（资源库行右侧的「+」）。
     pub fn new_window(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
-        let Some(screen_id) = self.resolve_screen(screen_id) else {
+        let Some(id) = self.resolve_screen(screen_id) else {
             return;
         };
-        if let Ok(desks) = self.desks.lock() {
-            desks.new_window(&screen_id, app);
-        }
+        self.enqueue(move |desks| desks.new_window(&id, app));
     }
 
     /// 关掉这个 App 的全部窗口（资源库行右侧的「×」）。
     pub fn quit(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
-        let Some(screen_id) = self.resolve_screen(screen_id) else {
+        let Some(id) = self.resolve_screen(screen_id) else {
             return;
         };
-        if let Ok(desks) = self.desks.lock() {
-            desks.quit(&screen_id, app);
-        }
+        self.enqueue(move |desks| desks.quit(&id, app));
     }
 
     /// 关掉某一个窗口（展开的窗口行右侧的「×」）。
     pub fn close_window(&self, screen_id: Option<&str>, window: WindowInfo) {
-        let Some(screen_id) = self.resolve_screen(screen_id) else {
+        let Some(id) = self.resolve_screen(screen_id) else {
             return;
         };
-        if let Ok(desks) = self.desks.lock() {
-            desks.close(&screen_id, window);
-        }
+        self.enqueue(move |desks| desks.close(&id, window));
     }
 
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
@@ -637,8 +676,23 @@ impl Drop for Controller {
         self.running.store(false, Ordering::Relaxed);
     }
 }
-/// 当前该有哪些屏——对应 C# v1.3.0 `AppController.OnTick` 的两行：
+/// 把当前所有屏的状态拷一份给界面线程。
 ///
+/// 后台线程调用；锁只持有到拷完就放掉，界面那边读的是自己的快照，不会等它。
+fn publish_snapshots(
+    desks: &Arc<std::sync::Mutex<DeskSet>>,
+    snapshots: &Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>>,
+) {
+    let states = match desks.lock() {
+        Ok(desks) => desks.all_states(),
+        Err(_) => return,
+    };
+    if let Ok(mut snap) = snapshots.lock() {
+        *snap = states;
+    }
+}
+
+/// 当前该有哪些屏——对应 C# v1.3.0 `AppController.OnTick` 的两行：///
 /// ```csharp
 /// bool remote = _session.InEpisode || _sensor.ManualOverride;
 /// _desks.SetWishes(ScreenPlan.Wishes(_config, remote));
