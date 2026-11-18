@@ -9,3 +9,7 @@
 .dotnet-home/
 tools/refdump/bin/
 tools/refdump/obj/
+
+# 几何对拍生成器的构建产物（TSV 真值要提交，bin/obj 不提交）
+tools/refdump/geometry/bin/
+tools/refdump/geometry/obj/

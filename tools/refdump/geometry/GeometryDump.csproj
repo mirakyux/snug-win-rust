@@ -5,7 +5,8 @@
     导出 screen_fit / crop / placement 三组 TSV，供 Rust 侧 `geometry_parity` 测试断言。
 
     与 `tools/refdump/refdump.csproj`（拼音 target）互不影响：这是独立工程。
-    跑法：dotnet run --project tools/refdump/geometry -c Release -- tools/geometry-ref
+    跑法（在仓库根目录）：dotnet run 加上工程参数 tools/refdump/geometry，-c Release，
+    末尾再给一个输出目录 tools/geometry-ref。
 
     注意 placement 那组要真的创建 WPF 窗口并调 SetWindowPos（只动自己的窗口，
     不碰用户任何窗口），所以目标框架是 net10.0-windows + UseWPF；
@@ -25,6 +26,11 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- UseWPF 会把 ImplicitUsings 换成桌面那套，System.IO 不在里面，显式补上。 -->
+    <Using Include="System.IO" />
+  </ItemGroup>
 
   <ItemGroup>
     <Compile Include="Program.cs" />
