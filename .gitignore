@@ -4,3 +4,8 @@
 *.pdb
 *.log
 /dist
+
+# 拼音表/语料生成工具的临时产物
+.dotnet-home/
+tools/refdump/bin/
+tools/refdump/obj/

@@ -9,6 +9,7 @@ pub mod geometry;
 pub mod left_behind;
 pub mod paths;
 pub mod phone_models;
+pub mod pinyin;
 pub mod record;
 pub mod screen_fit;
 pub mod scrolling;

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>refdump</AssemblyName>
+    <RootNamespace>RefDump</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- 只读引用参考源码，不拷贝、不修改 -->
+    <Compile Include="..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\PinyinSearch.cs" Link="PinyinSearch.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>
