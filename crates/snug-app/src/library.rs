@@ -14,13 +14,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use snug_core::apps::AppAction;
-use snug_core::windows::{AppInfo, RunningApp, WindowInfo};
+use snug_core::windows::{AppInfo, RunningApp};
 use snug_win::WinApps;
 
 /// 多久重新扫一次（新装的 App 最多半分钟后出现）。
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
-/// 网格里一个格子的边长（点）。
-pub const TILE: f32 = 76.0;
 
 /// 后台扫描的线程句柄与结果通道。
 struct Scan {
@@ -59,20 +57,8 @@ impl Library {
         }
     }
 
-    pub fn installed(&self) -> &[AppInfo] {
-        &self.installed
-    }
-
     pub fn running(&self) -> &[RunningApp] {
         &self.running
-    }
-
-    /// 所有运行中的窗口，按 Z 序（前面的是最近用过的）。
-    pub fn running_windows(&self) -> Vec<WindowInfo> {
-        self.running
-            .iter()
-            .flat_map(|app| app.windows.iter().cloned())
-            .collect()
     }
 
     /// 该不该重扫。`force` 用于"手动刷新"按钮或手机屏刚就绪时。
@@ -190,13 +176,5 @@ impl Library {
             .into_iter()
             .map(|group| (group.letter, group.apps))
             .collect()
-    }
-
-    /// 按查询过滤运行中的窗口（标题拼音匹配）。
-    pub fn filter_windows(&self, query: &str) -> Vec<WindowInfo> {
-        if query.trim().is_empty() {
-            return self.running_windows();
-        }
-        snug_core::apps::search(query, &self.installed, &self.running).windows
     }
 }

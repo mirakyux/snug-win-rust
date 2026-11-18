@@ -41,7 +41,7 @@ pub use touch::{HookEngine, TouchHook, WinInput};
 pub use uia::{Uia, UiaCloseButtons};
 pub use update::{AppUpdateService, UpdateCheckResult, UpdateError, PreparedUpdate};
 pub use vdd::{VddClient, VddError, VddMode, VddMonitor, VddProtocol};
-pub use window::{find_own_window, WinDesktop, WinWindows};
+pub use window::{find_own_window, frame_of, WinDesktop, WinWindows};
 pub use selection_action::{WinKeyboard, WinSelectionActions};
 
 /// 平台层已接通的模块数（用于界面显示进度）。

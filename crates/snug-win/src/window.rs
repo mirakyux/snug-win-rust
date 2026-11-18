@@ -1600,3 +1600,14 @@ mod tests {
         assert_eq!(asking.key, WindowKey::new(100, 0x11));
     }
 }
+
+/// 读窗口当前的物理矩形（`GetWindowRect`，不含 DWM 阴影扩展）。
+///
+/// 用来核对"我们让它待的位置"和"它实际在的位置"是否一致：显示器 DPI 变化时
+/// winit 会按新比例改窗口尺寸，绕开 `SetWindowPos`。
+pub fn frame_of(handle: u64) -> Option<Rect> {
+    if handle == 0 {
+        return None;
+    }
+    WinDesktop::window_rect(hwnd(handle))
+}

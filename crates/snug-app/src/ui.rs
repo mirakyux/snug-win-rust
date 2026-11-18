@@ -9,7 +9,7 @@ use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
 
 use crate::controller::{Controller, TouchEvent};
-use crate::library::{Library, TILE};
+use crate::library::Library;
 use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsTab, SettingsWindow, StatusInfo};
 use crate::tray::{Tray, TrayCommand};
 
@@ -34,7 +34,6 @@ pub struct PhoneHomeApp {
     pub tab: HomeTab,
     pub search: String,
     /// 手机屏的逻辑宽度（点），用于把界面元素按屏宽等比放大。
-    pub screen_width: f32,
     /// 设置窗（无人操作时它自己返回 `Idle`，不画任何东西）。
     pub settings: SettingsWindow,
     /// 本进程是否管理员（设置窗要显示，重启提权也要用）。
@@ -91,7 +90,6 @@ impl PhoneHomeApp {
         paths: Paths,
         pipe_ready: bool,
         controller: Controller,
-        screen_width: f32,
     ) -> Self {
         let mut settings = SettingsWindow::new();
         settings.set_catalog(catalog.clone());
@@ -114,7 +112,6 @@ impl PhoneHomeApp {
             controller,
             tab: HomeTab::Running,
             search: String::new(),
-            screen_width,
             settings,
             elevated: snug_win::is_elevated(),
             request_exit: false,
@@ -444,13 +441,18 @@ impl PhoneHomeApp {
             return;
         };
 
-        if self.last_phone_rect != Some(bounds) {
-            // 尺寸也要跟着变：egui 的尺寸单位是点，屏幕矩形是物理像素。
-            let ppp = ctx.pixels_per_point() as f64;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                (bounds.width / ppp) as f32,
-                (bounds.height / ppp) as f32,
-            )));
+        // 除了"我们想要的矩形变了"，还要核对"窗口实际还在不在那里"：显示器 DPI 变化
+        // （虚拟屏是 116.7%）时 winit 会按新比例自己改窗口尺寸，绕开 `SetWindowPos`，
+        // 结果界面比屏小一圈、右边和底部留黑边。每帧比一次，不一致就重新摆。
+        let placed_ok = self.last_phone_rect == Some(bounds)
+            && snug_win::frame_of(hwnd)
+                .map(|got| got.matches(bounds, 2.0))
+                .unwrap_or(false);
+        if !placed_ok {
+            // 尺寸与位置都交给 `SetWindowPos`（物理像素，和虚拟屏分辨率同一套单位）。
+            //
+            // 这里**不能**再发 `ViewportCommand::InnerSize`：那是 egui 的逻辑点，eframe 会按
+            // `pixels_per_point` 换算回物理像素，和 `SetWindowPos` 抢同一个窗口尺寸。
             let request = snug_win::PlacementRequest::new(bounds);
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
@@ -626,20 +628,6 @@ impl PhoneHomeApp {
             PhoneScreenPhase::Failed => "手机屏：失败",
         }
     }
-
-    /// 底部指示条高度，规则与上游一致：28 点 × (屏宽 / 540)。
-    pub fn home_bar_height(&self) -> f32 {
-        (28.0 * self.screen_width / 540.0).round()
-    }
-
-    /// 当前使用中的机型名（顶部标题栏用）。
-    pub fn phone_label(&self) -> String {
-        self.config
-            .phone
-            .model
-            .clone()
-            .unwrap_or_else(|| "自定义分辨率".to_string())
-    }
 }
 
 impl eframe::App for PhoneHomeApp {
@@ -787,50 +775,96 @@ impl eframe::App for PhoneHomeApp {
         }
 
         // 从列表回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
+        // 从列表回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
         let mut back_to_placed = false;
-        egui::TopBottomPanel::top("search")
-            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(12, 8)))
+        let mut pull_window: Option<snug_core::windows::WindowInfo> = None;
+        let mut open_app: Option<snug_core::windows::AppInfo> = None;
+        let mut new_window: Option<snug_core::windows::RunningApp> = None;
+        let mut quit_app: Option<snug_core::windows::RunningApp> = None;
+        let mut close_window: Option<snug_core::windows::WindowInfo> = None;
+
+        // ---- 顶部：App 大字 + 搜索 + 两个页签（对齐原版 `PhoneHomeWindow`）----
+        egui::TopBottomPanel::top("header")
+            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(30, 8)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("‹");
-                    ui.strong(self.phone_label());
-                    let state = self.controller.state();
-                    ui.label(egui::RichText::new(Self::phase_text(state.screen_phase)).weak());
-                    if let Some(placed) = &state.placed {
-                        // 铺着的窗口仍然在手机屏上（只是被列表盖住了），点这里回去。
+                    ui.label(
+                        egui::RichText::new("App")
+                            .size(38.0)
+                            .strong()
+                            .color(egui::Color32::from_gray(238)),
+                    );
+                    let header_state = self.controller.state();
+                    if let Some(placed) = &header_state.placed {
                         let label = format!("· {}", placed.window.label());
-                        let response = ui
+                        if ui
                             .add(
                                 egui::Button::new(
                                     egui::RichText::new(label)
+                                        .size(15.0)
                                         .color(egui::Color32::from_rgb(140, 200, 255)),
                                 )
                                 .frame(false),
                             )
-                            .on_hover_text("回到手机屏上的这个窗口");
-                        if response.clicked() {
+                            .on_hover_text("回到手机屏上的这个窗口")
+                            .clicked()
+                        {
                             back_to_placed = true;
                         }
                     }
-                    if !self.pipe_ready {
-                        ui.label(egui::RichText::new("驱动未就绪").color(egui::Color32::LIGHT_RED));
-                    }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} App · {} 窗口",
-                            self.library.installed().len(),
-                            self.library.running().len()
-                        ))
-                        .weak()
-                        .small(),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .hint_text("搜索 App 与窗口")
-                                .desired_width(ui.available_width() - 40.0),
-                        );
+                        // 原版右上角是「⏏」和「📱」，这里放功能对得上的两个开关。
+                        if ui
+                            .add(egui::Button::new("⚙").min_size(egui::vec2(56.0, 44.0)))
+                            .on_hover_text("设置与诊断")
+                            .clicked()
+                        {
+                            self.settings.open();
+                        }
+                        let mut phone_on = self.config.phone_screen;
+                        if ui
+                            .add(
+                                egui::Button::new(if phone_on { "📱 开" } else { "📱 关" })
+                                    .min_size(egui::vec2(82.0, 44.0)),
+                            )
+                            .on_hover_text("手机屏总开关")
+                            .clicked()
+                        {
+                            phone_on = !phone_on;
+                            self.config.phone_screen = phone_on;
+                            self.controller.set_phone_screen(phone_on);
+                        }
                     });
+                });
+
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("🔍 搜索 App")
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(8.0);
+                let half = ((ui.available_width() - 8.0) / 2.0).max(120.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [half, 44.0],
+                            egui::Button::selectable(self.tab == HomeTab::Running, "运行中"),
+                        )
+                        .clicked()
+                    {
+                        self.tab = HomeTab::Running;
+                    }
+                    if ui
+                        .add_sized(
+                            [half, 44.0],
+                            egui::Button::selectable(self.tab == HomeTab::All, "全部"),
+                        )
+                        .clicked()
+                    {
+                        self.tab = HomeTab::All;
+                    }
                 });
             });
 
@@ -839,204 +873,129 @@ impl eframe::App for PhoneHomeApp {
             self.controller.return_to_placed();
         }
 
-        egui::TopBottomPanel::bottom("home_bar")
-            .exact_height(self.home_bar_height().max(20.0))
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if self.config.screenshot {
-                        // 相机键：抓当前铺在手机屏上的那个窗口（C# 底部条上的相机）。
-                        let placed = self.controller.state().placed.map(|placed| placed.window);
-                        match placed {
-                            Some(window) => {
-                                // 覆盖层开着的时候别再抓一张（C# 也是同一行为）。
-                                let enabled = !self.shots.is_open();
-                                if ui
-                                    .add_enabled(enabled, egui::Button::new("📷"))
-                                    .on_hover_text(format!("截取 {}", window.label()))
-                                    .clicked()
-                                {
-                                    self.shots.take(&window);
-                                }
-                            }
-                            None => {
-                                ui.label("📷");
-                            }
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut wanted = self.config.phone_screen;
-                        if ui.checkbox(&mut wanted, "手机屏").changed() {
-                            self.config.phone_screen = wanted;
-                            self.controller.set_phone_screen(wanted);
-                        }
-                        if ui.small_button("全部").clicked() {
-                            self.tab = HomeTab::All;
-                        }
-                        if ui.small_button("⚙").on_hover_text("设置").clicked() {
-                            self.settings.open();
-                        }
-                        if ui.small_button("运行中").clicked() {
-                            self.tab = HomeTab::Running;
-                        }
-                    });
-                });
-            });
-
+        // ---- 列表：竖向一行一个 App（原版就是这个结构，不是图标网格）----
         egui::CentralPanel::default().show(ctx, |ui| {
-            match self.tab {
-                HomeTab::Running => {
-                    ui.add_space(6.0);
-                    let windows = self.library.filter_windows(&self.search);
-                    if windows.is_empty() {
-                        ui.add_sized(
-                            [ui.available_width(), 60.0],
-                            egui::Button::new(egui::RichText::new(if self.search.trim().is_empty() {
-                                "暂无运行中的窗口"
+            if self.library.needs_scan(false) {
+                self.library.start_scan();
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(8.0);
+                match self.tab {
+                    HomeTab::Running => {
+                        let apps = self.library.running().to_vec();
+                        if apps.is_empty() {
+                            ui.label(egui::RichText::new("没有正在运行的窗口").size(16.0).weak());
+                            ui.label(
+                                egui::RichText::new("启动一个 App 后，它的窗口会列在这里，点一下铺满手机屏")
+                                    .size(14.0)
+                                    .weak(),
+                            );
+                        }
+                        for app in apps {
+                            let texture = self.library.icon(ctx, &app.app);
+                            let count = app.windows.len();
+                            let (clicked, plus, cross) =
+                                app_row(ui, &app.app.name, Some(count), texture.as_ref(), true);
+                            if clicked {
+                                pull_window = app.windows.first().cloned();
+                            }
+                            if plus {
+                                new_window = Some(app.clone());
+                            }
+                            if cross {
+                                quit_app = Some(app.clone());
+                            }
+                            for window in &app.windows {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(52.0);
+                                    let label = format!("❐ {}", window.label());
+                                    let width = (ui.available_width() - 48.0).max(80.0);
+                                    if ui
+                                        .add_sized(
+                                            [width, 34.0],
+                                            egui::Button::new(egui::RichText::new(label).size(15.0))
+                                                .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        pull_window = Some(window.clone());
+                                    }
+                                    if ui
+                                        .add(egui::Button::new("×").min_size(egui::vec2(34.0, 34.0)))
+                                        .on_hover_text("关闭这个窗口")
+                                        .clicked()
+                                    {
+                                        close_window = Some(window.clone());
+                                    }
+                                });
+                            }
+                            ui.add_space(4.0);
+                        }
+                    }
+                    HomeTab::All => {
+                        let groups = self.library.grouped(&self.search);
+                        if groups.is_empty() {
+                            let hint = if !self.library.scanned_once {
+                                "正在读取已安装的 App…"
+                            } else if self.search.trim().is_empty() {
+                                "没有找到已安装的 App"
                             } else {
-                                "没有匹配的窗口"
-                            })
-                            .size(15.0)),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("窗口会在这里显示，点一下即铺满手机屏").weak(),
-                        );
-                    } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            let mut clicked = None;
-                            for window in &windows {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width(), 44.0],
-                                        egui::Button::new(window.label()),
-                                    )
-                                    .clicked()
-                                {
-                                    clicked = Some(window.clone());
-                                }
-                            }
-                            if let Some(window) = clicked {
-                                crate::info!("资源库：铺开 {}", window.label());
-                                self.controller.pull(window);
-                            }
-                        });
-                    }
-                }
-                HomeTab::All => {
-                    ui.add_space(6.0);
-                    if self.library.needs_scan(false) {
-                        self.library.start_scan();
-                    }
-                    let groups = self.library.grouped(&self.search);
-                    if groups.is_empty() {
-                        let hint = if !self.library.scanned_once {
-                            "正在读取已安装的 App…"
-                        } else if self.search.trim().is_empty() {
-                            "没有找到已安装的 App"
-                        } else {
-                            "没有匹配的 App"
-                        };
-                        ui.label(egui::RichText::new(hint).weak());
-                    }
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let mut clicked = None;
-                        let columns = ((ui.available_width() / TILE).floor() as usize).max(1);
+                                "没有匹配的 App"
+                            };
+                            ui.label(egui::RichText::new(hint).weak());
+                        }
                         for (letter, apps) in &groups {
-                            // 字母分组头（C# 的列表也是分段的）。
                             if !letter.is_empty() {
-                                ui.add_space(4.0);
+                                ui.add_space(10.0);
                                 ui.label(
                                     egui::RichText::new(letter)
+                                        .size(13.0)
                                         .strong()
-                                        .small()
                                         .color(egui::Color32::from_gray(150)),
                                 );
                             }
-                            for row in (*apps).chunks(columns) {
-                            ui.horizontal(|ui| {
-                                for app in row {
-                                    let texture = self.library.icon(ctx, app);
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(TILE - 4.0, TILE),
-                                        egui::Sense::click(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        10.0,
-                                        if response.hovered() {
-                                            egui::Color32::from_rgb(56, 60, 70)
-                                        } else {
-                                            egui::Color32::from_rgb(40, 43, 50)
-                                        },
-                                    );
-                                    match &texture {
-                                        Some(texture) => {
-                                            let side = TILE * 0.52;
-                                            let icon_rect = egui::Rect::from_center_size(
-                                                egui::pos2(rect.center().x, rect.top() + 8.0 + side / 2.0),
-                                                egui::vec2(side, side),
-                                            );
-                                            ui.painter().image(
-                                                texture.id(),
-                                                icon_rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                egui::Color32::WHITE,
-                                            );
-                                        }
-                                        None => {
-                                            // C# 对取不到图标的 App 画占位图（首字母）。
-                                            let initial = app
-                                                .name
-                                                .chars()
-                                                .next()
-                                                .map(|c| c.to_uppercase().to_string())
-                                                .unwrap_or_else(|| "?".to_string());
-                                            ui.painter().text(
-                                                egui::pos2(rect.center().x, rect.top() + 8.0 + TILE * 0.26),
-                                                egui::Align2::CENTER_CENTER,
-                                                initial,
-                                                egui::FontId::proportional(24.0),
-                                                egui::Color32::from_gray(170),
-                                            );
-                                        }
+                            for app in apps {
+                                let texture = self.library.icon(ctx, app);
+                                let count = self
+                                    .library
+                                    .running()
+                                    .iter()
+                                    .find(|run| run.app.app_id.eq_ignore_ascii_case(&app.app_id))
+                                    .map(|run| run.windows.len());
+                                if app_row(ui, &app.name, count, texture.as_ref(), false).0 {
+                                    match self.library.action_for(app) {
+                                        AppAction::Pull(window) => pull_window = Some(window),
+                                        AppAction::Open(app) => open_app = Some(app),
                                     }
-                                    let text_rect = egui::Rect::from_min_max(
-                                        egui::pos2(rect.left() + 2.0, rect.bottom() - 24.0),
-                                        egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
-                                    );
-                                    ui.painter().text(
-                                        text_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &app.name,
-                                        egui::FontId::proportional(11.0),
-                                        egui::Color32::from_gray(220),
-                                    );
-                                    if response.clicked() {
-                                        clicked = Some(app.clone());
-                                    }
-                                }
-                            });
-                            }
-                        }
-                        if let Some(app) = clicked {
-                            match self.library.action_for(&app) {
-                                AppAction::Pull(window) => {
-                                    crate::info!("资源库：铺开 {}", window.label());
-                                    self.controller.pull(window);
-                                }
-                                AppAction::Open(app) => {
-                                    crate::info!("资源库：启动 {}", app.name);
-                                    self.controller.open(app);
                                 }
                             }
                         }
-                    });
+                    }
                 }
-            }
+            });
         });
+
+        // 动作在闭包外落地，避免和 `self` 的借用打架。
+        if let Some(window) = pull_window {
+            crate::info!("资源库：铺开 {}", window.label());
+            self.controller.pull(window);
+        }
+        if let Some(app) = open_app {
+            crate::info!("资源库：启动 {}", app.name);
+            self.controller.open(app);
+        }
+        if let Some(app) = new_window {
+            crate::info!("资源库：给 {} 新开窗口", app.app.name);
+            self.controller.new_window(app);
+        }
+        if let Some(app) = quit_app {
+            crate::info!("资源库：关闭 {} 的全部窗口", app.app.name);
+            self.controller.quit(app);
+        }
+        if let Some(window) = close_window {
+            crate::info!("资源库：关闭窗口 {}", window.label());
+            self.controller.close_window(window);
+        }
     }
 }
 
@@ -1066,4 +1025,76 @@ fn run_elevated_powershell(script: &std::path::Path) -> std::io::Result<()> {
         ])
         .spawn()
         .map(|_| ())
+}
+
+/// 资源库里的一行 App：图标 + 名字（+ 窗口数），右侧「+」「×」。
+///
+/// 对应原版 `PhoneHomeWindow` 的 `RunningAppVm` 行：图标 66×66、名字、`N 个窗口`，
+/// 右侧「+」（再开一个窗口）和「×」（关掉这个 App 的全部窗口）。
+/// 返回 `(点按区, 加号, 叉号)` 是否被点。
+fn app_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: Option<usize>,
+    texture: Option<&egui::TextureHandle>,
+    show_actions: bool,
+) -> (bool, bool, bool) {
+    let mut clicked = false;
+    let mut plus = false;
+    let mut cross = false;
+
+    ui.horizontal(|ui| {
+        let icon = match texture {
+            Some(texture) => ui.add(
+                egui::Image::new(texture)
+                    .fit_to_exact_size(egui::vec2(46.0, 46.0))
+                    .sense(egui::Sense::click()),
+            ),
+            None => {
+                let initial = name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                ui.add_sized(
+                    [46.0, 46.0],
+                    egui::Button::new(egui::RichText::new(initial).size(20.0)),
+                )
+            }
+        };
+        if icon.clicked() {
+            clicked = true;
+        }
+        ui.vertical(|ui| {
+            if ui
+                .add(egui::Button::new(egui::RichText::new(name).size(19.0)).frame(false))
+                .clicked()
+            {
+                clicked = true;
+            }
+            if let Some(count) = count {
+                ui.label(egui::RichText::new(format!("{count} 个窗口")).size(13.0).weak());
+            }
+        });
+        if show_actions {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new("×").min_size(egui::vec2(40.0, 40.0)))
+                    .on_hover_text("关闭这个 App 的全部窗口")
+                    .clicked()
+                {
+                    cross = true;
+                }
+                if ui
+                    .add(egui::Button::new("+").min_size(egui::vec2(40.0, 40.0)))
+                    .on_hover_text("再开一个窗口")
+                    .clicked()
+                {
+                    plus = true;
+                }
+            });
+        }
+    });
+
+    (clicked, plus, cross)
 }

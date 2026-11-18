@@ -111,7 +111,6 @@ fn main() -> eframe::Result<()> {
                 paths.clone(),
                 pipe_ready,
                 controller,
-                logical.width as f32,
             )))
         }),
     );

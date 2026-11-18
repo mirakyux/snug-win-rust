@@ -338,6 +338,21 @@ impl Controller {
         self.desk.open(app);
     }
 
+    /// 给一个已经在跑的 App 再开一个窗口（资源库行右侧的「+」）。
+    pub fn new_window(&self, app: snug_core::windows::RunningApp) {
+        self.desk.new_window(app);
+    }
+
+    /// 关掉这个 App 的全部窗口（资源库行右侧的「×」）。
+    pub fn quit(&self, app: snug_core::windows::RunningApp) {
+        self.desk.quit(app);
+    }
+
+    /// 关掉某一个窗口（展开的窗口行右侧的「×」）。
+    pub fn close_window(&self, window: WindowInfo) {
+        self.desk.close(window);
+    }
+
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
     pub fn apply_gesture_settings(&self, config: &AppConfig) {
         crate::info!(
