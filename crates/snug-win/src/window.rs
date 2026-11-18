@@ -6,9 +6,9 @@
 //! - **边框补偿**：Win10/11 的窗口有不可见的阴影/圆角外扩。C# 用
 //!   `DWMWA_EXTENDED_FRAME_BOUNDS` 量出"看得见的边框"，再反推出 `SetWindowPos`
 //!   该用的原始矩形。这里原样移植（[`shadow_margins`] / [`window_rect_for_target`]）。
-//! - **关闭按钮位置**依赖 UIA，属于 `uia` 模块的活。这里留了
-//!   [`CloseButtonFinder`] 插口，还没接上时 [`WindowControl::close_button`] 返回 `None`，
-//!   触摸那边会退回"先归位再关"的策略。
+//! - **关闭按钮位置**依赖 UIA（C# `UiaHelper.FindCloseButtonRect`）。[`WinWindows`] 默认
+//!   就接上了 [`crate::uia::UiaCloseButtons`]，所以 [`WindowControl::close_button`] 会真的
+//!   去问 UIA；[`CloseButtonFinder`] 这个插口留着给测试换假实现。
 //!
 //! 选择复制（C# `CopySelectionAtAsync` / `SelectionBubbleAction`）依赖
 //! `SnugWin.Core.Touch.SelectionShortcutResolver`，等 core 移植过来再在 `touch` 模块里接。
@@ -394,8 +394,13 @@ pub struct Windows<A: WindowApi> {
 pub type WinWindows = Windows<WinDesktop>;
 
 impl WinWindows {
+    /// 真机窗口控制：默认已经接上 UIA 的关闭按钮查询（C# 里 `CloseButtonAsync` 走 `UiaHelper`）。
     pub fn new() -> Self {
-        Self { api: WinDesktop, timings: WindowTimings::default(), close_buttons: None }
+        Self {
+            api: WinDesktop,
+            timings: WindowTimings::default(),
+            close_buttons: Some(Arc::new(crate::uia::UiaCloseButtons)),
+        }
     }
 }
 
@@ -1478,9 +1483,28 @@ mod tests {
     }
 
     #[test]
-    fn close_button_is_none_until_uia_is_wired() {
+    fn close_button_is_none_without_a_finder() {
         let (service, _state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
         assert_eq!(service.close_button(WindowKey::new(100, 0x10)), None);
+    }
+
+    #[test]
+    fn close_button_uses_the_wired_uia_finder() {
+        let (service, _state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        let button = Rect::new(8.0, 12.0, 24.0, 24.0);
+        let service = service.with_close_buttons(Arc::new(StaticFinder(button)));
+        assert_eq!(service.close_button(WindowKey::new(100, 0x10)), Some(button));
+        // 窗口不在时不去问 UIA。
+        assert_eq!(service.close_button(WindowKey::new(100, 0x99)), None);
+    }
+
+    /// 假的 UIA 查找器：固定返回一个矩形。
+    struct StaticFinder(Rect);
+
+    impl CloseButtonFinder for StaticFinder {
+        fn find_close_button(&self, _handle: u64) -> Option<Rect> {
+            Some(self.0)
+        }
     }
 
     #[test]
