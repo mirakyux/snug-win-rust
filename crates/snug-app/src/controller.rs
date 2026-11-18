@@ -125,7 +125,10 @@ impl Controller {
         };
 
         let desk = Desk::new(displays.clone(), windows, apps, paths, options);
-        // 先还上次没还回去的窗口（C# `AppController.Start` 里 `_desk.Recover()` 在
+        // 先把上次没撤干净的虚拟屏清掉（C# `CleanupOrphansAsync`）。真机上撞到过：
+        // 进程被强杀后虚拟屏留在桌面上，下次启动必须先收尸。
+        displays.cleanup_orphans();
+        // 再还上次没还回去的窗口（C# `AppController.Start` 里 `_desk.Recover()` 在
         // 第一条 `SetWanted` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
         desk.recover();
         desk.set_wanted(config.phone_screen);

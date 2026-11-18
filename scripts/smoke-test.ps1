@@ -82,9 +82,13 @@ if (-not $alive) { Write-Host "  进程已退出（可能自己崩了或单实�
 
 # ---- 读日志判定 -------------------------------------------------------------
 Write-Step "判定"
-$log = Get-ChildItem (Join-Path $DataDir 'logs') -Filter '*.log' |
-    Where-Object { $_.LastWriteTime -gt $startedAt.AddMinutes(-1) } |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$logDir = Join-Path $DataDir 'logs'
+# 隔离目录里只有我们自己的日志，取最新的那个即可（不要用时间过滤：脚本和进程的
+# 时钟/时区口径没必要在这里互相猜）。
+$logs = @(Get-ChildItem -Path $logDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+Write-Host "  日志目录：$logDir（$($logs.Count) 个文件）"
+$log = $logs | Select-Object -First 1
 if (-not $log) { Fail "没有生成日志文件（程序没跑起来？）" }
 
 $text = Get-Content $log.FullName -Raw
@@ -135,16 +139,23 @@ Get-Content $log.FullName -Tail 30 | ForEach-Object { "  $_" }
 # ---- 收尾 -------------------------------------------------------------------
 Write-Step "收尾"
 if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
-    # 用关闭主窗口让它在 on_exit 里撤屏、存配置；托盘程序没有主窗口时才强杀。
-    $closed = $false
-    try { $closed = $proc.CloseMainWindow() } catch { $closed = $false }
-    if ($closed) {
-        if ($proc.WaitForExit(15000)) { Write-Host "  已正常退出" } else { Write-Host "  15s 内没退出，强杀" }
+    # 真机上 `CloseMainWindow` 会让进程直接消失、不走任何 Rust 收尾（虚拟屏会留在桌面）。
+    # 所以先放一个 `quit.request`，让它自己走 on_exit 那条路（撤屏 + 归位窗口 + 存配置）。
+    $quitFlag = Join-Path $DataDir 'quit.request'
+    Set-Content -Path $quitFlag -Value 'quit' -Encoding ascii
+    Write-Host "  已放退出请求：$quitFlag"
+    $graceful = $proc.WaitForExit(30000)
+    if ($graceful) {
+        Write-Host "  已正常退出（收尾日志见上）" -ForegroundColor Green
+    } else {
+        Write-Host "  30s 内没退出，改发关闭请求" -ForegroundColor Yellow
+        $proc.CloseMainWindow() | Out-Null
+        if (-not $proc.WaitForExit(10000)) {
+            Stop-Process -Id $proc.Id -Force
+            Write-Host "  只能强制结束（这次不会走收尾，虚拟屏可能残留，下次启动会自动清理）" -ForegroundColor Yellow
+        }
     }
-    if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
-        Stop-Process -Id $proc.Id -Force
-        Write-Host "  已强制结束（这次不会走 on_exit，配置不保存）" -ForegroundColor Yellow
-    }
+    Remove-Item $quitFlag -ErrorAction SilentlyContinue
 } else {
     Write-Host "  进程早已退出"
 }

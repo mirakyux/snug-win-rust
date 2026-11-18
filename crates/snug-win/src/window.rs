@@ -974,9 +974,9 @@ pub fn find_own_window(title: &str) -> Option<u64> {
 
     unsafe extern "system" fn find(window: HWND, data: LPARAM) -> BOOL {
         let search = unsafe { &mut *(data.0 as *mut Search) };
-        if !unsafe { IsWindowVisible(window) }.as_bool() {
-            return BOOL(1);
-        }
+        // 注意：**不能**过滤 IsWindowVisible。应用会把自己那个窗口藏起来
+        // （手机屏没就绪时只留托盘），藏起来之后还得能再被找到并搬回屏上，
+        // 否则就是一去不返（真机阶段 B 撞到过）。
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
         if pid as i32 != search.pid {

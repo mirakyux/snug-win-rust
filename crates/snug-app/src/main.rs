@@ -23,6 +23,10 @@ fn main() -> eframe::Result<()> {
         eprintln!("无法创建数据目录 {}：{err}", paths.data_dir().display());
     }
     logging::init(paths.log_directory());
+    // 崩溃要留痕：GUI 进程没有控制台，默认的 panic 输出会直接丢掉。
+    std::panic::set_hook(Box::new(|info| {
+        crate::error!("未捕获的 panic：{info}");
+    }));
     // 平台层（snug-win）是库，没有日志后端：不接这一行，它的告警只会进 stderr，
     // 而 GUI 程序没有控制台，等于把这些告警丢掉。
     snug_win::set_warn_sink(|message| crate::warn!("{message}"));
@@ -68,6 +72,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(ui::WINDOW_TITLE)
             .with_decorations(false)
+            // 不进任务栏：手机屏界面不是"应用程序窗口"，和 C# 的 HomeBar/PhoneHome 一样。
+            .with_taskbar(false)
             .with_inner_size([logical.width as f32, logical.height as f32])
             .with_min_inner_size([540.0, 800.0]),
         ..Default::default()
@@ -79,6 +85,19 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
             let repaint_ctx = cc.egui_ctx.clone();
+            // 心跳线程：eframe 在窗口长期没输入时会停在 Wait 上，而我们要靠 `update()`
+            // 去轮询托盘事件、退出请求、搬窗。真机上撞到过"隐藏窗口后一帧都不出"，
+            // 所以这里明确按节奏叫醒它，不依赖"窗口可见"这个前提。
+            {
+                let ctx = cc.egui_ctx.clone();
+                std::thread::Builder::new()
+                    .name("snug-ui-tick".to_string())
+                    .spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        ctx.request_repaint();
+                    })
+                    .ok();
+            }
             let controller = controller::Controller::start(
                 &config,
                 &paths,
@@ -99,6 +118,8 @@ fn main() -> eframe::Result<()> {
 
     if let Err(err) = &result {
         crate::error!("界面异常退出：{err}");
+    } else {
+        crate::info!("事件循环已退出");
     }
     if com_owned {
         snug_win::uninit_com();

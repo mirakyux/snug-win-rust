@@ -61,6 +61,17 @@ pub struct PhoneHomeApp {
     pub shots: crate::shots::Shots,
     /// "选后复制"的气泡（选区结束才弹）。
     pub bubble: crate::bubble::CopyBubble,
+    /// 界面窗口当前是不是被挪到屏幕外待命（避免反复 SetWindowPos）。
+    pub last_offscreen: Option<bool>,
+    /// 收尾是否已经做过（`on_exit` 与 `Drop` 都会调，必须幂等）。
+    pub finished: bool,
+}
+
+impl Drop for PhoneHomeApp {
+    fn drop(&mut self) {
+        // eframe 在某些路径下不会调 `on_exit`（真机撞到过），Drop 兜底。
+        self.finish();
+    }
 }
 
 /// 后台检查更新的结果。
@@ -117,6 +128,8 @@ impl PhoneHomeApp {
             library: Library::new(),
             shots: crate::shots::Shots::new(std::sync::Arc::new(|| {})),
             bubble: crate::bubble::CopyBubble::new(),
+            finished: false,
+            last_offscreen: None,
         }
     }
 
@@ -350,6 +363,30 @@ impl PhoneHomeApp {
         }
     }
 
+    /// 一次性收尾：撤托盘、撤手机屏、把窗口还回去、存配置。
+    ///
+    /// 真机上撞到过 **eframe 没有调 `on_exit`**（进程正常退出、日志里一行收尾都没有，
+    /// 虚拟屏就留在桌面上）。所以收尾做成幂等，`on_exit` 和 `Drop` 都调它：
+    /// 只要它被调用一次，桌面就不会留孤儿屏。
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        crate::info!("收尾：开始（撤托盘 + 撤屏 + 归位窗口 + 存配置）");
+        // 托盘要先撤掉：进程退出后留着图标，explorer 会留一个"幽灵图标"直到鼠标划过。
+        self.tray = None;
+        // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
+        self.controller.shutdown();
+        let file = self.paths.config_file();
+        let json = self.config.to_json();
+        match std::fs::write(&file, json) {
+            Ok(()) => crate::info!("收尾：配置已保存 {}", file.display()),
+            Err(err) => crate::warn!("收尾：配置保存失败 {}：{err}", file.display()),
+        }
+        crate::info!("收尾：完成");
+    }
+
     /// 让界面窗口跟着手机屏走：屏在就把窗口搬上去，屏没了就藏起来。
     ///
     /// 对应 C# 里 `PhoneHomeWindow` 始终待在虚拟屏上（由 `_displays.BoundsOf` 定位），
@@ -372,11 +409,27 @@ impl PhoneHomeApp {
         };
 
         let Some(bounds) = bounds else {
-            // 手机屏不在了：窗口回主屏并藏起来，只留托盘。
+            // 手机屏不在了：**不能把窗口隐藏**。
+            // 真机实测：窗口一旦 `Visible(false)`，eframe/winit 就不再出帧，
+            // `update()` 几乎不跑 → 托盘点击、退出请求、后续搬窗全部失效。
+            // 做法改成"挪到屏幕外"：Windows 认为它可见（帧照常来），用户看不见。
             self.last_phone_rect = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if self.phone_window.is_none() {
+                self.phone_window = snug_win::find_own_window(WINDOW_TITLE);
+            }
+            if let Some(hwnd) = self.phone_window
+                && self.last_offscreen != Some(true)
+            {
+                let far = snug_core::Rect::new(-30_000.0, -30_000.0, 540.0, 800.0);
+                if snug_win::apply_placement(hwnd, &snug_win::PlacementRequest::new(far)) {
+                    crate::info!("手机屏未就绪：界面窗口挪到屏幕外待命");
+                    self.last_offscreen = Some(true);
+                }
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             return;
         };
+        self.last_offscreen = Some(false);
 
         if self.phone_window.is_none() {
             self.phone_window = snug_win::find_own_window(WINDOW_TITLE);
@@ -586,19 +639,27 @@ impl PhoneHomeApp {
 
 impl eframe::App for PhoneHomeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 托盘要先撤掉：进程退出后留着图标，explorer 会留一个"幽灵图标"直到鼠标划过。
-        self.tray = None;
-        // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
-        self.controller.shutdown();
-        let file = self.paths.config_file();
-        let json = self.config.to_json();
-        match std::fs::write(&file, json) {
-            Ok(()) => crate::info!("配置已保存 {}", file.display()),
-            Err(err) => crate::warn!("配置保存失败 {}：{err}", file.display()),
-        }
+        self.finish();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 关闭请求在自己的代码里拦一次：真机上 eframe 的 `on_exit` 没被调用过，
+        // 结果虚拟屏留在了桌面上。这里收尾是可靠的（进程还活着，事件循环还在跑）。
+        if ctx.input(|i| i.viewport().close_requested()) {
+            crate::info!("界面收到关闭请求");
+            self.finish();
+        }
+        // 数据目录里的 `quit.request`：给脚本/外部程序一个"体面退出"的入口。
+        // 真机上 `CloseMainWindow` 会让进程直接消失、不走任何 Rust 收尾，这条才是
+        // 能保证"撤屏 + 归位窗口"的路。
+        let quit_flag = self.paths.data_dir().join("quit.request");
+        if quit_flag.exists() {
+            let _ = std::fs::remove_file(&quit_flag);
+            crate::info!("收到退出请求文件，开始收尾");
+            self.finish();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         // 手势钩子跟着手机屏与配置走（区域没变时什么都不做）。
         self.controller.sync_touch(&self.config);
 
@@ -642,6 +703,8 @@ impl eframe::App for PhoneHomeApp {
                 }
                 TrayCommand::Quit => {
                     crate::info!("托盘：退出（先还原窗口）");
+                    // 先收尾再关窗：关窗之后 Rust 侧可能一行都跑不到（真机实测）。
+                    self.finish();
                     self.request_exit = true;
                 }
             }
@@ -701,6 +764,8 @@ impl eframe::App for PhoneHomeApp {
             SettingsOutcome::Idle => {}
         }
         if self.request_exit {
+            // 同样先收尾：关窗之后 Rust 侧可能一行都跑不到。
+            self.finish();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
