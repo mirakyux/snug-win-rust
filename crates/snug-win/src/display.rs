@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use snug_core::desk::{PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException};
 use snug_core::screen_fit::DESIGN_WIDTH;
-use snug_core::{DisplayModeInfo, OtherDisplay, Point, Rect, ScreenFit};
+use snug_core::store::OwnedDisplayStore;
+use snug_core::{DisplayModeInfo, OtherDisplay, Paths, Point, Rect, ScreenFit};
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO,
@@ -441,26 +442,55 @@ struct PhoneScreen<A: DisplayApi, V: VirtualDisplays> {
     ipc: V,
     timings: Timings,
     maps: Arc<Mutex<ScreenMaps>>,
+    /// 归属记录（C# v1.3.0 `_ownedStore`）：只记本程序建的屏，启动清理只拆这些。
+    /// `None` = 不记账（内存版构造函数、单测用）。
+    owned: Option<OwnedDisplayStore>,
 }
 
 impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
     /// 测试里直接建一个完整对象；真机走 [`Self::with_maps`]，与查询共享 map。
     #[cfg(test)]
     fn new(api: A, ipc: V, timings: Timings) -> Self {
-        Self::with_maps(api, ipc, timings, Arc::new(Mutex::new(ScreenMaps::default())))
+        Self::with_maps(api, ipc, timings, Arc::new(Mutex::new(ScreenMaps::default())), None)
     }
 
-    fn with_maps(api: A, ipc: V, timings: Timings, maps: Arc<Mutex<ScreenMaps>>) -> Self {
-        Self { api, ipc, timings, maps }
+    fn with_maps(
+        api: A,
+        ipc: V,
+        timings: Timings,
+        maps: Arc<Mutex<ScreenMaps>>,
+        owned: Option<OwnedDisplayStore>,
+    ) -> Self {
+        Self { api, ipc, timings, maps, owned }
     }
 
-    /// 启动时清掉上次崩溃留下的虚拟屏（C# `CleanupOrphansAsync`）。
+    /// 启动时清掉上次崩溃留下的虚拟屏（C# v1.3.0 `CleanupOrphansAsync`）。
+    ///
+    /// 只拆归属记录里记着的 id：同机可能还装着 C# 版或别的程序建的虚拟屏，
+    /// 以前这里 `remove_all` 会把别人的屏一起拆掉。
     fn cleanup_orphans(&mut self) {
-        if !self.api.driver_pipe_available() {
+        let Some(store) = &self.owned else {
+            return;
+        };
+        let owned_ids = store.load_ids();
+        if owned_ids.is_empty() {
             return;
         }
-        let _ = self.ipc.remove_all();
-        sleep_for(self.timings.cleanup_settle);
+        if !self.api.driver_pipe_available() {
+            // C#：保留记录，等管道恢复后再清。
+            crate::warn("启动清理时驱动管道暂未就绪，保留归属记录以便管道恢复后清理");
+            return;
+        }
+        // C# 一次 RemoveAsync(全部 id)；驱动拒收就保留整本账（下一次启动再试）。
+        match self.ipc.remove(&owned_ids) {
+            Ok(()) => {
+                sleep_for(self.timings.cleanup_settle);
+                store.clear_all();
+            }
+            Err(error) => crate::warn(&format!(
+                "启动清理残留虚拟屏时异常：{error}（保留归属记录）"
+            )),
+        }
     }
 
     /// 建屏（C# `CreateAsync`）。
@@ -490,6 +520,11 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         let (base_width, base_height) = fit.pixel_size(fit.base_width());
 
         for candidate in candidates_starting_after(existing_virtual_count) {
+            // C# v1.3.0：已经归本程序管的编号不再重复 Notify，否则会把那块屏
+            // 的模式覆盖成这次请求的档位（多屏时两块屏会互踩）。
+            if lock_maps(&self.maps).fits.contains_key(&candidate) {
+                continue;
+            }
             let monitor = VddMonitor {
                 id: candidate,
                 name: Some(MONITOR_NAME.to_string()),
@@ -519,6 +554,10 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 let mut maps = lock_maps(&self.maps);
                 maps.fits.insert(candidate, fit.clone());
                 maps.device_names.insert(candidate, snapshot.device_name.clone());
+            }
+            // C# v1.3.0：确认上线后才记账；没上线就跳过、绝不写进归属记录。
+            if let Some(store) = &self.owned {
+                store.record_owned(candidate);
             }
             self.set_width(candidate, fit.base_width());
             // C2：与 C# 一致——SetWidth 失败时这里仍返回成功、fits 已记，
@@ -617,9 +656,18 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         };
         // C2：与 C# 一样，先删本地状态再发删除；若 remove 失败，屏还在但应用
         // 已经忘了它（孤儿屏，直到下次启动 CleanupOrphans 才清）。照抄不修。
-        if let Err(error) = self.ipc.remove(&[display_id]) {
-            // C# `Log.Warn($"移除手机屏 #{displayId} 失败：{ex.Message}")`
-            crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}"));
+        match self.ipc.remove(&[display_id]) {
+            Ok(()) => {
+                // C# v1.3.0：IPC 接受删除就销账（不等 10s 下线轮询；若最终没下线，
+                // 这块屏会变成没人认领的孤儿——C# 同款行为）。
+                if let Some(store) = &self.owned {
+                    store.release_owned(display_id);
+                }
+            }
+            Err(error) => {
+                // C# `Log.Warn($"移除手机屏 #{displayId} 失败：{ex.Message}")`
+                crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}"));
+            }
         }
 
         let Some(device_name) = device_name else {
@@ -1448,17 +1496,44 @@ impl Default for WinPhoneDisplays {
 }
 
 impl WinPhoneDisplays {
+    /// 内存版（不读写归属记录），单测与不需要清理的场景用。
     pub fn new() -> Self {
-        Self::with_timings(Timings::default())
+        Self::build(
+            WinDisplay::new(),
+            VddClient::default(),
+            Timings::default(),
+            None,
+        )
+    }
+
+    /// 真机版：带上 `owned-displays.json` 归属记录（C# v1.3.0 的 `paths` 参数）。
+    ///
+    /// 启动清理只会拆这里记着的屏，不会动 C# 版或别的程序建的虚拟屏。
+    pub fn with_paths(paths: &Paths) -> Self {
+        Self::build(
+            WinDisplay::new(),
+            VddClient::default(),
+            Timings::default(),
+            Some(OwnedDisplayStore::new(paths.owned_displays_file())),
+        )
     }
 
     pub fn with_timings(timings: Timings) -> Self {
-        Self::with_parts(WinDisplay::new(), VddClient::default(), timings)
+        Self::build(WinDisplay::new(), VddClient::default(), timings, None)
     }
 
     pub fn with_parts(api: WinDisplay, ipc: VddClient, timings: Timings) -> Self {
+        Self::build(api, ipc, timings, None)
+    }
+
+    fn build(
+        api: WinDisplay,
+        ipc: VddClient,
+        timings: Timings,
+        owned: Option<OwnedDisplayStore>,
+    ) -> Self {
         let maps = Arc::new(Mutex::new(ScreenMaps::default()));
-        let screen = PhoneScreen::with_maps(api, ipc, timings, maps.clone());
+        let screen = PhoneScreen::with_maps(api, ipc, timings, maps.clone(), owned);
         Self { api, maps, ops: Mutex::new(screen) }
     }
 
@@ -2030,6 +2105,29 @@ mod tests {
         (screen, shared)
     }
 
+    /// 带归属记录（临时文件）的手机屏对象。
+    fn owned_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("snug-display-owned-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("owned-displays.json")
+    }
+
+    fn screen_with_owned(
+        world: World,
+        path: &std::path::Path,
+    ) -> (PhoneScreen<FakeApi, FakeVdd>, Arc<Mutex<World>>) {
+        let shared = Arc::new(Mutex::new(world));
+        let screen = PhoneScreen::with_maps(
+            FakeApi(shared.clone()),
+            FakeVdd(shared.clone()),
+            fast_timings(),
+            Arc::new(Mutex::new(ScreenMaps::default())),
+            Some(OwnedDisplayStore::new(path)),
+        );
+        (screen, shared)
+    }
+
     #[test]
     fn create_reports_missing_driver_pipe() {
         let mut world = world_with_phone(&[0]);
@@ -2242,16 +2340,155 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphans_only_talks_to_the_driver_when_pipe_exists() {
-        let mut offline_world = world_with_phone(&[]);
-        offline_world.pipe_available = false;
-        let (mut screen, shared) = screen(offline_world);
+    fn cleanup_orphans_without_a_book_removes_nothing() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
         screen.cleanup_orphans();
-        assert_eq!(shared.lock().unwrap().remove_all_calls, 0);
 
-        let (mut screen, shared) = self::screen(world_with_phone(&[0]));
+        let world = shared.lock().unwrap();
+        assert!(world.removed.is_empty(), "没有归属记录就一块都不许撤");
+        assert_eq!(world.remove_all_calls, 0, "不能再走 remove_all 把别人的屏拆掉");
+    }
+
+    #[test]
+    fn cleanup_orphans_only_removes_ids_in_the_book() {
+        let path = owned_path("cleanup");
+        OwnedDisplayStore::new(&path).record_owned(1);
+
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0, 1]), &path);
+        {
+            let mut world = shared.lock().unwrap();
+            world.driver_online(0); // 别人的屏（比如 C# 版建的）
+            world.driver_online(1); // 我们上次留下的
+        }
         screen.cleanup_orphans();
-        assert_eq!(shared.lock().unwrap().remove_all_calls, 1);
+
+        {
+            let world = shared.lock().unwrap();
+            assert_eq!(world.removed, vec![1], "只撤书里记的 1 号");
+            assert!(
+                world.monitors.iter().any(|m| m.device_name == r"\\.\DISPLAY2"),
+                "0 号屏不在书里，必须留着"
+            );
+            assert!(
+                !world.monitors.iter().any(|m| m.device_name == r"\\.\DISPLAY3"),
+                "1 号屏在书里，应被撤掉"
+            );
+        }
+        assert!(
+            OwnedDisplayStore::new(&path).load_ids().is_empty(),
+            "清理成功后账要清空"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cleanup_orphans_keeps_the_book_when_the_pipe_is_missing() {
+        let path = owned_path("cleanup-nopipe");
+        OwnedDisplayStore::new(&path).record_owned(1);
+
+        let mut world = world_with_phone(&[1]);
+        world.pipe_available = false;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.cleanup_orphans();
+
+        assert!(shared.lock().unwrap().removed.is_empty(), "管道没就绪别乱发删除");
+        assert_eq!(
+            OwnedDisplayStore::new(&path).load_ids(),
+            vec![1],
+            "管道恢复后还要靠这本账清理，不能清空"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn create_records_ownership_and_retire_releases_it() {
+        let path = owned_path("rotation");
+        let (mut screen, _) = screen_with_owned(world_with_phone(&[0]), &path);
+
+        let id = screen.create(ScreenFit::standard()).expect("建屏成功");
+        assert_eq!(id, 0);
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0], "上线后才记账");
+
+        assert!(screen.retire(id));
+        assert!(
+            OwnedDisplayStore::new(&path).load_ids().is_empty(),
+            "撤屏成功后要销账"
+        );
+        assert!(!path.exists(), "最后一条销掉后文件也该删");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn create_does_not_record_a_screen_that_never_came_online() {
+        let path = owned_path("never-online");
+        let (mut screen, _) = screen_with_owned(world_with_phone(&[]), &path);
+        screen.timings.online = Duration::from_millis(5);
+
+        let error = screen.create(ScreenFit::standard()).expect_err("没有候选上线");
+        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+        assert!(
+            OwnedDisplayStore::new(&path).load_ids().is_empty(),
+            "没确认上线绝不能记账"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn create_skips_an_id_this_instance_already_manages() {
+        let (mut screen, shared) = screen(world_with_phone(&[1]));
+        {
+            // 假装 0 号已经是本程序在管的屏（当前不在线）。
+            let mut maps = lock_maps(&screen.maps);
+            maps.fits.insert(0, ScreenFit::standard());
+            maps.device_names.insert(0, r"\\.\DISPLAY2".to_string());
+        }
+
+        let id = screen.create(ScreenFit::standard()).expect("应换到 1 号");
+        assert_eq!(id, 1);
+        assert_eq!(
+            shared.lock().unwrap().notified,
+            vec![vec![1]],
+            "已归本程序管的 0 号不该再 Notify（会把它的模式覆盖掉）"
+        );
+    }
+
+    #[test]
+    fn two_phone_screens_get_separate_state_and_devices() {
+        let path = owned_path("multi");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0, 1]), &path);
+
+        let first = screen.create(ScreenFit::standard()).expect("第一块");
+        let second = screen.create(ScreenFit::standard()).expect("第二块");
+        assert_eq!((first, second), (0, 1), "候选 id 要轮转，不能撞同一个");
+
+        {
+            let maps = lock_maps(&screen.maps);
+            assert_eq!(maps.fits.len(), 2);
+            assert_eq!(maps.device_names.get(&0).map(String::as_str), Some(r"\\.\DISPLAY2"));
+            assert_eq!(maps.device_names.get(&1).map(String::as_str), Some(r"\\.\DISPLAY3"));
+        }
+        assert!(is_online_of(&screen.api, &screen.maps, first));
+        assert!(is_online_of(&screen.api, &screen.maps, second));
+        assert_eq!(width_of_display(&screen.api, &screen.maps, 0), Some(540));
+        assert_eq!(width_of_display(&screen.api, &screen.maps, 1), Some(540));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0, 1]);
+
+        // 撤掉第一块不能影响第二块的状态与设备名。
+        assert!(screen.retire(first));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![1]);
+        assert!(is_online_of(&screen.api, &screen.maps, second));
+        assert!(!is_online_of(&screen.api, &screen.maps, first));
+        assert_eq!(
+            lock_maps(&screen.maps).device_names.get(&1).map(String::as_str),
+            Some(r"\\.\DISPLAY3")
+        );
+        assert_eq!(shared.lock().unwrap().notified, vec![vec![0], vec![1]]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // ----- 测试夹具 -----

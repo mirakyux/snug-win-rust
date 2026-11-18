@@ -478,6 +478,28 @@ mod tests {
     }
 
     #[test]
+    fn notify_can_create_multiple_displays_in_one_frame() {
+        // v1.3.0 多屏：drivers 的 id 是参数，一帧里可以带多块屏；
+        // 建屏流程仍是一块一块发，这里只确认协议层不会把第二块丢掉。
+        let mut second = monitor();
+        second.id = 1;
+        second.name = Some("Snug 手机屏 2".into());
+        let json = serialize_notify(&[monitor(), second.clone()]);
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("合法 JSON");
+        let monitors = value["Notify"].as_array().expect("Notify 数组");
+        assert_eq!(monitors.len(), 2, "两块屏都要在同一帧里：{json}");
+        assert_eq!(monitors[0]["id"], 0);
+        assert_eq!(monitors[1]["id"], 1);
+        assert_eq!(monitors[1]["name"], "Snug 手机屏 2");
+
+        // legacy（v0.3.x）同理，Add 也是数组。
+        let legacy: serde_json::Value =
+            serde_json::from_str(&serialize_legacy_add(&[monitor(), second])).expect("合法 JSON");
+        assert_eq!(legacy["Add"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
     fn legacy_add_uses_first_refresh_rate_and_defaults_to_60() {
         let mut m = monitor();
         m.modes[0].refresh_rates.clear();
