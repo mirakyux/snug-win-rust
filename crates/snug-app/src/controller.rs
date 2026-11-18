@@ -10,40 +10,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays};
-use snug_core::windows::{AppInfo, WindowInfo};
 use snug_core::{AppConfig, Paths, Rect, ScreenFit};
 use snug_win::{WinPhoneDisplays, WinWindows};
 
-/// 判空壳：`apps` 模块（应用枚举/启动/关闭）还没接上时使用。
-/// 接上之后换成 `snug_win::apps::WinApps`，其余代码不动。
-struct PendingApps;
-
-impl AppControl for PendingApps {
-    fn pid_of(&self, _app: &AppInfo) -> Option<i32> {
-        None
-    }
-    fn pids(&self, _app_id: &str) -> Vec<i32> {
-        Vec::new()
-    }
-    fn open(&self, _app: &AppInfo) -> Option<i32> {
-        None
-    }
-    fn new_window(&self, _pid: i32) -> bool {
-        false
-    }
-    fn quit(&self, _pid: i32) -> bool {
-        false
-    }
-    fn force_quit(&self, _pid: i32) -> bool {
-        false
-    }
-    fn is_running(&self, _pid: i32) -> bool {
-        false
-    }
-    fn app_windows(&self, _app: &AppInfo, _launched_pid: Option<i32>) -> Vec<WindowInfo> {
-        Vec::new()
-    }
-}
+/// `snug-win` 的 `WinApps` 已经实现了 core 的 [`AppControl`]
+/// （`apps.rs` 的 `impl<S: AppSystem> AppControl for Apps<S>`），控制器直接用真机实现。
+use snug_win::WinApps;
 
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
@@ -71,7 +43,7 @@ impl Controller {
         let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
         let displays = Arc::new(WinPhoneDisplays::new());
         let windows = Arc::new(WinWindows::new());
-        let apps: Arc<dyn AppControl> = Arc::new(PendingApps);
+        let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
 
         let events = DeskEvents {
             state_changed: Some(Arc::new(move |_state| on_change())),
