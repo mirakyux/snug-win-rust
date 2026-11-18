@@ -14,6 +14,7 @@ pub mod phone_models;
 pub mod pinyin;
 pub mod record;
 pub mod screen_fit;
+pub mod screenshots;
 pub mod scrolling;
 pub mod store;
 pub mod touch;
@@ -28,6 +29,10 @@ pub use paths::Paths;
 pub use phone_models::{PhoneCatalog, PhoneChoice, PhoneModel, PhoneScreenSpec};
 pub use record::PhoneRecord;
 pub use screen_fit::{PhoneSpec, ScreenFit};
+pub use screenshots::{
+    CaptureError, CaptureFailure, CapturedImage, ScreenshotControl, ScreenshotNotice,
+    ScreenshotOverlay, Screenshots,
+};
 pub use scrolling::{Momentum, MomentumPhase, ScrollPhase, ScrollStep};
 pub use store::{JsonFileStore, RestoreRecordStore};
 pub use touch::{

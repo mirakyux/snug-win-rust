@@ -12,7 +12,7 @@ pub mod model;
 pub mod services;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use engine::{Desk, DeskEvents, DeskOptions, MINIMUM_LIFETIME};
 pub use model::{
