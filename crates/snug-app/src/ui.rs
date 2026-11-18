@@ -57,6 +57,8 @@ pub struct PhoneHomeApp {
     pub install_rx: Option<std::sync::mpsc::Receiver<InstallOutcome>>,
     /// App 资源库（后台扫描 + 图标缓存）。
     pub library: Library,
+    /// 截图覆盖层（相机键）。
+    pub shots: crate::shots::Shots,
 }
 
 /// 后台检查更新的结果。
@@ -111,6 +113,7 @@ impl PhoneHomeApp {
             last_update: None,
             install_rx: None,
             library: Library::new(),
+            shots: crate::shots::Shots::new(std::sync::Arc::new(|| {})),
         }
     }
 
@@ -552,6 +555,10 @@ impl eframe::App for PhoneHomeApp {
         // 界面窗口跟着手机屏走（对应 C# 里 PhoneHomeWindow 一直待在虚拟屏上）。
         self.sync_window(ctx);
 
+        // 截图覆盖层：过期检查 + 画在最上层。
+        self.shots.poll();
+        self.shots.show(ctx);
+
         // 设置窗：先执行上一帧排出的动作，再画这一帧（动作会影响配置和控制器状态）。
         self.poll_update_check();
         self.poll_install_update();
@@ -634,7 +641,24 @@ impl eframe::App for PhoneHomeApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     if self.config.screenshot {
-                        ui.label("📷");
+                        // 相机键：抓当前铺在手机屏上的那个窗口（C# 底部条上的相机）。
+                        let placed = self.controller.state().placed.map(|placed| placed.window);
+                        match placed {
+                            Some(window) => {
+                                // 覆盖层开着的时候别再抓一张（C# 也是同一行为）。
+                                let enabled = !self.shots.is_open();
+                                if ui
+                                    .add_enabled(enabled, egui::Button::new("📷"))
+                                    .on_hover_text(format!("截取 {}", window.label()))
+                                    .clicked()
+                                {
+                                    self.shots.take(&window);
+                                }
+                            }
+                            None => {
+                                ui.label("📷");
+                            }
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut wanted = self.config.phone_screen;
