@@ -84,6 +84,12 @@ pub struct Controller {
     touch: Arc<snug_win::TouchHook>,
     /// UU 远程探测（C# `UUSensor`）：由后台线程每秒采样一次。
     uu: Arc<snug_win::UuSensor>,
+    /// 手机屏总开关（对应 C# `_config.PhoneScreen`）。
+    ///
+    /// 它只是"允许开屏"，真正开不开还要看会话：C# 每个 tick 都算
+    /// `_config.PhoneScreen && _session.InEpisode && WantsPhoneScreen(...)` 再 `SetWanted`。
+    /// 移植时漏了这一层（只在启动时设一次），真机表现就是"退出远控后虚拟屏还挂着"。
+    phone_enabled: Arc<AtomicBool>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: std::sync::Mutex<Option<TouchRegion>>,
     /// 钩子抛出的事件队列（关闭窗口 / 选区结束 / 选区取消）。
@@ -111,10 +117,23 @@ impl Controller {
         let windows = Arc::new(WinWindows::new());
         let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
 
+        // 会话状态机与它用的时钟：`DeskEvents::topology_changing` 回调也要用到
+        // （C# `_desks.TopologyChanging += () => _session.NoteSelfInducedChange(now)`），
+        // 所以两边必须是同一个 `RemoteSession`、同一根时间轴。
+        let clock = std::time::Instant::now();
+        let session = Arc::new(std::sync::Mutex::new(snug_core::session::RemoteSession::new()));
+
         let events = DeskEvents {
             state_changed: Some(Arc::new(move |_state| on_change())),
             gone: None,
-            topology_changing: None,
+            topology_changing: Some(Arc::new({
+                let session = session.clone();
+                move || {
+                    if let Ok(mut session) = session.lock() {
+                        session.note_self_induced_change(clock.elapsed().as_secs_f64());
+                    }
+                }
+            })),
             log: Some(Arc::new(log)),
         };
         let options = DeskOptions {
@@ -131,13 +150,19 @@ impl Controller {
         // 再还上次没还回去的窗口（C# `AppController.Start` 里 `_desk.Recover()` 在
         // 第一条 `SetWanted` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
         desk.recover();
-        desk.set_wanted(config.phone_screen);
+        // 注意：这里**不**按 `config.phone_screen` 直接开屏。C# 的 `SetWanted` 由
+        // `OnTick` 每秒按会话算一次（见下面 worker），启动时 `_wanted` 是 false、
+        // 屏幕要等第一段远程会话才建。移植时漏了这一层，真机表现是"退出远控后
+        // 虚拟屏还挂着，只有杀进程才消失"。
 
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
         let desk_worker = desk.clone();
         let uu = Arc::new(snug_win::UuSensor::new());
         let uu_worker = uu.clone();
+        let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
+        let phone_enabled_worker = phone_enabled.clone();
+        let session_worker = session;
         // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
         let touch_events = Arc::new(TouchEventQueue::default());
         let touch = Arc::new(snug_win::TouchHook::with_parts(
@@ -150,13 +175,13 @@ impl Controller {
             .spawn(move || {
                 // UU 采样：一路读不到不该影响状态机，`sample` 自己保证只返回"读不到"。
                 // 采样节奏照 C# 的 1 秒一次；`idle`/`check_returns` 保持 500ms。
-                let mut tracker = snug_core::session::ConnectionTracker::new();
                 // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
                 // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
                 use snug_win::display::DisplayApi;
                 let display = snug_win::WinDisplay::new();
                 let mut last_topology: Option<Vec<(u32, i32, i32, i32, i32)>> = None;
-                let started = std::time::Instant::now();
+                // 与 `topology_changing` 回调共用同一根时间轴（会话状态机内部按秒比较）。
+                let started = clock;
                 let mut last_sample = -1.0_f64;
                 let mut last_topology_check = -1.0_f64;
                 let mut last_connected = false;
@@ -192,16 +217,41 @@ impl Controller {
                             );
                             last_signals = Some(summary);
                         }
-                        tracker.update(&sampled.to_signals(), now);
-                        if tracker.is_connected() != last_connected {
-                            last_connected = tracker.is_connected();
+                        let signals = sampled.to_signals();
+                        // 会话判定用 `RemoteSession`（不只是 ConnectionTracker）：C# 的
+                        // `_session.InEpisode` / `EpisodeControllers` 决定"该不该有手机屏"，
+                        // 中断后还有一段重连窗口，单用 `ConnectionTracker` 会把这段丢掉。
+                        let (wants, connected, in_episode, controllers_len, ended) = {
+                            let mut session =
+                                session_worker.lock().unwrap_or_else(|e| e.into_inner());
+                            let transitions = session.update(&signals, now);
+                            let ended = transitions
+                                .iter()
+                                .any(|t| matches!(t, snug_core::session::SessionTransition::Ended));
+                            // C# `OnTick`：`_config.PhoneScreen && _session.InEpisode
+                            // && ControllerClassifier.WantsPhoneScreen(EpisodeControllers(now))`
+                            let wants = wants_screen_now(
+                                phone_enabled_worker.load(Ordering::Relaxed),
+                                session.in_episode(),
+                                &session.episode_controllers(now),
+                            );
+                            (wants, session.is_connected(), session.in_episode(), session.controllers().len(), ended)
+                        };
+                        if connected != last_connected {
+                            last_connected = connected;
                             crate::info!(
                                 "远程会话：{}（控制端 {} 个）",
-                                if last_connected { "已连入" } else { "已断开" },
-                                tracker.controllers().len()
+                                if connected { "已连入" } else { "已断开" },
+                                controllers_len
                             );
                         }
-                        desk_worker.set_remote(last_connected);
+                        if ended {
+                            crate::info!("远程会话：本次会话结束，撤掉手机屏");
+                        }
+                        // 每一拍都喂一次：`set_wanted` 内部比较，值没变就直接返回。
+                        desk_worker.set_wanted(wants);
+                        desk_worker.set_remote(in_episode);
+
                     }
                     if now - last_topology_check >= 2.0 {
                         last_topology_check = now;
@@ -241,6 +291,7 @@ impl Controller {
             displays,
             touch,
             uu,
+            phone_enabled,
             touch_region: std::sync::Mutex::new(None),
             touch_events,
             selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
@@ -261,8 +312,14 @@ impl Controller {
     }
 
     /// 手机屏开关（设置界面用）。
+    ///
+    /// 只改"允许开屏"这个开关；真正开/关由采样线程每秒按会话算（和 C# 一样）。
+    /// 关掉时立刻 `SetWanted(false)`，不等下一拍。
     pub fn set_phone_screen(&self, on: bool) {
-        self.desk.set_wanted(on);
+        self.phone_enabled.store(on, Ordering::Relaxed);
+        if !on {
+            self.desk.set_wanted(false);
+        }
     }
 
     /// 机型/字号变了：换比例并重新铺窗（C# `SetFit` + `SetDefaultZoom`）。
@@ -423,5 +480,64 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// "这一刻该不该有手机屏"——对应 C# `AppController.OnTick` 里那行 `wantsPhone`：
+///
+/// ```csharp
+/// bool wantsPhone = _config.PhoneScreen
+///                   && _session.InEpisode
+///                   && ControllerClassifier.WantsPhoneScreen(_session.EpisodeControllers(now));
+/// _desk.SetWanted(wantsPhone);
+/// ```
+///
+/// 抽成纯函数是为了能单测：这个三段判断漏掉任何一段都会在真机上表现为
+/// "该撤的屏不撤"或"人在电脑前屏自己冒出来"。
+fn wants_screen_now(enabled: bool, in_episode: bool, controllers: &[String]) -> bool {
+    enabled && in_episode && snug_core::session::wants_phone_screen(controllers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_screen_now;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `in_episode` 这一段。
+    #[test]
+    fn no_screen_outside_a_session() {
+        assert!(!wants_screen_now(true, false, &[]));
+        assert!(!wants_screen_now(true, false, &names(&["iPhone 17 Pro"])));
+    }
+
+    #[test]
+    fn screen_during_a_phone_session() {
+        assert!(wants_screen_now(true, true, &names(&["iPhone 17 Pro"])));
+    }
+
+    /// 纯桌面控制端（Mac/Windows）不占手机屏，C# 的 `WantsPhoneScreen` 同义。
+    #[test]
+    fn desktop_only_session_keeps_the_screen_off() {
+        assert!(!wants_screen_now(true, true, &names(&["MacBook Pro"])));
+        assert!(!wants_screen_now(true, true, &names(&["Windows PC"])));
+    }
+
+    #[test]
+    fn mixed_controllers_still_want_the_screen() {
+        assert!(wants_screen_now(true, true, &names(&["MacBook Pro", "iPhone 17 Pro"])));
+    }
+
+    /// 控制端表读不到时是空表，C# 里"没有控制端"也当成要开屏（保守）。
+    #[test]
+    fn unreadable_controller_table_defaults_to_on() {
+        assert!(wants_screen_now(true, true, &[]));
+    }
+
+    #[test]
+    fn master_switch_off_wins() {
+        assert!(!wants_screen_now(false, true, &names(&["iPhone 17 Pro"])));
     }
 }
