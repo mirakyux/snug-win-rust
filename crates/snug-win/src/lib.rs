@@ -58,6 +58,16 @@ type WarnSink = Box<dyn Fn(&str) + Send + Sync>;
 
 static WARN_SINK: std::sync::OnceLock<WarnSink> = std::sync::OnceLock::new();
 
+/// 测试构建里额外记一份告警，方便断言“这条日志真的会出来”；生产构建不存在。
+#[cfg(test)]
+static TEST_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 取测试构建里累计的告警（跨测试共享，断言请用 `iter().any(...)`）。
+#[cfg(test)]
+pub(crate) fn test_warnings() -> Vec<String> {
+    TEST_WARNINGS.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
 /// 把平台层的告警接到应用自己的日志（通常是 `crate::logging::Warn`）。
 ///
 /// 只认第一次安装：后装的调用会被忽略。没装时 [`warn`] 写 stderr——GUI 程序没有
@@ -69,6 +79,13 @@ pub fn set_warn_sink(sink: impl Fn(&str) + Send + Sync + 'static) {
 /// 平台层告警，对应 C# 的 `Log.Warn`。库里没有日志后端，交给 [`set_warn_sink`] 装的
 /// 接收端；没装就写 stderr。
 pub fn warn(message: &str) {
+    #[cfg(test)]
+    {
+        TEST_WARNINGS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(message.to_string());
+    }
     match WARN_SINK.get() {
         Some(sink) => sink(message),
         None => eprintln!("[Warn] {message}"),

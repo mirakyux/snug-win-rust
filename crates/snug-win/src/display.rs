@@ -464,8 +464,13 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 enabled: true,
                 modes: modes.clone(),
             };
-            if self.ipc.notify(&[monitor]).is_err() {
-                // 驱动拒了这块（多半是编号被占），换下一个候选。
+            if let Err(error) = self.ipc.notify(&[monitor]) {
+                // C# `PhoneDisplayService.cs:73`：`Log.Warn($"手机屏（id={candidateId}）IPC Notify 失败：{ex.Message}")`
+                // 这一行是排障关键：没有它，「Notify 全被驱动拒了」和「Notify 成功但驱动
+                // 没把屏挂上来」在日志里长得一模一样。
+                crate::warn(&format!(
+                    "手机屏（id={candidate}）IPC Notify 失败：{error}"
+                ));
                 continue;
             }
             let Some(snapshot) = self.wait_for_online(&existing, base_width, base_height) else {
@@ -1776,6 +1781,8 @@ mod tests {
         devices: HashMap<u32, String>,
         /// 新屏上线时系统先给它挑的分辨率；`None` = 正好是基准档（1080×1900）。
         online_mode: Option<(i32, i32)>,
+        /// 非 `None` 时所有 `notify` 都失败（模拟驱动拒收/管道已断）。
+        notify_error: Option<String>,
     }
 
     impl World {
@@ -1881,6 +1888,12 @@ mod tests {
     impl VirtualDisplays for FakeVdd {
         fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
             let mut world = self.0.lock().unwrap();
+            if let Some(message) = world.notify_error.clone() {
+                return Err(VddError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    message,
+                )));
+            }
             world.notified.push(monitors.iter().map(|m| m.id).collect());
             let ids: Vec<u32> = monitors.iter().map(|m| m.id).collect();
             for id in ids {
@@ -2058,6 +2071,34 @@ mod tests {
         assert_eq!(id, 0);
         let world = shared.lock().unwrap();
         assert_eq!(world.attaches, vec![(1080, 1900, 1920, 0)]);
+    }
+
+    #[test]
+    fn notify_failure_logs_candidate_id_and_ipc_error() {
+        // C# `PhoneDisplayService.cs:73` 的那行 Warn。没有它，「Notify 全被驱动拒了」
+        // 和「Notify 成功但驱动没把屏挂上来」在日志里完全分不出来。
+        let mut world = world_with_phone(&[]);
+        world.notify_error = Some("管道已断开（ERROR_BROKEN_PIPE）".to_string());
+        let (mut screen, _shared) = screen(world);
+
+        let error = screen.create(ScreenFit::standard()).expect_err("Notify 全被拒就不能建屏");
+        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+
+        let warnings = crate::test_warnings();
+        assert!(
+            warnings.iter().any(|line| line.contains("手机屏（id=0）IPC Notify 失败")
+                && line.contains("管道已断开")),
+            "告警里要能读到候选 id 和 IPC 错误：{warnings:?}"
+        );
+        // 四个候选都失败时每个都要留痕，否则分不清"只挂在 0 号"还是"四个全被拒"。
+        for id in 0..4u32 {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|line| line.contains(&format!("手机屏（id={id}）IPC Notify 失败"))),
+                "缺少候选 {id} 的日志：{warnings:?}"
+            );
+        }
     }
 
     #[test]
