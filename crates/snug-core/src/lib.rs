@@ -15,6 +15,8 @@ pub mod pinyin;
 pub mod record;
 pub mod screen_fit;
 pub mod screenshots;
+pub mod selection;
+pub mod session;
 pub mod scrolling;
 pub mod store;
 pub mod touch;
@@ -35,6 +37,15 @@ pub use screenshots::{
     ScreenshotOverlay, Screenshots,
 };
 pub use scrolling::{Momentum, MomentumPhase, ScrollPhase, ScrollStep};
+pub use selection::{
+    SelectionBubbleAction, SelectionKeystroke, is_modern_terminal, is_terminal,
+    resolve as resolve_selection_shortcut,
+};
+pub use session::{
+    ConnectionEvent, ConnectionTracker, ControllerKind, ControllerTable, ControllerTableParser,
+    EpisodeChange, RemoteSession, SessionEpisode, SessionTransition, UUSignals, UuElement,
+    classify, wants_phone_screen,
+};
 pub use store::{JsonFileStore, RestoreRecordStore};
 pub use touch::{
     CloseButton, TouchCommand, TouchInput, TouchInputKind, TouchOptions, TouchRegion,
