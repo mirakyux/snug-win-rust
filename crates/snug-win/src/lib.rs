@@ -15,11 +15,14 @@
 
 pub mod display;
 pub mod vdd;
+mod wide;
+pub mod window;
 
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use vdd::{VddClient, VddError, VddMode, VddMonitor, VddProtocol};
+pub use window::{WinDesktop, WinWindows};
 
 /// 平台层已接通的模块数（用于界面显示进度）。
 pub fn implemented_modules() -> &'static [&'static str] {
-    &["vdd", "display"]
+    &["vdd", "display", "window"]
 }
