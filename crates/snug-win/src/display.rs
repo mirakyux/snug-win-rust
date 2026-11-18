@@ -113,6 +113,23 @@ pub fn dpi_rel_for_percent(target_percent: i32, min_rel: i32, max_rel: i32) -> O
     Some((target_index - recommended).clamp(min_rel, max_rel))
 }
 
+/// C# `Math.Round(double)` 的默认舍入：银行家舍入（.5 取偶）。
+///
+/// 与 `.round()`（远离零）不同：`300.5` 在 C# 里是 300，不是 301。
+pub fn round_ties_even(value: f64) -> f64 {
+    let floor = value.floor();
+    let fraction = value - floor;
+    if fraction > 0.5 {
+        floor + 1.0
+    } else if fraction < 0.5 {
+        floor
+    } else if (floor as i64) % 2 == 0 {
+        floor
+    } else {
+        floor + 1.0
+    }
+}
+
 /// 显示器稳定 ID。
 ///
 /// C# 用 `HashCode.Combine(LUID, sourceId)`（进程内随机化）或设备名哈希；
@@ -147,7 +164,8 @@ fn fnv_write(mut hash: u32, value: u32) -> u32 {
 /// 屏幕上能放窗口的区域：工作区去掉底部 Home Bar（C# `PhoneDisplayService.WindowAreaOf`）。
 pub fn window_area(monitor: &MonitorSnapshot, logical_width: i32) -> Rect {
     let scale = f64::max(1.0, monitor.mode.width as f64 / logical_width.max(1) as f64);
-    let home_bar_px = (ScreenFit::home_bar_height(logical_width.max(1) as f64) * scale).round();
+    // C# `Math.Round(...)` 是银行家舍入，不是远离零。
+    let home_bar_px = round_ties_even(ScreenFit::home_bar_height(logical_width.max(1) as f64) * scale);
     let work = monitor.work_area;
     Rect::new(work.x, work.y, work.width, f64::max(100.0, work.height - home_bar_px))
 }
@@ -212,7 +230,11 @@ pub fn cursor_rescue_point(cursor: Point, monitors: &[MonitorSnapshot]) -> Optio
         .iter()
         .find(|m| m.is_primary)
         .unwrap_or(&monitors[0]);
-    Some(target.bounds.center())
+    // C# `SetCursorPos((int)Math.Round(MidX), (int)Math.Round(MidY))`：银行家舍入。
+    Some(Point::new(
+        round_ties_even(target.bounds.mid_x()),
+        round_ties_even(target.bounds.mid_y()),
+    ))
 }
 
 /// 从在线列表里认出"刚建出来的那块屏"（C# `WaitForOnlineAsync` 的挑选顺序）。
@@ -1013,7 +1035,8 @@ impl DisplayApi for WinDisplay {
         dev_mode.dmPelsHeight = height.max(0) as u32;
         let mut fields = DM_PELSWIDTH | DM_PELSHEIGHT;
         if refresh_rate > 0.0 {
-            dev_mode.dmDisplayFrequency = refresh_rate.round().max(1.0) as u32;
+            // C# `(uint)Math.Round(refreshRate)`：银行家舍入。
+            dev_mode.dmDisplayFrequency = round_ties_even(refresh_rate) as u32;
             fields = fields | DM_DISPLAYFREQUENCY;
         }
         dev_mode.dmFields = fields;
@@ -1466,6 +1489,17 @@ mod tests {
     }
 
     #[test]
+    fn rounding_matches_dotnet_math_round() {
+        // C# Math.Round 默认是银行家舍入（.5 取偶），不是远离零。
+        assert_eq!(round_ties_even(300.5), 300.0);
+        assert_eq!(round_ties_even(301.5), 302.0);
+        assert_eq!(round_ties_even(2.4), 2.0);
+        assert_eq!(round_ties_even(2.6), 3.0);
+        assert_eq!(round_ties_even(-0.5), 0.0);
+        assert_eq!(round_ties_even(-1.5), -2.0);
+    }
+
+    #[test]
     fn dpi_rel_for_percent_only_accepts_table_values() {
         // 推荐 175%（index 3），要 200% → 相对 +1。
         assert_eq!(dpi_rel_for_percent(200, -3, 3), Some(1));
@@ -1624,6 +1658,20 @@ mod tests {
             Some(Point::new(960.0, 540.0))
         );
         assert_eq!(cursor_rescue_point(Point::new(0.0, 0.0), &[]), None);
+
+        // 奇数宽的屏：中点 960.5 按银行家舍入落到 960（C# Math.Round）。
+        let odd = vec![snapshot(
+            r"\\.\DISPLAY1",
+            "DELL",
+            Rect::new(0.0, 0.0, 1921.0, 1080.0),
+            Rect::new(0.0, 0.0, 1921.0, 1040.0),
+            true,
+            mode(1921, 1080),
+        )];
+        assert_eq!(
+            cursor_rescue_point(Point::new(5000.0, 0.0), &odd),
+            Some(Point::new(960.0, 540.0))
+        );
     }
 
     #[test]
