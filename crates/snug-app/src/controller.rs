@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays};
+use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays, PhoneScreenPhase};
+use snug_core::touch::{TouchOptions, TouchRegion};
 use snug_core::windows::{AppInfo, WindowInfo};
 use snug_core::{AppConfig, Paths, Rect, ScreenFit};
 use snug_win::{WinPhoneDisplays, WinWindows};
@@ -23,6 +24,10 @@ pub struct Controller {
     desk: Desk,
     /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
     displays: Arc<WinPhoneDisplays>,
+    /// 手势钩子（C# `TouchHookService`）。
+    touch: Arc<snug_win::TouchHook>,
+    /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
+    touch_region: std::sync::Mutex<Option<TouchRegion>>,
     #[allow(dead_code)] // 后续设置界面/诊断要用
     paths: Paths,
     /// "手动强制手机屏"（C# `UUSensor.ManualOverride`），界面回显用。
@@ -76,7 +81,18 @@ impl Controller {
             })
             .ok();
 
-        Self { desk, displays, paths: paths.clone(), manual_override: Arc::new(AtomicBool::new(false)), running, worker }
+        let touch = Arc::new(snug_win::TouchHook::new());
+
+        Self {
+            desk,
+            displays,
+            touch,
+            touch_region: std::sync::Mutex::new(None),
+            paths: paths.clone(),
+            manual_override: Arc::new(AtomicBool::new(false)),
+            running,
+            worker,
+        }
     }
 
     pub fn state(&self) -> DeskState {
@@ -136,17 +152,60 @@ impl Controller {
     }
 
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
-    ///
-    /// 触摸钩子还没接进控制器，先记一行，避免设置窗看起来改了却毫无反馈。
     pub fn apply_gesture_settings(&self, config: &AppConfig) {
-        crate::warn!(
-            "手势配置更新（开关={} 滚动={} 长按右键={} 选后复制={} 仅注入={}）：触摸钩子未接线",
+        crate::info!(
+            "设置：手势配置更新（总开关={} 滚动={} 长按右键={} 选后复制={} 仅注入={}）",
             config.gestures,
             config.gesture_scroll,
             config.gesture_long_press_right_click,
             config.copy_after_selection,
             config.gestures_injected_only
         );
+        // 立刻按新配置重算一次：关掉总开关会当场把钩子摘下来。
+        self.sync_touch(config);
+    }
+
+    /// 让手势钩子跟手机屏与配置保持一致（C# `UpdateTouchHook`）。
+    ///
+    /// 每帧调用是安全的：区域/选项没变时什么都不做，所以不会反复装钩子。
+    pub fn sync_touch(&self, config: &AppConfig) {
+        let state = self.desk.state();
+        let region = if config.gestures && state.screen_phase == PhoneScreenPhase::Ready {
+            state
+                .display_id
+                .and_then(|id| self.displays.bounds_of(id))
+                .map(|bounds| TouchRegion::for_phone_screen(bounds, state.close_button))
+        } else {
+            None
+        };
+
+        let mut applied = match self.touch_region.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *applied != region {
+            let running = self.touch.set_region(region);
+            crate::info!(
+                "手势钩子：{}（{}）",
+                if running { "已接管手机屏" } else { "已停用" },
+                match &region {
+                    Some(region) => format!("区域 {}×{}", region.frame.width, region.frame.height),
+                    None => "手机屏未就绪或手势已关".to_string(),
+                }
+            );
+            *applied = region;
+        }
+        drop(applied);
+
+        // C#：`AllowScroll = GestureScroll`、`AllowRightClick = GestureLongPressRightClick`、
+        // `NotifySelectionEnded = CopyAfterSelection && !ListVisible`。
+        self.touch.set_options(TouchOptions {
+            allow_scroll: config.gestures && config.gesture_scroll,
+            allow_right_click: config.gestures && config.gesture_long_press_right_click,
+            notify_selection_ended: config.copy_after_selection && !state.list_visible,
+        });
+        self.touch
+            .set_require_injected_flag(config.gestures_injected_only && !self.manual_override());
     }
 
     /// 撤屏并停掉后台线程；返回前会把状态机收干净。

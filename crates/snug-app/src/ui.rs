@@ -515,6 +515,9 @@ impl eframe::App for PhoneHomeApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 手势钩子跟着手机屏与配置走（区域没变时什么都不做）。
+        self.controller.sync_touch(&self.config);
+
         // 托盘事件：菜单点击、双击。先把事件收齐再处理，避免与 `apply_setting` 抢借用。
         let tray_commands = self.tray.as_mut().map(|tray| tray.poll()).unwrap_or_default();
         for command in tray_commands {
