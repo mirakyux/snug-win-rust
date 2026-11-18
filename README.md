@@ -72,6 +72,7 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 ## 文档
 
 - [docs/acceptance.md](docs/acceptance.md) — 真机验收单（八组）
+- [docs/release.md](docs/release.md) — 发版流程（版本号、门禁、资产名、更新源）
 - [docs/real-machine-test.md](docs/real-machine-test.md) — 真机测试记录
 - [docs/display-parity.md](docs/display-parity.md) — 虚拟屏链路与原版逐行对拍
 - [docs/ui-parity.md](docs/ui-parity.md) — 界面与原版对照

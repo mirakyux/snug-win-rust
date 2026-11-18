@@ -31,7 +31,10 @@ param(
     # 输出目录（会被创建；同名 zip 先删再写）。
     [string]$OutDir,
     # 跳过 SHA-256 交叉校验（只在明确知道自己在干什么时用）。
-    [switch]$SkipRustCrossCheck
+    [switch]$SkipRustCrossCheck,
+    # 期望固化在 exe 里的更新源（`owner/name`）。默认取构建时的
+    # SNUG_RELEASES_REPO；给了就核对 exe 里真的有它，避免发出去的包"检查更新"不可用。
+    [string]$ReleasesRepo = $env:SNUG_RELEASES_REPO
 )
 
 Set-StrictMode -Version Latest
@@ -164,6 +167,24 @@ if (-not $SkipRustCrossCheck) {
 
     Assert-RustSha256 -File $exePath -Expected $exeHash -VcVars $vcvars
     Assert-RustSha256 -File $zipPath -Expected $zipHash -VcVars $vcvars
+}
+
+# ---------------------------------------------------------------------------
+# 更新源：仓库坐标是编译期 SNUG_RELEASES_REPO，没配的话"检查更新"不可用
+# ---------------------------------------------------------------------------
+
+if ($ReleasesRepo) {
+    # 编译期常量在二进制里就是一段 ASCII，按字节找即可。
+    $bytes = [System.IO.File]::ReadAllBytes($exePath)
+    $haystack = [System.Text.Encoding]::Latin1.GetString($bytes)
+    if ($haystack.Contains($ReleasesRepo)) {
+        Write-Host ("更新源       : {0}（已固化在 exe 里）" -f $ReleasesRepo)
+    } else {
+        throw "exe 里找不到更新源 '$ReleasesRepo'：构建时没设 SNUG_RELEASES_REPO？" +
+            "（这样发出去的包「检查更新」会不可用；要么重新构建，要么去掉 -ReleasesRepo 明确接受）"
+    }
+} else {
+    Write-Host '更新源       : 未配置（检查更新不可用；见 docs/release.md）' -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------

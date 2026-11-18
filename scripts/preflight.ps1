@@ -14,7 +14,8 @@
          顺带核对 PerMonitorV2 / longPathAware / activeCodePage=UTF-8；
       4. 依赖：dumpbin /dependents 里只有系统 DLL（零运行时依赖的实证，
          不应出现 VCRUNTIME140 / MSVCP140 之类的可再发行组件）；
-      5. 发行包：dist 里当前版本的 zip 结构与 checksums.txt 的 SHA-256 对得上。
+      5. 发行包：dist 里当前版本的 zip 结构与 checksums.txt 的 SHA-256 对得上；
+      6. 更新源（给了 -ReleasesRepo 才查）：exe 里确实固化了那个仓库坐标。
 
     第 3、4 项需要 MSVC 的 dumpbin.exe 与 SDK 的 mt.exe；找不到就记 SKIP 并说明，
     不伪装成通过。
@@ -30,7 +31,9 @@ param(
     # 允许的体积上限（字节）。默认 8 MiB。
     [long]$MaxBytes = 8388608,
     # 发行包目录。
-    [string]$DistDir
+    [string]$DistDir,
+    # 期望固化在 exe 里的更新源（`owner/name`）；给了才检查这一项。
+    [string]$ReleasesRepo
 )
 
 Set-StrictMode -Version Latest
@@ -265,6 +268,25 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
         }
     }
     if ($zipPath) { Write-Host ("  zip  : {0:N0} B" -f (Get-Item -LiteralPath $zipPath).Length) }
+}
+
+# ---------------------------------------------------------------------------
+# 6. 更新源
+# ---------------------------------------------------------------------------
+
+Head '== 更新源 =='
+if (-not $ReleasesRepo) {
+    Skip '未给 -ReleasesRepo：没核对 exe 里的更新源（没配时"检查更新"按钮不可用，见 docs/release.md）'
+} else {
+    # 仓库坐标是编译期 option_env!("SNUG_RELEASES_REPO") 固化的普通字符串，
+    # 在二进制里就是一段 ASCII，直接按字节找即可（不用解析 PE 数据段）。
+    $bytes = [System.IO.File]::ReadAllBytes($exePath)
+    $haystack = [System.Text.Encoding]::Latin1.GetString($bytes)
+    if ($haystack.Contains($ReleasesRepo)) {
+        Pass "exe 里固化了更新源 $ReleasesRepo"
+    } else {
+        Fail "exe 里找不到更新源 '$ReleasesRepo'——构建时没设 SNUG_RELEASES_REPO？"
+    }
 }
 
 # ---------------------------------------------------------------------------
