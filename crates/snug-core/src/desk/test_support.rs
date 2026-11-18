@@ -257,6 +257,10 @@ pub struct FakeWindows {
     min_logical_width: Mutex<f64>,
     zoom_ok: AtomicBool,
     restore_calls: Mutex<Vec<(HashMap<WindowKey, Rect>, Option<WindowKey>)>>,
+    full_screen_calls: Mutex<Vec<(WindowKey, bool)>>,
+    minimized_calls: Mutex<Vec<(WindowKey, bool)>>,
+    full_screen_state: Mutex<HashMap<WindowKey, bool>>,
+    minimized_state: Mutex<HashMap<WindowKey, bool>>,
 }
 
 impl Default for FakeWindows {
@@ -267,6 +271,10 @@ impl Default for FakeWindows {
             min_logical_width: Mutex::new(0.0),
             zoom_ok: AtomicBool::new(true),
             restore_calls: Mutex::new(Vec::new()),
+            full_screen_calls: Mutex::new(Vec::new()),
+            minimized_calls: Mutex::new(Vec::new()),
+            full_screen_state: Mutex::new(HashMap::new()),
+            minimized_state: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -304,6 +312,23 @@ impl FakeWindows {
     pub fn restore_calls(&self) -> Vec<(HashMap<WindowKey, Rect>, Option<WindowKey>)> {
         self.restore_calls.lock().expect("restore calls").clone()
     }
+
+    pub fn full_screen_calls(&self) -> Vec<(WindowKey, bool)> {
+        self.full_screen_calls.lock().expect("fullscreen calls").clone()
+    }
+
+    pub fn minimized_calls(&self) -> Vec<(WindowKey, bool)> {
+        self.minimized_calls.lock().expect("minimized calls").clone()
+    }
+
+    /// 让窗口在 look() 里报告为最大化 / 最小化（模拟窗口本来就是这个状态）。
+    pub fn mark_full_screen(&self, window: WindowKey) {
+        self.full_screen_state.lock().expect("fullscreen state").insert(window, true);
+    }
+
+    pub fn mark_minimized(&self, window: WindowKey) {
+        self.minimized_state.lock().expect("minimized state").insert(window, true);
+    }
 }
 
 impl WindowControl for FakeWindows {
@@ -316,7 +341,12 @@ impl WindowControl for FakeWindows {
     }
 
     fn look(&self, window: WindowKey) -> Option<WindowLook> {
-        self.frame_of(window).map(WindowLook::new)
+        let frame = self.frame_of(window)?;
+        Some(WindowLook {
+            frame,
+            full_screen: *self.full_screen_state.lock().expect("fullscreen state").get(&window).unwrap_or(&false),
+            minimized: *self.minimized_state.lock().expect("minimized state").get(&window).unwrap_or(&false),
+        })
     }
 
     fn move_window(&self, window: WindowKey, frame: Rect) -> Option<Rect> {
@@ -329,9 +359,15 @@ impl WindowControl for FakeWindows {
         Some(got)
     }
 
-    fn set_full_screen(&self, _window: WindowKey, _on: bool) {}
+    fn set_full_screen(&self, window: WindowKey, on: bool) {
+        self.full_screen_calls.lock().expect("fullscreen calls").push((window, on));
+        self.full_screen_state.lock().expect("fullscreen state").insert(window, on);
+    }
 
-    fn set_minimized(&self, _window: WindowKey, _on: bool) {}
+    fn set_minimized(&self, window: WindowKey, on: bool) {
+        self.minimized_calls.lock().expect("minimized calls").push((window, on));
+        self.minimized_state.lock().expect("minimized state").insert(window, on);
+    }
 
     fn focus(&self, _window: WindowKey) {}
 
@@ -416,6 +452,7 @@ pub struct Harness {
     pub windows: Arc<FakeWindows>,
     pub apps: Arc<FakeApps>,
     pub timeline: Arc<FakeTimeline>,
+    pub paths: Paths,
     pub dir: PathBuf,
     states: Arc<Mutex<Vec<DeskState>>>,
 }
@@ -456,7 +493,7 @@ impl Harness {
             },
         );
 
-        Self { desk, displays, windows, apps, timeline, dir, states }
+        Self { desk, displays, windows, apps, timeline, paths, dir, states }
     }
 
     pub fn states(&self) -> Vec<DeskState> {
