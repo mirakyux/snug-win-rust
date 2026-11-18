@@ -89,15 +89,44 @@ impl Controller {
                 let started = std::time::Instant::now();
                 let mut last_sample = -1.0_f64;
                 let mut last_topology_check = -1.0_f64;
+                let mut last_connected = false;
+                let mut last_signals: Option<(bool, bool, Option<bool>, bool)> = None;
                 while stop.load(Ordering::Relaxed) {
                     desk_worker.idle();
                     desk_worker.check_returns();
                     let now = started.elapsed().as_secs_f64();
                     if now - last_sample >= 1.0 {
                         last_sample = now;
-                        let signals = uu_worker.sample(now);
-                        tracker.update(&signals.to_signals(), now);
-                        desk_worker.set_remote(tracker.is_connected());
+                        let sampled = uu_worker.sample(now);
+                        // 真机联调靠日志判断"UU 到底探测到了什么"，所以原始信号变了就记一行。
+                        let summary = (
+                            sampled.client_running,
+                            sampled.client_visible,
+                            sampled.capture_active,
+                            sampled.peer_active,
+                        );
+                        if last_signals != Some(summary) {
+                            crate::info!(
+                                "UU 探测：客户端={} 覆盖窗={} 推流={:?} 对端={} 控制端={}（{}）",
+                                summary.0,
+                                summary.1,
+                                summary.2,
+                                summary.3,
+                                sampled.controllers.names.len(),
+                                if sampled.controllers.readable { "可读" } else { "读不到" }
+                            );
+                            last_signals = Some(summary);
+                        }
+                        tracker.update(&sampled.to_signals(), now);
+                        if tracker.is_connected() != last_connected {
+                            last_connected = tracker.is_connected();
+                            crate::info!(
+                                "远程会话：{}（控制端 {} 个）",
+                                if last_connected { "已连入" } else { "已断开" },
+                                tracker.controllers().len()
+                            );
+                        }
+                        desk_worker.set_remote(last_connected);
                     }
                     if now - last_topology_check >= 2.0 {
                         last_topology_check = now;
