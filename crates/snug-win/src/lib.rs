@@ -19,6 +19,7 @@ pub mod uia;
 pub mod vdd;
 mod wide;
 pub mod window;
+pub mod apps;
 
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use touch::{HookEngine, TouchHook, WinInput};
