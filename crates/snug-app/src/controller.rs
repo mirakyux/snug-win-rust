@@ -90,6 +90,8 @@ pub struct Controller {
     /// `_config.PhoneScreen && _session.InEpisode && WantsPhoneScreen(...)` 再 `SetWanted`。
     /// 移植时漏了这一层（只在启动时设一次），真机表现就是"退出远控后虚拟屏还挂着"。
     phone_enabled: Arc<AtomicBool>,
+    /// UU 远程会话状态机（采样线程每拍更新，界面读它判断"在不在会话里"）。
+    session: Arc<std::sync::Mutex<snug_core::session::RemoteSession>>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: std::sync::Mutex<Option<TouchRegion>>,
     /// 钩子抛出的事件队列（关闭窗口 / 选区结束 / 选区取消）。
@@ -113,7 +115,7 @@ impl Controller {
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
         let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
-        let displays = Arc::new(WinPhoneDisplays::new());
+        let displays = Arc::new(WinPhoneDisplays::with_paths(paths));
         let windows = Arc::new(WinWindows::new());
         let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
 
@@ -162,7 +164,7 @@ impl Controller {
         let uu_worker = uu.clone();
         let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
         let phone_enabled_worker = phone_enabled.clone();
-        let session_worker = session;
+        let session_worker = session.clone();
         // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
         let touch_events = Arc::new(TouchEventQueue::default());
         let touch = Arc::new(snug_win::TouchHook::with_parts(
@@ -292,6 +294,7 @@ impl Controller {
             touch,
             uu,
             phone_enabled,
+            session,
             touch_region: std::sync::Mutex::new(None),
             touch_events,
             selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
@@ -311,7 +314,28 @@ impl Controller {
         self.desk.set_remote(on);
     }
 
-    /// 手机屏开关（设置界面用）。
+    /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
+    pub fn reenter(&self) {
+        if !self.phone_enabled.load(Ordering::Relaxed) {
+            crate::warn!("重新进入手机屏：总开关是关的，忽略");
+            return;
+        }
+        crate::info!("重新进入手机屏");
+        self.desk.reenter();
+    }
+
+    /// 当前这一段远程会话还在不在（对应 C# `_session.InEpisode`）。
+    pub fn in_session(&self) -> bool {
+        self.session.lock().map(|session| session.in_episode()).unwrap_or(false)
+    }
+
+    /// 能不能"重新进入手机屏"（C# `CanReenterPhoneScreen`）：
+    /// 会话中（或手动强制）**且**手机屏被用户收起过。
+    pub fn can_reenter(&self) -> bool {
+        self.desk.state().dismissed && (self.in_session() || self.manual_override())
+    }
+
+    /// 设置里的手机屏开关。
     ///
     /// 只改"允许开屏"这个开关；真正开/关由采样线程每秒按会话算（和 C# 一样）。
     /// 关掉时立刻 `SetWanted(false)`，不等下一拍。
@@ -351,6 +375,11 @@ impl Controller {
     pub fn phone_bounds(&self) -> Option<Rect> {
         let id = self.desk.state().display_id?;
         self.displays.bounds_of(id)
+    }
+
+    /// 主屏（非手机屏）的可用区域（物理像素），桌面预览要按它摆放。
+    pub fn main_area(&self) -> Option<Rect> {
+        self.displays.main_area()
     }
 
     /// 手机屏底部指示条的区域（物理像素）。有窗口铺在屏上时，我们的界面窗口

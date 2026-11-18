@@ -1,13 +1,18 @@
 //! 托盘图标，移植自 C# 版 `App.xaml.cs` 的 `NotifyIcon` 部分。
 //!
-//! 菜单结构与 C# 逐项对齐：
+//! 菜单结构与 C# v1.3.0 逐项对齐：
 //! 1. `状态：…`（禁用，随状态刷新）
 //! 2. 分隔线
 //! 3. `打开设置与诊断...` → 设置窗第 0 页
-//! 4. `检查更新...` → 设置窗第 3 页（关于与更新）
-//! 5. `手动开启手机屏（测试/兜底）`（可勾选）→ `SetManualOverride`
-//! 6. 分隔线
-//! 7. `退出 SnugWin（先还原窗口）`
+//! 4. `预览手机界面...` → 桌面预览窗（对应 C# `OpenPhonePreview`）
+//! 5. `检查更新...` → 设置窗第 3 页（关于与更新）
+//! 6. `重新进入手机屏` → 撤销"收起手机屏"（C# `_reentryMenuItem`）
+//! 7. `手动开启手机屏（测试/兜底）`（可勾选）→ `SetManualOverride`
+//! 8. 分隔线
+//! 9. `退出 SnugWin（先还原窗口）`
+//!
+//! 一处**有意偏离**：C# 用 `Visible = false` 藏起第 6 项，`muda 0.19` 的
+//! `MenuItem` 没有 `set_visible`，这里改成"不可用时禁用"（`set_enabled`）。
 //!
 //! 双击托盘 = 打开设置（C# `_trayIcon.DoubleClick`）。
 //! 图标随连接状态切换 `snugwin-idle.ico` / `snugwin-connected.ico`（C# 同）。
@@ -28,6 +33,10 @@ const CONNECTED_ICON: &[u8] = include_bytes!("../assets/snugwin-connected.ico");
 pub enum TrayCommand {
     /// 打开设置窗并切到指定页（C# 的 `ShowSettings(index)`）。
     OpenSettings(usize),
+    /// 桌面预览手机界面（C# `OpenPhonePreview`）。
+    OpenPreview,
+    /// 重新进入手机屏：撤销"收起"（C# `ReenterScreen`）。
+    Reenter,
     /// 手动强制手机屏（菜单里的勾选项）。
     SetManualOverride(bool),
     /// 退出（先还原窗口）。
@@ -39,8 +48,11 @@ pub struct Tray {
     _icon: TrayIcon,
     status_item: MenuItem,
     manual_item: CheckMenuItem,
+    reentry_item: MenuItem,
     settings_id: MenuId,
     update_id: MenuId,
+    preview_id: MenuId,
+    reentry_id: MenuId,
     quit_id: MenuId,
     manual_id: MenuId,
     connected: bool,
@@ -52,7 +64,10 @@ impl Tray {
     pub fn new(connected: bool) -> Option<Self> {
         let status_item = MenuItem::new("状态：初始化中", false, None);
         let settings = MenuItem::new("打开设置与诊断...", true, None);
+        let preview = MenuItem::new("预览手机界面...", true, None);
         let update = MenuItem::new("检查更新...", true, None);
+        // C# 里这一项默认 `Visible = false`，只在"手机屏被收起且还在会话里"时出现。
+        let reentry = MenuItem::new("重新进入手机屏", false, None);
         let manual = CheckMenuItem::new("手动开启手机屏（测试/兜底）", true, false, None);
         let quit = MenuItem::new("退出 SnugWin（先还原窗口）", true, None);
 
@@ -61,7 +76,9 @@ impl Tray {
             &status_item,
             &PredefinedMenuItem::separator(),
             &settings,
+            &preview,
             &update,
+            &reentry,
             &manual,
             &PredefinedMenuItem::separator(),
             &quit,
@@ -83,7 +100,10 @@ impl Tray {
             status_item,
             manual_id: manual.id().clone(),
             manual_item: manual,
+            reentry_id: reentry.id().clone(),
+            reentry_item: reentry,
             settings_id: settings.id().clone(),
+            preview_id: preview.id().clone(),
             update_id: update.id().clone(),
             quit_id: quit.id().clone(),
             connected,
@@ -97,8 +117,14 @@ impl Tray {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_id {
                 out.push(TrayCommand::OpenSettings(0));
+            } else if event.id == self.preview_id {
+                out.push(TrayCommand::OpenPreview);
             } else if event.id == self.update_id {
                 out.push(TrayCommand::OpenSettings(3));
+            } else if event.id == self.reentry_id {
+                if self.reentry_item.is_enabled() {
+                    out.push(TrayCommand::Reenter);
+                }
             } else if event.id == self.manual_id {
                 // muda 已经把勾选状态翻转过了，直接读当前值。
                 out.push(TrayCommand::SetManualOverride(self.manual_item.is_checked()));
@@ -112,6 +138,15 @@ impl Tray {
             }
         }
         out
+    }
+
+    /// 「重新进入手机屏」能不能点（C# `_reentryMenuItem.Visible` 的判定）。
+    ///
+    /// C# 隐藏它，这里禁用——理由见文件头注释。
+    pub fn set_reenter_available(&mut self, available: bool) {
+        if self.reentry_item.is_enabled() != available {
+            self.reentry_item.set_enabled(available);
+        }
     }
 
     /// 刷新状态行、提示文字与图标（对应 C# `RefreshTray`）。

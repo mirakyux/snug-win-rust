@@ -64,6 +64,19 @@ pub struct PhoneHomeApp {
     pub last_offscreen: Option<bool>,
     /// 收尾是否已经做过（`on_exit` 与 `Drop` 都会调，必须幂等）。
     pub finished: bool,
+    /// 桌面预览（对应 C# `OpenScreenPreview` 开的那个只读预览窗）。
+    ///
+    /// 我们只有一个窗口，所以预览不是"再开一个窗"，而是把**这个**窗口搬到主屏上、
+    /// 按机型比例缩放到工作区里，并且只读——C# 预览模式下所有会动手机屏的动作
+    /// 都只弹一条"预览模式只读"提示。
+    pub preview: Option<PreviewState>,
+}
+
+/// 桌面预览的运行态。
+#[derive(Debug, Clone)]
+pub struct PreviewState {
+    /// 界面整体缩放（设计 540 点 → 屏幕点），对应 C# 的 `ScaleTransform`。
+    pub scale: f32,
 }
 
 impl Drop for PhoneHomeApp {
@@ -127,6 +140,7 @@ impl PhoneHomeApp {
             bubble: crate::bubble::CopyBubble::new(),
             finished: false,
             last_offscreen: None,
+            preview: None,
         }
     }
 
@@ -402,7 +416,15 @@ impl PhoneHomeApp {
         // 设置窗打开时必须让窗口恢复整屏：设置窗是画在**当前窗口**里的 `egui::Window`，
         // 而指示条状态下窗口只有 1080×56，把它塞进去只会剩一条灰边（真机反馈）。
         let showing_bar =
-            state.placed.is_some() && !state.list_visible && !self.settings.is_open();
+            state.placed.is_some() && !state.list_visible && !self.settings.is_open()
+                && state.screen_phase == PhoneScreenPhase::Ready;
+        // 手机屏起来了就把预览让掉：我们只有一个窗口，C# 那边预览窗和手机屏窗是两个。
+        if ready && self.preview.is_some() {
+            self.preview = None;
+            ctx.set_zoom_factor(1.0);
+            crate::info!("预览：手机屏已就绪，预览窗口让位");
+        }
+        let preview_rect = if ready { None } else { self.preview_rect(ctx) };
         let bounds = if ready {
             if showing_bar {
                 self.controller.home_bar_area()
@@ -410,7 +432,7 @@ impl PhoneHomeApp {
                 self.controller.phone_bounds()
             }
         } else {
-            None
+            preview_rect
         };
 
         let Some(bounds) = bounds else {
@@ -459,8 +481,15 @@ impl PhoneHomeApp {
             let request = snug_win::PlacementRequest::new(bounds);
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
-                    "手机屏界面：{}，搬到 ({}, {}) {}×{}",
-                    if showing_bar { "收成底部指示条" } else { "铺满资源库" },
+                    "{}：{}，搬到 ({}, {}) {}×{}",
+                    if self.preview.is_some() { "预览窗" } else { "手机屏界面" },
+                    if showing_bar {
+                        "收成底部指示条"
+                    } else if self.preview.is_some() {
+                        "预览（只读）"
+                    } else {
+                        "铺满资源库"
+                    },
                     bounds.x,
                     bounds.y,
                     bounds.width,
@@ -473,6 +502,74 @@ impl PhoneHomeApp {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
+
+    /// 预览窗该摆在哪：主屏工作区里按机型比例居中。
+    ///
+    /// 缩放规则照 C# `ScreenFit.ComputePreviewLayout`：最宽取工作区 72%、最高取 84% 减 48，
+    /// 缩放上限 0.84、下限 0.35。C# 用 `ScaleTransform` 缩整个界面，egui 这边用
+    /// `zoom_factor` 达到同样效果——窗口物理尺寸 = 设计点 × 缩放 × 屏幕原生 DPI。
+    ///
+    /// 返回 `None` 表示拿不到主屏区域，调用方按"没有手机屏"处理（窗口挪到屏幕外）。
+    fn preview_rect(&mut self, ctx: &egui::Context) -> Option<snug_core::Rect> {
+        let area = self.controller.main_area()?;
+        let fit = snug_core::ScreenFit::from_phone(&self.config.phone.screen.to_fit_spec());
+        let (design_width, design_height, scale) = snug_core::ScreenFit::compute_preview_layout(
+            snug_core::Size::new(area.width, area.height),
+            &fit,
+        );
+        // 原生 DPI = 当前有效 ppp ÷ 我们设过的 zoom（zoom 会改 ppp，除回去才稳定）。
+        let native = (ctx.pixels_per_point() / ctx.zoom_factor()) as f64;
+        let width = design_width * scale * native;
+        let height = design_height * scale * native;
+        let rect = snug_core::Rect::new(
+            area.x + (area.width - width) / 2.0,
+            area.y + (area.height - height) / 2.0,
+            width,
+            height,
+        );
+        if (ctx.zoom_factor() - scale as f32).abs() > 0.01 {
+            ctx.set_zoom_factor(scale as f32);
+            crate::info!("预览：界面缩放 {:.2}", scale);
+        }
+        self.preview = Some(PreviewState { scale: scale as f32 });
+        Some(rect)
+    }
+
+    /// 开桌面预览（C# `OpenScreenPreview`）。
+    ///
+    /// C# 里手机屏已经就绪时不去开预览窗，而是把资源库列表翻出来——这里保持一致。
+    fn open_preview(&mut self, ctx: &egui::Context) {
+        let state = self.controller.state();
+        if state.screen_phase == PhoneScreenPhase::Ready {
+            crate::info!("预览：手机屏已就绪，改为回到资源库列表");
+            self.controller.show_list();
+            return;
+        }
+        if self.preview.is_some() {
+            return;
+        }
+        crate::info!("预览：打开桌面预览（只读）");
+        // 先把窗口摆正，下一帧 `sync_window` 会按实际可摆放的矩形再校准一次。
+        self.last_phone_rect = None;
+        self.last_offscreen = None;
+        if self.preview_rect(ctx).is_none() {
+            crate::warn!("预览：拿不到主屏工作区，无法摆放预览窗");
+            self.preview = None;
+        }
+        ctx.request_repaint();
+    }
+
+    /// 关掉桌面预览，界面窗口回到屏幕外待命。
+    fn close_preview(&mut self, ctx: &egui::Context) {
+        if self.preview.take().is_some() {
+            crate::info!("预览：关闭");
+            ctx.set_zoom_factor(1.0);
+            self.last_phone_rect = None;
+            self.last_offscreen = None;
+            ctx.request_repaint();
+        }
+    }
+
 
     /// 开机自启服务（每次都按当前 exe 现取，换目录后也能对上）。
     fn startup_service() -> snug_win::StartupService<snug_win::startup::SystemRunner> {
@@ -695,6 +792,15 @@ impl eframe::App for PhoneHomeApp {
                     self.settings.open();
                     ctx.request_repaint();
                 }
+                TrayCommand::OpenPreview => {
+                    crate::debug!("托盘：预览手机界面");
+                    self.open_preview(ctx);
+                }
+                TrayCommand::Reenter => {
+                    crate::info!("托盘：重新进入手机屏");
+                    self.controller.reenter();
+                    ctx.request_repaint();
+                }
                 TrayCommand::SetManualOverride(on) => {
                     self.apply_setting(SettingsAction::SetManualOverride(on));
                 }
@@ -712,6 +818,7 @@ impl eframe::App for PhoneHomeApp {
             let connected = state.screen_phase == PhoneScreenPhase::Ready;
             tray.set_status(&summary, connected);
             tray.set_manual_override(self.controller.manual_override());
+            tray.set_reenter_available(self.controller.can_reenter());
         }
         // 托盘事件来自另一个消息窗口，egui 没有输入就不会重绘；靠这个定时器
         // 让 `poll` 有节奏地跑起来（200ms 足够，不是每帧空转）。
@@ -793,6 +900,7 @@ impl eframe::App for PhoneHomeApp {
         let mut close_window: Option<snug_core::windows::WindowInfo> = None;
 
         // ---- 顶部：App 大字 + 搜索 + 两个页签（对齐原版 `PhoneHomeWindow`）----
+        let mut close_preview = false;
         egui::TopBottomPanel::top("header")
             .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(30, 8)))
             .show(ctx, |ui| {
@@ -847,6 +955,28 @@ impl eframe::App for PhoneHomeApp {
                 });
 
                 ui.add_space(6.0);
+                if let Some(preview) = &self.preview {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "预览模式 · 只读（{:.0}%）",
+                                preview.scale * 100.0
+                            ))
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(255, 196, 120)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("关闭预览").clicked() {
+                                close_preview = true;
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new("预览只用于查看 App 资源库；要铺窗口请先连上手机")
+                            .size(12.0)
+                            .weak(),
+                    );
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("🔍 搜索 App")
@@ -880,6 +1010,9 @@ impl eframe::App for PhoneHomeApp {
         if back_to_placed {
             crate::info!("资源库：回到手机屏上的窗口");
             self.controller.return_to_placed();
+        }
+        if close_preview {
+            self.close_preview(ctx);
         }
 
         // ---- 列表：竖向一行一个 App（原版就是这个结构，不是图标网格）----
@@ -1061,6 +1194,22 @@ impl eframe::App for PhoneHomeApp {
         });
 
         // 动作在闭包外落地，避免和 `self` 的借用打架。
+        // 桌面预览是只读的（C# `ShowPreviewReadOnlyNotice`）：没有虚拟屏，铺窗口/开关 App
+        // 全部落不了地，与其静默失败，不如明确不执行。
+        if self.preview.is_some()
+            && (pull_window.is_some()
+                || open_app.is_some()
+                || new_window.is_some()
+                || quit_app.is_some()
+                || close_window.is_some())
+        {
+            crate::info!("预览：只读模式，忽略这次操作");
+            pull_window = None;
+            open_app = None;
+            new_window = None;
+            quit_app = None;
+            close_window = None;
+        }
         if let Some(window) = pull_window {
             crate::info!("资源库：铺开 {}", window.label());
             self.controller.pull(window);
