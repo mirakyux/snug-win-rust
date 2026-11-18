@@ -92,6 +92,29 @@ pub fn write(level: Level, message: impl AsRef<str>) {
     }
 }
 
+/// 当天日志文件的完整路径（设置窗要"打开日志目录"并预览）。
+pub fn current_file() -> Option<PathBuf> {
+    let now = local_now();
+    let guard = sink().lock().unwrap_or_else(|e| e.into_inner());
+    let sink = guard.as_ref()?;
+    Some(sink.directory.join(format!(
+        "snug-{:04}{:02}{:02}.log",
+        now.year, now.month, now.day
+    )))
+}
+
+/// 读当天日志的最后 `lines` 行（设置窗"驱动与日志"页的只读日志框）。
+///
+/// 直接读文件而不是从内存环形缓冲里取：日志可能被上一次运行的进程写过，
+/// C# 版也是读文件。
+pub fn tail(lines: usize) -> String {
+    let Some(path) = current_file() else { return String::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return String::new() };
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    all[start..].join("\n")
+}
+
 /// 本地时间（不引 chrono：用 Win32 的 GetLocalTime 太绕，这里用系统时区偏移近似）。
 #[derive(Debug, Clone, Copy)]
 struct LocalNow {

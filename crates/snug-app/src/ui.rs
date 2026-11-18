@@ -45,12 +45,25 @@ pub struct PhoneHomeApp {
     pub phone_window: Option<u64>,
     /// 上次把窗口摆到的手机屏矩形，用来避免每帧重复 `SetWindowPos`。
     pub last_phone_rect: Option<snug_core::Rect>,
+    /// 日志框已经显示到文件的第几个字节（增量追加用；日志轮换时归零重来）。
+    pub log_seen_len: u64,
     /// 正在跑的更新检查（后台线程结果从这里回来；`None` 表示没有任务）。
     pub update_rx: Option<std::sync::mpsc::Receiver<UpdateCheckOutcome>>,
+    /// 上一次检查的结果（安装更新要用它拿下载地址）。
+    pub last_update: Option<snug_win::UpdateCheckResult>,
+    /// 正在跑的下载/校验（进度与结果都从这里回来）。
+    pub install_rx: Option<std::sync::mpsc::Receiver<InstallOutcome>>,
 }
 
 /// 后台检查更新的结果。
 pub type UpdateCheckOutcome = Result<snug_win::UpdateCheckResult, snug_win::UpdateError>;
+
+/// 下载线程发回的消息：先是一串进度，最后是结果。
+#[derive(Debug)]
+pub enum InstallOutcome {
+    Progress(f64),
+    Done(Result<snug_win::PreparedUpdate, snug_win::UpdateError>),
+}
 
 impl PhoneHomeApp {
     pub fn new(
@@ -90,7 +103,10 @@ impl PhoneHomeApp {
             tray,
             phone_window: None,
             last_phone_rect: None,
+            log_seen_len: 0,
             update_rx: None,
+            last_update: None,
+            install_rx: None,
         }
     }
 
@@ -157,19 +173,170 @@ impl PhoneHomeApp {
                     result.current_version
                 );
                 self.settings.set_update_state(UpdateUiState::Available {
-                    version: result.latest_version,
+                    version: result.latest_version.clone(),
                     downloadable: result.package_download_url.is_some(),
                 });
+                self.last_update = Some(result);
             }
             Ok(result) => {
                 crate::info!("设置：已是最新版本 v{}", result.current_version);
                 self.settings.set_update_state(UpdateUiState::UpToDate);
+                self.last_update = None;
             }
             Err(err) => {
                 crate::warn!("设置：检查更新失败 {err}");
                 self.settings
                     .set_update_state(UpdateUiState::CheckFailed(err.to_string()));
+                self.last_update = None;
             }
+        }
+    }
+
+    /// 下载 + 校验 + 解包，成功后交给 `apply-update.ps1` 并退出（C# `OnInstallUpdate`）。
+    fn start_install_update(&mut self) {
+        use crate::settings::UpdateUiState;
+
+        let Some(check) = self.last_update.clone() else {
+            crate::warn!("设置：还没有检查结果，无法安装更新");
+            return;
+        };
+        let version = check.latest_version.clone();
+        crate::info!("设置：开始下载 v{version}");
+
+        let app_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_default();
+        let service = snug_win::update::AppUpdateService::new(
+            snug_win::update::CurlHttpClient::default(),
+            app_dir,
+            std::env::temp_dir(),
+        );
+        if !service.is_configured() {
+            self.settings.set_update_state(UpdateUiState::InstallFailed {
+                version,
+                message: "未配置发布仓库".to_string(),
+            });
+            return;
+        }
+
+        self.settings.set_update_state(UpdateUiState::Downloading {
+            version: version.clone(),
+            progress: 0.0,
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.install_rx = Some(rx);
+        let progress_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("snug-update-download".to_string())
+            .spawn(move || {
+                let mut progress = |fraction: f64| {
+                    let _ = progress_tx.send(InstallOutcome::Progress(fraction));
+                };
+                let outcome = service.download_and_prepare(&check, &mut progress);
+                let _ = tx.send(InstallOutcome::Done(outcome));
+            })
+            .ok();
+    }
+
+    /// 每帧收一次下载进度与结果。
+    fn poll_install_update(&mut self) {
+        use crate::settings::UpdateUiState;
+        use std::sync::mpsc::TryRecvError;
+
+        loop {
+            let Some(rx) = &self.install_rx else { return };
+            let message = match rx.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.install_rx = None;
+                    crate::warn!("设置：下载线程异常结束");
+                    return;
+                }
+            };
+            match message {
+                InstallOutcome::Progress(fraction) => {
+                    let version = self
+                        .last_update
+                        .as_ref()
+                        .map(|check| check.latest_version.clone())
+                        .unwrap_or_default();
+                    self.settings.set_update_state(UpdateUiState::Downloading {
+                        version,
+                        progress: fraction as f32,
+                    });
+                }
+                InstallOutcome::Done(outcome) => {
+                    self.install_rx = None;
+                    match outcome {
+                        Ok(prepared) => {
+                            crate::info!(
+                                "设置：v{} 已下载并校验通过，交给 apply-update.ps1 后退出",
+                                prepared.version
+                            );
+                            self.settings.set_update_state(UpdateUiState::Ready);
+                            match snug_win::update::launch_apply_script(&prepared, true) {
+                                Ok(script) => {
+                                    crate::info!("设置：替换脚本已启动 {}，本进程退出", script.display());
+                                    self.request_exit = true;
+                                }
+                                Err(err) => {
+                                    crate::warn!("设置：启动替换脚本失败 {err}");
+                                    self.settings.set_update_state(UpdateUiState::InstallFailed {
+                                        version: prepared.version,
+                                        message: err.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            crate::warn!("设置：下载/校验失败 {err}");
+                            let version = self
+                                .last_update
+                                .as_ref()
+                                .map(|check| check.latest_version.clone())
+                                .unwrap_or_default();
+                            self.settings.set_update_state(UpdateUiState::InstallFailed {
+                                version,
+                                message: err.to_string(),
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 增量刷新设置窗里的日志框（C# `LogAppended` 事件的效果）。
+    ///
+    /// 首帧或跨天轮换时整体取末尾 200 行，之后只把新增的字节按行追加上去：
+    /// 日志一天能写几万字，每帧 `read_to_string` 整份文件会把界面拖卡。
+    fn refresh_logs(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let Some(path) = crate::logging::current_file() else { return };
+        let len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if self.log_seen_len == 0 || len < self.log_seen_len {
+            self.settings.set_logs(crate::logging::tail(200));
+            self.log_seen_len = len;
+            return;
+        }
+        if len == self.log_seen_len {
+            return;
+        }
+        let Ok(mut file) = std::fs::File::open(&path) else { return };
+        if file.seek(SeekFrom::Start(self.log_seen_len)).is_err() {
+            return;
+        }
+        let mut buffer = Vec::new();
+        if file.read_to_end(&mut buffer).is_err() {
+            return;
+        }
+        self.log_seen_len = len;
+        for line in String::from_utf8_lossy(&buffer).lines() {
+            self.settings.append_log(line);
         }
     }
 
@@ -234,6 +401,10 @@ impl PhoneHomeApp {
         self.settings.set_status(status);
         self.settings.set_autostart(Self::startup_service().is_enabled());
         self.settings.set_manual_override(self.controller.manual_override());
+        // 日志框：只在"驱动与日志"页增量刷新，别每帧把整个文件读进文本框。
+        if self.settings.tab() == SettingsTab::Diagnostics {
+            self.refresh_logs();
+        }
     }
 
     /// 执行设置窗排出来的动作。副作用都在这里落地，`settings.rs` 本身不做事。
@@ -290,15 +461,7 @@ impl PhoneHomeApp {
                 }
             }
             SettingsAction::CheckUpdate => self.start_update_check(),
-            SettingsAction::InstallUpdate => {
-                // 下载 + 校验 + 解包 + 换文件是下一步；先把"检查"做成真的，
-                // 免得按钮一点就假装在做事。
-                crate::warn!("设置：下载并安装更新尚未接线（检查已经可用）");
-                self.settings.set_update_state(crate::settings::UpdateUiState::InstallFailed {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    message: "下载与替换尚未接线，请等下一版".to_string(),
-                });
-            }
+            SettingsAction::InstallUpdate => self.start_install_update(),
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
                 self.controller.apply_gesture_settings(&self.config);
@@ -353,7 +516,9 @@ impl eframe::App for PhoneHomeApp {
         for command in tray_commands {
             match command {
                 TrayCommand::OpenSettings(tab) => {
-                    self.settings.select_tab(SettingsTab::from_index(tab));
+                    let tab = SettingsTab::from_index(tab);
+                    crate::debug!("托盘：打开设置第 {} 页（{}）", tab.index(), tab.nav_title());
+                    self.settings.select_tab(tab);
                     self.settings.open();
                     ctx.request_repaint();
                 }
@@ -382,6 +547,7 @@ impl eframe::App for PhoneHomeApp {
 
         // 设置窗：先执行上一帧排出的动作，再画这一帧（动作会影响配置和控制器状态）。
         self.poll_update_check();
+        self.poll_install_update();
         for action in self.settings.take_actions() {
             self.apply_setting(action);
         }
