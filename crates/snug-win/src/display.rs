@@ -443,6 +443,11 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 continue;
             }
             let Some(snapshot) = self.wait_for_online(&existing, base_width, base_height) else {
+                // C# `Log.Warn($"手机屏（id={candidateId}）创建后 {OnlineTimeout.TotalSeconds:0}s 内未在 Windows 上线，尝试备用 ID")`
+                crate::warn(&format!(
+                    "手机屏（id={candidate}）创建后 {}s 内未在 Windows 上线，尝试备用 ID",
+                    self.timings.online.as_secs()
+                ));
                 let _ = self.ipc.remove(&[candidate]);
                 continue;
             };
@@ -542,7 +547,12 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             maps.fits.remove(&display_id);
             maps.device_names.remove(&display_id)
         };
-        let _ = self.ipc.remove(&[display_id]);
+        // C2：与 C# 一样，先删本地状态再发删除；若 remove 失败，屏还在但应用
+        // 已经忘了它（孤儿屏，直到下次启动 CleanupOrphans 才清）。照抄不修。
+        if let Err(error) = self.ipc.remove(&[display_id]) {
+            // C# `Log.Warn($"移除手机屏 #{displayId} 失败：{ex.Message}")`
+            crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}"));
+        }
 
         let Some(device_name) = device_name else {
             return true;
@@ -1009,13 +1019,23 @@ impl DisplayApi for WinDisplay {
         dev_mode.dmFields = fields;
 
         unsafe {
-            ChangeDisplaySettingsExW(
+            let result = ChangeDisplaySettingsExW(
                 name,
                 Some(&dev_mode as *const DEVMODEW),
                 None,
                 CDS_UPDATEREGISTRY,
                 None,
-            ) == DISP_CHANGE_SUCCESSFUL
+            );
+            if result == DISP_CHANGE_SUCCESSFUL {
+                true
+            } else {
+                // C# `Log.Warn($"ChangeDisplaySettingsEx({deviceName}, {w}x{h}) 返回 {res}")`
+                crate::warn(&format!(
+                    "ChangeDisplaySettingsEx({device_name}, {width}x{height}) 返回 {}",
+                    result.0
+                ));
+                false
+            }
         }
     }
 
@@ -1052,7 +1072,13 @@ impl DisplayApi for WinDisplay {
             },
             scale_rel,
         };
-        unsafe { DisplayConfigSetDeviceInfo(&set.header) == 0 }
+        let status = unsafe { DisplayConfigSetDeviceInfo(&set.header) };
+        if status != 0 {
+            // C# `Log.Warn($"设置 DPI 缩放 {targetPercent}% 失败（status={status}）")`
+            crate::warn(&format!("设置 DPI 缩放 {percent}% 失败（status={status}）"));
+            return false;
+        }
+        true
     }
 
     fn try_attach_virtual_display(&self, width: i32, height: i32, x: i32, y: i32) -> Option<String> {
