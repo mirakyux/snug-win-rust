@@ -353,8 +353,20 @@ impl PhoneHomeApp {
     /// 没有手机屏时整个程序只剩托盘图标。这条是"Rust 版看起来像不像原版"的关键，
     /// 所以失败时只记 warn，不阻塞界面。
     fn sync_window(&mut self, ctx: &egui::Context) {
-        let ready = self.controller.state().screen_phase == PhoneScreenPhase::Ready;
-        let bounds = if ready { self.controller.phone_bounds() } else { None };
+        let state = self.controller.state();
+        let ready = state.screen_phase == PhoneScreenPhase::Ready;
+        // 有窗口铺在手机屏上时，我们只留底部那条指示条（C# 里 `PhoneHomeWindow` 隐、
+        // `HomeBarWindow` 显）；没有窗口铺着时，整块手机屏都是资源库。
+        let placed = state.placed.is_some();
+        let bounds = if ready {
+            if placed {
+                self.controller.home_bar_area()
+            } else {
+                self.controller.phone_bounds()
+            }
+        } else {
+            None
+        };
 
         let Some(bounds) = bounds else {
             // 手机屏不在了：窗口回主屏并藏起来，只留托盘。
@@ -372,10 +384,17 @@ impl PhoneHomeApp {
         };
 
         if self.last_phone_rect != Some(bounds) {
+            // 尺寸也要跟着变：egui 的尺寸单位是点，屏幕矩形是物理像素。
+            let ppp = ctx.pixels_per_point() as f64;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                (bounds.width / ppp) as f32,
+                (bounds.height / ppp) as f32,
+            )));
             let request = snug_win::PlacementRequest::new(bounds);
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
-                    "手机屏界面已搬到 ({}, {}) {}×{}",
+                    "手机屏界面：{}，搬到 ({}, {}) {}×{}",
+                    if placed { "收成底部指示条" } else { "铺满资源库" },
                     bounds.x,
                     bounds.y,
                     bounds.width,
@@ -476,6 +495,44 @@ impl PhoneHomeApp {
             // 下面这些要等平台层的更新器/驱动/机型窗接上，先如实写日志，不假装成功。
             other => crate::warn!("设置：动作 {other:?} 尚未接线，已忽略"),
         }
+    }
+
+    /// 铺着窗口时的那一条底部指示条（对应 C# `HomeBarWindow`）。
+    ///
+    /// 这一条要**一直盖在被铺开的窗口上面**，否则用户没法回到资源库；所以它由我们
+    /// 自己的置顶窗口承担（`PlacementRequest` 默认 `topmost`）。
+    fn draw_home_bar(&mut self, ctx: &egui::Context) {
+        let placed = self.controller.state().placed.map(|placed| placed.window);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(24, 26, 30))
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if ui.button("‹ 资源库").clicked() {
+                        crate::info!("指示条：回到资源库");
+                        self.controller.show_list();
+                    }
+                    if let Some(window) = &placed {
+                        ui.label(egui::RichText::new(window.label()).small().weak());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("⚙").on_hover_text("设置").clicked() {
+                            self.settings.open();
+                        }
+                        if let Some(window) = &placed
+                            && self.config.screenshot
+                            && ui
+                                .add_enabled(!self.shots.is_open(), egui::Button::new("📷"))
+                                .clicked()
+                        {
+                            self.shots.take(window);
+                        }
+                    });
+                });
+            });
     }
 
     /// 手机屏当前阶段的简短文案。
@@ -597,6 +654,14 @@ impl eframe::App for PhoneHomeApp {
         }
         if self.request_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // 有窗口铺在手机屏上时，界面只剩底部指示条（C#：PhoneHomeWindow 隐、HomeBarWindow 显）。
+        if self.controller.state().placed.is_some() {
+            self.draw_home_bar(ctx);
+            self.shots.poll();
+            self.shots.show(ctx);
             return;
         }
 

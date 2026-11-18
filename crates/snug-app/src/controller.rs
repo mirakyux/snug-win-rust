@@ -141,6 +141,18 @@ impl Controller {
         self.displays.bounds_of(id)
     }
 
+    /// 手机屏底部指示条的区域（物理像素）。有窗口铺在屏上时，我们的界面窗口
+    /// 要缩成这一条，对应 C# 的 `HomeBarWindow`（它是独立置顶窗口）。
+    pub fn home_bar_area(&self) -> Option<Rect> {
+        let id = self.desk.state().display_id?;
+        self.displays.home_bar_area_of(id)
+    }
+
+    /// 回到资源库（C# `ShowList`）：把铺开的窗口归位。
+    pub fn show_list(&self) {
+        self.desk.show_list();
+    }
+
     /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
     pub fn pull(&self, window: WindowInfo) {
         self.desk.pull(window);
