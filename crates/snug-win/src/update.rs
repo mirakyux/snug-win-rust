@@ -3,10 +3,11 @@
 //! 流程与 C# 一致：
 //! 1. `GET https://api.github.com/repos/nicocart/snug-win/releases/latest`，
 //!    解出 tag 与附件；API 不行就退到 releases/latest 的**重定向最终地址**里抠 tag；
-//! 2. 按当前包形态拼出资产名（`SnugWin-v{ver}-win-x64-{selfcontained|frameworkdependent}.zip`），
+//! 2. 按当前包形态拼出资产名（`Snug-v{ver}-win-x64-{selfcontained|frameworkdependent}.zip`，
+//!    上游 C# 的 `SnugWin-v…` 布局只作参考：Rust 版是并行重写版，用自己的发行名），
 //!    顺带找 `checksums.txt`；
 //! 3. 下载 zip、用 `checksums.txt` 里的 SHA-256 校验（校验不过就中止并删临时目录）；
-//! 4. 解压到 staging 的 `payload/`，确认里面有 `SnugWin.App.exe`；
+//! 4. 解压到 staging 的 `payload/`，确认里面有 [`TARGET_EXE`]（`snug.exe`）；
 //! 5. 写一个 `apply-update.ps1`：等本进程退出 → 覆盖文件 → 重新拉起 → 删临时目录。
 //!
 //! 网络、解压、文件系统都经 trait 注入，单测只跑纯逻辑（版本比较、资产匹配、
@@ -26,8 +27,8 @@
 use std::path::{Path, PathBuf};
 
 use snug_core::update::{
-    is_newer, normalize, parse_latest_release, preferred_asset_name, try_find_sha256,
-    ReleasePackageKind, UpdateReleaseInfo,
+    is_newer, normalize, parse_latest_release, try_find_sha256, ReleasePackageKind,
+    UpdateReleaseInfo,
 };
 
 /// GitHub "latest release" API。
@@ -37,7 +38,13 @@ pub const LATEST_WEB_URL: &str = "https://github.com/nicocart/snug-win/releases/
 /// 校验和文件名。
 pub const CHECKSUMS_ASSET: &str = "checksums.txt";
 /// 更新包里必须有的可执行文件。
-pub const TARGET_EXE: &str = "SnugWin.App.exe";
+///
+/// 用我们自己的发行名 `snug.exe`：上游 C# 版的 `SnugWin.App.exe` 只是参考。
+/// Rust 版是**并行**的重写版，不替换用户机器上已装的 C# 正式版，所以资产名、
+/// 覆盖目标、重启命令一律按 `snug.exe` 走，不去兼容 C# 的目录布局。
+pub const TARGET_EXE: &str = "snug.exe";
+/// 发行资产名前缀。C# 是 `SnugWin-v…`，我们是 `Snug-v…`。
+pub const ASSET_PREFIX: &str = "Snug-v";
 /// **应用版本**，编译期取 crate 版本。
 ///
 /// 对应 C# `Directory.Build.props` 的 `<Version>1.2.0</Version>`：自动更新拿它跟
@@ -49,6 +56,16 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const USER_AGENT: &str = "SnugWin-Updater/1.1";
 /// staging 目录名前缀。
 pub const STAGING_PREFIX: &str = "SnugWin-Update";
+
+/// 本地发行资产名：`Snug-v{ver}-win-x64-{kind}.zip`。
+///
+/// 对应 C# `AppVersionHelper.PreferredAssetName`，但换了产品名。`snug-core` 里的
+/// [`snug_core::update::preferred_asset_name`] 仍按 C# 的 `SnugWin-v…` 拼（core 归别人
+/// 维护、且它服务的是上游语义），更新器不能调它，否则会去 GitHub 找一个永远不会存在的资产。
+pub fn release_asset_name(tag_or_version: &str, kind: ReleasePackageKind) -> String {
+    let version = normalize(tag_or_version);
+    format!("{ASSET_PREFIX}{version}-win-x64-{}.zip", kind.suffix())
+}
 
 // ---------------------------------------------------------------------------
 // HTTP 与解压的抽象
@@ -322,8 +339,8 @@ pub fn fallback_release(url: &str) -> Option<UpdateReleaseInfo> {
     let tag = tag_from_release_url(final_url)?;
     let version = normalize(&tag);
     let base = format!("https://github.com/nicocart/snug-win/releases/download/{tag}");
-    let self_zip = preferred_asset_name(&tag, ReleasePackageKind::SelfContained);
-    let fdd_zip = preferred_asset_name(&tag, ReleasePackageKind::FrameworkDependent);
+    let self_zip = release_asset_name(&tag, ReleasePackageKind::SelfContained);
+    let fdd_zip = release_asset_name(&tag, ReleasePackageKind::FrameworkDependent);
     Some(UpdateReleaseInfo {
         tag_name: tag,
         normalized_version: version,
@@ -347,7 +364,7 @@ pub fn build_check_result(
     current_version: &str,
     package_kind: ReleasePackageKind,
 ) -> UpdateCheckResult {
-    let preferred = preferred_asset_name(&release.tag_name, package_kind);
+    let preferred = release_asset_name(&release.tag_name, package_kind);
     let package = release
         .assets
         .iter()
@@ -795,6 +812,20 @@ mod tests {
     }
 
     #[test]
+    fn release_asset_name_uses_our_own_product_name() {
+        // 不兼容 C# 的 `SnugWin-v…`：Rust 版是并行重写版，用自己的发行名。
+        assert_eq!(
+            release_asset_name("v1.2.0", ReleasePackageKind::SelfContained),
+            "Snug-v1.2.0-win-x64-selfcontained.zip"
+        );
+        assert_eq!(
+            release_asset_name("1.2.0", ReleasePackageKind::FrameworkDependent),
+            "Snug-v1.2.0-win-x64-frameworkdependent.zip"
+        );
+        assert_eq!(TARGET_EXE, "snug.exe", "覆盖/重启的目标就是我们的产物名");
+    }
+
+    #[test]
     fn fallback_release_builds_three_assets() {
         let release = fallback_release("https://github.com/nicocart/snug-win/releases/tag/v1.2.0")
             .expect("能拼出来");
@@ -804,7 +835,7 @@ mod tests {
         assert_eq!(release.assets[2].name, CHECKSUMS_ASSET);
         assert_eq!(
             release.assets[0].download_url,
-            "https://github.com/nicocart/snug-win/releases/download/v1.2.0/SnugWin-v1.2.0-win-x64-selfcontained.zip"
+            "https://github.com/nicocart/snug-win/releases/download/v1.2.0/Snug-v1.2.0-win-x64-selfcontained.zip"
         );
         assert!(fallback_release("https://example.com/") .is_none());
     }
@@ -818,12 +849,12 @@ mod tests {
             body: "notes".to_string(),
             assets: vec![
                 snug_core::update::UpdateAssetInfo::new(
-                    "SnugWin-v1.3.0-win-x64-selfcontained.zip",
+                    "Snug-v1.3.0-win-x64-selfcontained.zip",
                     "https://example.invalid/self.zip",
                     1,
                 ),
                 snug_core::update::UpdateAssetInfo::new(
-                    "SnugWin-v1.3.0-win-x64-frameworkdependent.zip",
+                    "Snug-v1.3.0-win-x64-frameworkdependent.zip",
                     "https://example.invalid/fdd.zip",
                     2,
                 ),
@@ -838,7 +869,7 @@ mod tests {
         let self_contained =
             build_check_result(&release, "1.2.0", ReleasePackageKind::SelfContained);
         assert!(self_contained.has_update);
-        assert_eq!(self_contained.package_asset_name, "SnugWin-v1.3.0-win-x64-selfcontained.zip");
+        assert_eq!(self_contained.package_asset_name, "Snug-v1.3.0-win-x64-selfcontained.zip");
         assert_eq!(
             self_contained.package_download_url.as_deref(),
             Some("https://example.invalid/self.zip")
@@ -895,7 +926,7 @@ mod tests {
         assert!(script.contains("$targetPid = 4242"));
         assert!(script.contains(r"$src = 'C:\Temp\SnugWin-Update\1.3.0-ab\payload'"));
         assert!(script.contains(r"$dst = 'C:\it''s\SnugWin'"), "单引号要转义：{script}");
-        assert!(script.contains(r"$launchExe = 'C:\it''s\SnugWin\SnugWin.App.exe'"));
+        assert!(script.contains(r"$launchExe = 'C:\it''s\SnugWin\snug.exe'"));
         assert!(script.contains("$launchArgs = '--minimized'"));
         assert!(script.contains("Remove-Item -Path 'C:\\Temp\\SnugWin-Update\\1.3.0-ab'"));
 
@@ -995,7 +1026,7 @@ mod tests {
     fn release_json(tag: &str) -> String {
         format!(
             r#"{{"tag_name":"{tag}","html_url":"https://github.com/nicocart/snug-win/releases/tag/{tag}","body":"notes","assets":[
-              {{"name":"SnugWin-v{}-win-x64-selfcontained.zip","browser_download_url":"https://example.invalid/self.zip","size":10}},
+              {{"name":"Snug-v{}-win-x64-selfcontained.zip","browser_download_url":"https://example.invalid/self.zip","size":10}},
               {{"name":"checksums.txt","browser_download_url":"https://example.invalid/checksums.txt","size":2}}]}}"#,
             tag.trim_start_matches('v')
         )
@@ -1097,7 +1128,7 @@ mod tests {
             release_url: String::new(),
             release_notes: String::new(),
             package_kind: ReleasePackageKind::SelfContained,
-            package_asset_name: "SnugWin-v1.3.0-win-x64-selfcontained.zip".to_string(),
+            package_asset_name: "Snug-v1.3.0-win-x64-selfcontained.zip".to_string(),
             package_download_url: Some("https://example.invalid/pkg.zip".to_string()),
             checksums_download_url: checksums_url.map(str::to_string),
         }
@@ -1112,7 +1143,7 @@ mod tests {
             "https://example.invalid/checksums.txt",
             HttpResponse::new(
                 200,
-                format!("{hash}  {}\n", "SnugWin-v1.3.0-win-x64-selfcontained.zip"),
+                format!("{hash}  {}\n", "Snug-v1.3.0-win-x64-selfcontained.zip"),
                 "https://example.invalid/checksums.txt",
             ),
         );
@@ -1141,7 +1172,7 @@ mod tests {
             HttpResponse::new(
                 200,
                 format!(
-                    "{}  SnugWin-v1.3.0-win-x64-selfcontained.zip\n",
+                    "{}  Snug-v1.3.0-win-x64-selfcontained.zip\n",
                     "0".repeat(64)
                 ),
                 "https://example.invalid/checksums.txt",
@@ -1242,8 +1273,8 @@ mod tests {
     #[test]
     fn missing_checksum_warning_names_the_asset() {
         // 名字对不上时行为不变（继续、不校验），但必须留一行日志说明"校验没生效"。
-        let message = missing_checksum_warning("SnugWin-v1.3.0-win-x64-selfcontained.zip");
-        assert!(message.contains("SnugWin-v1.3.0-win-x64-selfcontained.zip"), "{message}");
+        let message = missing_checksum_warning("Snug-v1.3.0-win-x64-selfcontained.zip");
+        assert!(message.contains("Snug-v1.3.0-win-x64-selfcontained.zip"), "{message}");
         assert!(message.contains("跳过 SHA-256 校验"), "{message}");
     }
 }
