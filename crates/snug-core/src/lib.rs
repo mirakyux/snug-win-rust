@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod crop;
+pub mod desk;
 pub mod geometry;
 pub mod left_behind;
 pub mod paths;
