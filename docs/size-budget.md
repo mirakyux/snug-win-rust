@@ -7,12 +7,12 @@
 
 | 项 | 大小 | 时间 |
 | --- | --- | --- |
-| `target/release/snug.exe` | 6,905,344 B（6.59 MiB） | 2026-11-19 |
-| `dist/Snug-v1.2.0-win-x64-selfcontained.zip` | 3,079,597 B（2.94 MiB） | 2026-11-18（上一版，未重新打包） |
+| `target/release-check/release/snug.exe`（1.3.0） | 6,899,200 B（6.58 MiB） | 2026-11-19 |
+| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 3,202,919 B（3.05 MiB） | 2026-11-19 |
 
 历史：5.09 MiB → 6.13 MiB（加托盘、截图、UU 探测、App 资源库）
 → 6.26 MiB（修 bug）→ 6.56 MiB（多屏 `DeskSet`、主题、控制中心设置页、重入胶囊）
-→ 6.59 MiB（退出手机屏确认条）。
+→ 6.59 MiB（退出手机屏确认条）→ 6.58 MiB（1.3.0 收尾，版本资源变化）。
 
 > 注意：`target/release/snug.exe` 正在运行时无法被覆盖，release 构建会报
 > `failed to remove file`。要么先退出程序，要么用独立目录验证：
@@ -46,10 +46,11 @@ strip = "symbols"    # 符号不进二进制
 
 ## 还能省的地方（按收益排序）
 
-1. **egui/eframe 是最大头**。默认字体（`Hack`/`Ubuntu-Light`/emoji）占数百 KB，
-   我们只用系统 `msyh.ttc` 渲染中文，可以关掉 egui 自带字体 feature。
-2. `windows` crate 的 `Win32_UI_Shell`、`Win32_Graphics_Dwm` 等按符号裁剪时再看一遍，
-   有大块没用到就关 feature。
+1. ~~关掉 egui 自带字体~~ **已评估，不做**。`default_fonts` 打包的 `Hack`/`Ubuntu-Light`
+   之外还有 **`NotoEmoji` 与 `emoji-icon-font`**——界面上的 `⏏` `📱` `‹` `×` 全靠它们
+   渲染（见 `ui.rs`/`tray.rs`）。关掉会全变豆腐块；自己内嵌一份等大的字体并不会更小，
+   等于把省下的几百 KB 原样塞回去。要省只能改成纯 ASCII 图标，那是界面改版，不是体积优化。
+2. `windows` crate 的 feature 按符号裁剪时再看一遍，有大块没用到就关掉。
 3. 图标资源（`snugwin-idle.ico` / `snugwin-connected.ico` / logo）内嵌，
    多尺寸 ICO 只留 16/20/24/32/48 就够。
 
@@ -64,4 +65,10 @@ cargo build --release -p snug-app --offline
 
 ```powershell
 pwsh -File scripts\build-release.ps1
+```
+
+发版门禁（版本/体积/清单/依赖/发行包一次查完，不用启动程序）：
+
+```powershell
+pwsh -File scripts\preflight.ps1
 ```

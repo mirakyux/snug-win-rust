@@ -6,6 +6,18 @@
 > `quit.request`）。新 exe 在退出后才能覆盖，或直接用
 > `cargo build --release -p snug-app --offline --target-dir target\release-check` 的产物。
 
+## 0. 先跑静态门禁（不用启动程序）
+
+```powershell
+pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe
+```
+
+它只查「发出去的那个 exe 是不是发布形态」：版本与 `Cargo.toml` 一致、体积在 8 MiB 内、
+清单是 `requireAdministrator` + PerMonitorV2 + UTF-8、`dumpbin` 里只有系统 DLL、
+dist 的 zip 与 checksums 对得上。**全 PASS 再往下点**；SKIP 的项要看清原因。
+
+它不验证任何行为——下面八组才是行为验收。
+
 ## 1. 该撤的屏会撤（本次最重要）
 
 | 步骤 | 期望 |
