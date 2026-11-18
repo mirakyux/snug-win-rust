@@ -20,6 +20,7 @@ pub mod vdd;
 mod wide;
 pub mod window;
 pub mod apps;
+pub mod com;
 pub mod screenshot;
 pub mod elevation;
 pub mod placement;
@@ -27,6 +28,7 @@ pub mod startup;
 pub mod update;
 
 pub use apps::WinApps;
+pub use com::{init_sta, uninit as uninit_com};
 pub use screenshot::{WinScreenshot, WinScreens};
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use elevation::{is_elevated, restart_elevated};
