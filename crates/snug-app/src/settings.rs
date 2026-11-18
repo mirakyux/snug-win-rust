@@ -18,8 +18,6 @@
 //! 3. 关掉手势总开关后，四个子项变灰且不可点；
 //! 4. 断驱动时“常规”页出现黄色横幅，“驱动与日志”页显示未就绪。
 
-#![allow(dead_code)] // main.rs 只加了 `mod settings;`，ui.rs 的接线由 Chief 做；接线后删掉这行
-
 use eframe::egui;
 use snug_core::{AppConfig, PhoneCatalog, PhoneChoice};
 

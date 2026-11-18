@@ -50,6 +50,8 @@ pub struct Controller {
     desk: Desk,
     #[allow(dead_code)] // 后续设置界面/诊断要用
     paths: Paths,
+    /// "手动强制手机屏"（C# `UUSensor.ManualOverride`），界面回显用。
+    manual_override: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -99,7 +101,7 @@ impl Controller {
             })
             .ok();
 
-        Self { desk, paths: paths.clone(), running, worker }
+        Self { desk, paths: paths.clone(), manual_override: Arc::new(AtomicBool::new(false)), running, worker }
     }
 
     pub fn state(&self) -> DeskState {
@@ -115,6 +117,44 @@ impl Controller {
     /// 手机屏开关（设置界面用）。
     pub fn set_phone_screen(&self, on: bool) {
         self.desk.set_wanted(on);
+    }
+
+    /// 机型/字号变了：换比例并重新铺窗（C# `SetFit` + `SetDefaultZoom`）。
+    pub fn set_fit(&self, fit: ScreenFit) {
+        self.desk.set_fit(fit);
+    }
+
+    /// 默认字号档位（设置窗的 zoom 滑杆）。
+    pub fn set_default_zoom(&self, steps: i32) {
+        self.desk.set_default_zoom(steps);
+    }
+
+    /// 手动强制（C# `AppController.SetManualOverride` → `UUSensor.ManualOverride`）。
+    ///
+    /// 语义是"不管 UU 连没连都保持手机屏"。`uu` 探测模块还没接进来，
+    /// 这里先把用户的意图记下来（设置窗要回显），并如实说明本次不会生效。
+    pub fn set_manual_override(&self, on: bool) {
+        self.manual_override.store(on, Ordering::Relaxed);
+        crate::warn!("手动强制手机屏 = {on}：uu 探测模块未接线，本次未生效");
+    }
+
+    /// 当前"手动强制"状态（设置窗回显用）。
+    pub fn manual_override(&self) -> bool {
+        self.manual_override.load(Ordering::Relaxed)
+    }
+
+    /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
+    ///
+    /// 触摸钩子还没接进控制器，先记一行，避免设置窗看起来改了却毫无反馈。
+    pub fn apply_gesture_settings(&self, config: &AppConfig) {
+        crate::warn!(
+            "手势配置更新（开关={} 滚动={} 长按右键={} 选后复制={} 仅注入={}）：触摸钩子未接线",
+            config.gestures,
+            config.gesture_scroll,
+            config.gesture_long_press_right_click,
+            config.copy_after_selection,
+            config.gestures_injected_only
+        );
     }
 
     /// 撤屏并停掉后台线程；返回前会把状态机收干净。
