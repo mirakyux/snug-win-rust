@@ -39,7 +39,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW,
     SetForegroundWindow, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
     GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
@@ -664,17 +664,34 @@ impl WinDesktop {
         String::from_utf16_lossy(&buffer[..len as usize])
     }
 
+    /// 读窗口标题。
+    ///
+    /// **不能用 `GetWindowTextW`**：对同进程窗口它会同步投递 `WM_GETTEXT`，如果那个窗口
+    /// 所属线程此刻正阻塞（收尾时 UI 线程在等 desk 线程完成撤屏），就会自己等自己 ——
+    /// 真机上「退出卡死、虚拟屏残留」正是这条路径：desk 线程扫窗口快照时读到了我们自己
+    /// 的 egui 窗口。改成带超时的发送，读不到就返回空串（快照本来也不需要自己的标题）。
     fn window_title(window: HWND) -> String {
-        let len = unsafe { GetWindowTextLengthW(window) };
-        if len <= 0 {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_GETTEXT,
+        };
+        let mut buffer = [0u16; 512];
+        let mut result = 0usize;
+        let ok = unsafe {
+            SendMessageTimeoutW(
+                window,
+                WM_GETTEXT,
+                WPARAM(buffer.len()),
+                LPARAM(buffer.as_mut_ptr() as isize),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                150,
+                Some(&mut result),
+            )
+        };
+        if ok.0 == 0 {
             return String::new();
         }
-        let mut buffer = vec![0u16; len as usize + 1];
-        let written = unsafe { GetWindowTextW(window, &mut buffer) };
-        if written <= 0 {
-            return String::new();
-        }
-        String::from_utf16_lossy(&buffer[..written as usize])
+        let written = result.min(buffer.len());
+        String::from_utf16_lossy(&buffer[..written])
     }
 
     /// 一次把这个窗口的样式、状态、类名、标题全查出来。
@@ -683,6 +700,7 @@ impl WinDesktop {
             return None;
         }
         let window = hwnd(handle);
+        let self_pid = std::process::id();
         unsafe {
             if !IsWindow(Some(window)).as_bool() {
                 return None;
@@ -692,6 +710,9 @@ impl WinDesktop {
             let has_owner = GetWindow(window, GW_OWNER)
                 .map(|owner| !owner.0.is_null())
                 .unwrap_or(false);
+            // 自己的窗口不读标题：快照（`probes`）只为恢复别人的窗口，而读自己的标题
+            // 要跨线程发 `WM_GETTEXT`，收尾时 UI 线程正阻塞等 desk 线程，白白多等一个超时。
+            let title = if pid == self_pid { String::new() } else { Self::window_title(window) };
             Some(WindowProbe {
                 handle,
                 pid: pid as i32,
@@ -704,7 +725,7 @@ impl WinDesktop {
                 has_owner,
                 rect: Self::window_rect(window).unwrap_or(Rect::ZERO),
                 class: Self::class_name(window),
-                title: Self::window_title(window),
+                title,
             })
         }
     }
@@ -819,7 +840,13 @@ impl WindowApi for WinDesktop {
                 LPARAM(&mut handles as *mut Vec<u64> as isize),
             );
         }
-        handles.into_iter().filter_map(Self::probe_window).collect()
+        let mut out = Vec::with_capacity(handles.len());
+        for handle in handles {
+            if let Some(probe) = Self::probe_window(handle) {
+                out.push(probe);
+            }
+        }
+        out
     }
 
     fn probe(&self, handle: u64) -> Option<WindowProbe> {
