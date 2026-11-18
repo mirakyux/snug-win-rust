@@ -70,6 +70,10 @@ pub struct PhoneHomeApp {
     /// 按机型比例缩放到工作区里，并且只读——C# 预览模式下所有会动手机屏的动作
     /// 都只弹一条"预览模式只读"提示。
     pub preview: Option<PreviewState>,
+    /// 当前生效的是不是深色主题（`Auto` 时由系统决定）。
+    pub dark: bool,
+    /// 界面里手写颜色用的调色板（随主题切换）。
+    pub palette: crate::theme::Palette,
 }
 
 /// 桌面预览的运行态。
@@ -141,6 +145,9 @@ impl PhoneHomeApp {
             finished: false,
             last_offscreen: None,
             preview: None,
+            // 真正的应用发生在 `update()` 第一帧（那里才拿得到 `Context`）。
+            dark: false,
+            palette: crate::theme::Palette::DARK,
         }
     }
 
@@ -583,6 +590,7 @@ impl PhoneHomeApp {
             pipe_available: self.pipe_ready,
             elevated: self.elevated,
             phone_screen_ready: state.screen_phase == PhoneScreenPhase::Ready,
+            can_reenter: self.controller.can_reenter(),
             status_summary: Self::phase_text(state.screen_phase).to_string(),
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             self_contained: true,
@@ -597,11 +605,19 @@ impl PhoneHomeApp {
     }
 
     /// 执行设置窗排出来的动作。副作用都在这里落地，`settings.rs` 本身不做事。
-    fn apply_setting(&mut self, action: SettingsAction) {
+    fn apply_setting(&mut self, action: SettingsAction, ctx: &egui::Context) {
         match action {
             SettingsAction::SetPhoneScreen(on) => {
                 crate::info!("设置：手机屏 → {on}");
                 self.controller.set_phone_screen(on);
+            }
+            SettingsAction::ReenterScreen => {
+                crate::info!("设置：进入手机屏");
+                self.controller.reenter();
+            }
+            SettingsAction::OpenPreview => {
+                crate::info!("设置：预览界面");
+                self.open_preview(ctx);
             }
             SettingsAction::SetManualOverride(on) => {
                 crate::info!("设置：手动强制手机屏 → {on}");
@@ -666,13 +682,6 @@ impl PhoneHomeApp {
                     ),
                 }
             }
-            SettingsAction::OpenPhoneModels => {
-                // C# 是弹一个独立的 `PhoneModelWindow`；我们的机型选择在设置窗"常规"页，
-                // 直接把人送到那儿，比再开一个只有一份列表的窗口更好用。
-                crate::info!("设置：打开机型选择（常规页）");
-                self.settings.select_tab(SettingsTab::General);
-                self.settings.open();
-            }
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
                 self.controller.apply_gesture_settings(&self.config);
@@ -689,7 +698,7 @@ impl PhoneHomeApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(24, 26, 30))
+                    .fill(self.palette.home_bar)
                     .inner_margin(egui::Margin::symmetric(8, 2)),
             )
             .show(ctx, |ui| {
@@ -737,6 +746,19 @@ impl eframe::App for PhoneHomeApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 主题：每帧核对一次（`Auto` 还要看系统设置变没变），变了才重建样式。
+        let dark = crate::theme::resolve_dark(self.config.theme);
+        if dark != self.dark || self.palette.dark != dark {
+            self.dark = dark;
+            self.palette = crate::theme::palette(dark);
+            crate::theme::apply(ctx, dark);
+            crate::info!(
+                "主题：{}（{}）",
+                self.config.theme.label(),
+                if dark { "深色" } else { "浅色" }
+            );
+        }
+
         // 关闭请求在自己的代码里拦一次：真机上 eframe 的 `on_exit` 没被调用过，
         // 结果虚拟屏留在了桌面上。这里收尾是可靠的（进程还活着，事件循环还在跑）。
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -802,7 +824,7 @@ impl eframe::App for PhoneHomeApp {
                     ctx.request_repaint();
                 }
                 TrayCommand::SetManualOverride(on) => {
-                    self.apply_setting(SettingsAction::SetManualOverride(on));
+                    self.apply_setting(SettingsAction::SetManualOverride(on), ctx);
                 }
                 TrayCommand::Quit => {
                     crate::info!("托盘：退出（先还原窗口）");
@@ -840,7 +862,7 @@ impl eframe::App for PhoneHomeApp {
             self.library.start_scan();
         }
         for action in self.settings.take_actions() {
-            self.apply_setting(action);
+            self.apply_setting(action, ctx);
         }
         if self.settings.is_open() {
             self.refresh_settings_status();
@@ -856,13 +878,18 @@ impl eframe::App for PhoneHomeApp {
                 }
                 match impact {
                     ChangeImpact::RebuildPhoneScreen => {
-                        self.controller.set_fit(snug_core::ScreenFit::from_phone(
-                            &self.config.phone.screen.to_fit_spec(),
-                        ));
+                        // 机型/方向变了：屏愿望里的 fit 跟着变，状态机按新比例重建。
+                        self.controller.apply_screens(&self.config);
                         self.controller.set_default_zoom(self.config.zoom_steps);
                     }
                     ChangeImpact::ReloadGestures => {
                         self.controller.apply_gesture_settings(&self.config)
+                    }
+                    // 主题在每帧开头按 `config.theme` 自动对齐，这里不用做事。
+                    ChangeImpact::Theme => {}
+                    // 屏列表交给状态机（C# `DeskSet.SetWishes`）。
+                    ChangeImpact::Screens => {
+                        self.controller.apply_screens(&self.config);
                     }
                     ChangeImpact::RefreshHomeBar | ChangeImpact::None => {}
                 }
@@ -909,7 +936,7 @@ impl eframe::App for PhoneHomeApp {
                         egui::RichText::new("App")
                             .size(38.0)
                             .strong()
-                            .color(egui::Color32::from_gray(238)),
+                            .color(self.palette.text),
                     );
                     let header_state = self.controller.state();
                     if let Some(placed) = &header_state.placed {
@@ -919,7 +946,7 @@ impl eframe::App for PhoneHomeApp {
                                 egui::Button::new(
                                     egui::RichText::new(label)
                                         .size(15.0)
-                                        .color(egui::Color32::from_rgb(140, 200, 255)),
+                                        .color(self.palette.accent),
                                 )
                                 .frame(false),
                             )
@@ -963,7 +990,7 @@ impl eframe::App for PhoneHomeApp {
                                 preview.scale * 100.0
                             ))
                             .size(14.0)
-                            .color(egui::Color32::from_rgb(255, 196, 120)),
+                            .color(self.palette.warn),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("关闭预览").clicked() {
@@ -1103,7 +1130,7 @@ impl eframe::App for PhoneHomeApp {
                                         egui::RichText::new(letter)
                                             .size(13.0)
                                             .strong()
-                                            .color(egui::Color32::from_gray(150)),
+                                            .color(self.palette.text_weak),
                                     );
                                 });
                             }
@@ -1120,7 +1147,7 @@ impl eframe::App for PhoneHomeApp {
                                             ui.painter().rect_filled(
                                                 rect.shrink(2.0),
                                                 16.0,
-                                                egui::Color32::from_rgb(46, 50, 58),
+                                                self.palette.card,
                                             );
                                         }
                                         let icon_rect = egui::Rect::from_center_size(
@@ -1146,7 +1173,7 @@ impl eframe::App for PhoneHomeApp {
                                                 ui.painter().rect_filled(
                                                     icon_rect,
                                                     icon_side * 0.22,
-                                                    egui::Color32::from_rgb(58, 62, 72),
+                                                    self.palette.card_hover,
                                                 );
                                                 let initial = app
                                                     .name
@@ -1159,7 +1186,7 @@ impl eframe::App for PhoneHomeApp {
                                                     egui::Align2::CENTER_CENTER,
                                                     initial,
                                                     egui::FontId::proportional(icon_side * 0.42),
-                                                    egui::Color32::from_gray(200),
+                                                    self.palette.text,
                                                 );
                                             }
                                         }
@@ -1176,7 +1203,7 @@ impl eframe::App for PhoneHomeApp {
                                             egui::Align2::CENTER_TOP,
                                             label,
                                             egui::FontId::proportional(14.0),
-                                            egui::Color32::from_gray(215),
+                                            self.palette.text,
                                         );
                                         if response.clicked() {
                                             match self.library.action_for(app) {

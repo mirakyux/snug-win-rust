@@ -8,67 +8,82 @@
 //! - “改了要不要重来 / 两个开关是不是互相矛盾”这类判定抽成纯函数
 //!   （[`classify_change`]、[`change_hint`]、[`both_off_hint`]），`show()` 只摆控件。
 //!
-//! 四个页面与 C# 一致：常规与手机屏 / 手势与交互 / 驱动与日志 / 关于与更新。
+//! 五个页面与 C# v1.3.0 一致：控制中心（bento 首页）/ 手势与交互 / 驱动与日志 /
+//! 关于与更新 / 多屏与设备。首页把原来"常规与手机屏"那一页的开关与机型信息
+//! 收进了卡片里（C# 1.3.0 就是这么拆的）。
 //! 字段全部来自 `snug_core::AppConfig`（对应 C# `SnugWin.Core.Config.AppConfig`），
 //! 本模块不新造配置结构。
 //!
 //! 手动验证（真机）：
-//! 1. 打开设置窗，四个页签都能切换，底部状态与提权文案正确；
+//! 1. 打开设置窗，五个页签都能切换，底部状态与提权文案正确；
 //! 2. 改“默认字号放大”后关窗再开，值能被控制器写回 config.json；
 //! 3. 关掉手势总开关后，四个子项变灰且不可点；
-//! 4. 断驱动时“常规”页出现黄色横幅，“驱动与日志”页显示未就绪。
+//! 4. 断驱动时首页出现黄色横幅，“驱动与日志”页显示未就绪；
+//! 5. 首页切浅色/暗黑/自动，界面配色立刻变（自动跟系统）。
 
 use eframe::egui;
-use snug_core::{AppConfig, PhoneCatalog, PhoneChoice};
+use snug_core::{AppConfig, AppThemeMode, PhoneCatalog, PhoneChoice, ScreenConfig, ScreenFit};
 
 /// 字号放大档位（C# `ZoomCombo` 的 0~4），与 core 的 `MIN_ZOOM_STEPS`/`MAX_ZOOM_STEPS` 一致。
 pub const ZOOM_LABELS: [&str; 5] = ["0 级（默认）", "+1 级", "+2 级", "+3 级", "+4 级"];
 
-/// 页签，顺序与 C# 左侧导航一致。
+/// 页签，顺序与 C# v1.3.0 的 `SelectTab(index)` 一致：
+/// 0 控制中心（bento 首页）/ 1 手势与交互 / 2 驱动与日志 / 3 关于与更新 / 4 多屏与设备。
+///
+/// "常规与手机屏"那一页在 1.3.0 里被拆掉了：开关与机型信息都挪进首页卡片。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
-    General,
+    Home,
     Gestures,
     Diagnostics,
     About,
+    Screens,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 4] =
-        [SettingsTab::General, SettingsTab::Gestures, SettingsTab::Diagnostics, SettingsTab::About];
+    pub const ALL: [SettingsTab; 5] = [
+        SettingsTab::Home,
+        SettingsTab::Gestures,
+        SettingsTab::Diagnostics,
+        SettingsTab::About,
+        SettingsTab::Screens,
+    ];
 
-    /// 左侧导航文字（C# `NavTabRadio.Content`）。
+    /// 左侧导航文字。
     pub fn nav_title(self) -> &'static str {
         match self {
-            SettingsTab::General => "常规与手机屏",
+            SettingsTab::Home => "控制中心",
             SettingsTab::Gestures => "手势与交互",
             SettingsTab::Diagnostics => "驱动与日志",
             SettingsTab::About => "关于与更新",
+            SettingsTab::Screens => "多屏与设备",
         }
     }
 
-    /// 页面标题（C# 页内 `TextBlock`），与导航文字略有出入。
+    /// 页面标题（对应 C# 子页顶部标题；首页是品牌行，用程序名）。
     pub fn page_title(self) -> &'static str {
         match self {
-            SettingsTab::General => "常规与手机屏",
-            SettingsTab::Gestures => "手势与交互",
-            SettingsTab::Diagnostics => "驱动与实时日志",
+            SettingsTab::Home => "SnugWin",
+            SettingsTab::Gestures => "手势与交互细项",
+            SettingsTab::Diagnostics => "驱动状态与实时日志",
             SettingsTab::About => "关于与版本更新",
+            SettingsTab::Screens => "多屏与设备管理",
         }
     }
 
     pub fn index(self) -> usize {
         match self {
-            SettingsTab::General => 0,
+            SettingsTab::Home => 0,
             SettingsTab::Gestures => 1,
             SettingsTab::Diagnostics => 2,
             SettingsTab::About => 3,
+            SettingsTab::Screens => 4,
         }
     }
 
-    /// C# `SelectTab(index)`：越界落回“常规”。
+    /// C# `SelectTab(index)`：越界落回首页。
     pub fn from_index(index: usize) -> Self {
-        Self::ALL.get(index).copied().unwrap_or(SettingsTab::General)
+        Self::ALL.get(index).copied().unwrap_or(SettingsTab::Home)
     }
 }
 
@@ -101,10 +116,12 @@ pub enum SettingsAction {
     OpenRepository,
     /// 以管理员身份重启（C# `OnRestartElevated`）。
     RestartElevated,
-    /// 打开机型库窗口（C# `OnOpenModels` 的 `PhoneModelWindow`）。
-    OpenPhoneModels,
     /// 手势配置变了，钩子要按新配置重新接管（C# 里是 `SetGesturesEnabled` 等四个 setter）。
     ApplyGestureSettings,
+    /// 首页的「进入手机屏」（C# `HeroReentryBtn` → `ReenterScreen`）。
+    ReenterScreen,
+    /// 首页的「预览界面」（C# `OpenScreenPreview`）。
+    OpenPreview,
 }
 
 /// 运行态快照：由 app 层喂进来，界面只读（对应 C# 里从 `_controller` 读的那些字段）。
@@ -116,6 +133,8 @@ pub struct StatusInfo {
     pub elevated: bool,
     /// 手机屏是否已就绪（决定状态灯颜色）。
     pub phone_screen_ready: bool,
+    /// 能不能"重新进入手机屏"（C# `CanReenterPhoneScreen`：会话中且被收起过）。
+    pub can_reenter: bool,
     /// 一句话状态（C# `GetStatusSummary()`）。
     pub status_summary: String,
     /// 当前版本（C# `CurrentVersion`）。
@@ -130,6 +149,7 @@ impl Default for StatusInfo {
             pipe_available: false,
             elevated: false,
             phone_screen_ready: false,
+            can_reenter: false,
             status_summary: "待机中".to_string(),
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             self_contained: true,
@@ -220,10 +240,17 @@ pub enum ChangeImpact {
     ReloadGestures,
     /// 机型或字号变了：手机屏要以新比例重建并重新铺窗。
     RebuildPhoneScreen,
+    /// 明暗主题变了：只换配色，不重建屏。
+    Theme,
+    /// 多屏配置增删改：屏列表发给状态机，由它建/撤屏。
+    Screens,
 }
 
 /// 对比两份配置，得出影响面。判定顺序从“最重”到“最轻”。
 pub fn classify_change(before: &AppConfig, after: &AppConfig) -> ChangeImpact {
+    if before.screens != after.screens {
+        return ChangeImpact::Screens;
+    }
     if before.phone != after.phone || before.zoom_steps != after.zoom_steps {
         return ChangeImpact::RebuildPhoneScreen;
     }
@@ -237,6 +264,9 @@ pub fn classify_change(before: &AppConfig, after: &AppConfig) -> ChangeImpact {
     }
     if before.screenshot != after.screenshot {
         return ChangeImpact::RefreshHomeBar;
+    }
+    if before.theme != after.theme {
+        return ChangeImpact::Theme;
     }
     // phone_screen / auto_check_updates / welcomed / last_version 都不需要“重来”：
     // 前两个由控制器实时响应，后两个不是设置界面能改的。
@@ -252,6 +282,8 @@ pub fn change_hint(impact: ChangeImpact) -> Option<&'static str> {
         ChangeImpact::RebuildPhoneScreen => {
             Some("机型或字号已改变：下次连接会按新比例重建手机屏，已铺开的窗口会重新归位。")
         }
+        ChangeImpact::Theme => None,
+        ChangeImpact::Screens => Some("屏配置已变化：下一次连接会按新配置建屏。"),
     }
 }
 
@@ -270,6 +302,24 @@ pub fn both_off_hint(cfg: &AppConfig, autostart: bool) -> Option<&'static str> {
 pub fn model_text(choice: &PhoneChoice) -> String {
     let model = choice.model.clone().unwrap_or_else(|| "自定义".to_string());
     format!("{model}（{} × {}）", choice.screen.width, choice.screen.height)
+}
+
+/// 首页「当前手机屏」卡的第二行（C# `PhoneSpecText`：`1206 × 2622 · 200%`）。
+///
+/// 尺寸取设备本身的物理像素；百分比取 `ScreenFit` 给虚拟屏定的 DPI
+/// （电脑屏且 2 倍会超 4K/2400 时退回 100%，见 C# `TargetDpiPercent`）。
+pub fn spec_text(choice: &PhoneChoice) -> String {
+    let fit = ScreenFit::from_device(
+        &choice.screen.to_fit_spec(),
+        choice.kind,
+        choice.kind.usual_orientation(),
+    );
+    format!(
+        "{} × {} · {}%",
+        choice.screen.width as i64,
+        choice.screen.height as i64,
+        fit.target_dpi_percent(fit.base_width())
+    )
 }
 
 /// 关于页的版本行（C# `AboutVersionText`）。
@@ -301,11 +351,6 @@ pub fn zoom_index(steps: i32) -> usize {
     steps.clamp(0, ZOOM_LABELS.len() as i32 - 1) as usize
 }
 
-/// 下拉选项下标 → 字号档位（越界夹回 0~4）。
-pub fn zoom_steps(index: usize) -> i32 {
-    index.min(ZOOM_LABELS.len() - 1) as i32
-}
-
 /// 档位 → 下拉文字。
 pub fn zoom_label(steps: i32) -> &'static str {
     ZOOM_LABELS[zoom_index(steps)]
@@ -331,6 +376,15 @@ pub struct SettingsWindow {
     baseline: Option<AppConfig>,
     /// 最近一次改动的提示，换页/关窗后清空。
     last_hint: Option<&'static str>,
+    /// 多屏页「添加一块屏」的三个选择（只属于界面状态，不进配置）。
+    new_screen_kind: snug_core::DeviceKind,
+    new_screen_orientation: snug_core::ScreenOrientation,
+    new_screen_model: Option<String>,
+    /// 正在给第几块屏挑机型（`None` = 没在挑）。对应 C# 的 `PhoneModelWindow`，
+    /// 我们把它做成多屏页里的内嵌选择器，不再单开一个窗口。
+    model_picker: Option<usize>,
+    /// 机型选择器的搜索词。
+    model_search: String,
 }
 
 impl Default for SettingsWindow {
@@ -343,7 +397,7 @@ impl SettingsWindow {
     pub fn new() -> Self {
         Self {
             open: false,
-            tab: SettingsTab::General,
+            tab: SettingsTab::Home,
             status: StatusInfo::default(),
             update: UpdateUiState::Idle,
             autostart: false,
@@ -353,6 +407,11 @@ impl SettingsWindow {
             actions: Vec::new(),
             baseline: None,
             last_hint: None,
+            new_screen_kind: snug_core::DeviceKind::Phone,
+            new_screen_orientation: snug_core::ScreenOrientation::Portrait,
+            new_screen_model: None,
+            model_picker: None,
+            model_search: String::new(),
         }
     }
 
@@ -493,7 +552,8 @@ impl SettingsWindow {
                     ui.heading(self.tab.page_title());
                     ui.add_space(4.0);
                     match self.tab {
-                        SettingsTab::General => self.page_general(ui, cfg),
+                        SettingsTab::Home => self.page_home(ui, cfg),
+                        SettingsTab::Screens => self.page_screens(ui, cfg),
                         SettingsTab::Gestures => self.page_gestures(ui, cfg),
                         SettingsTab::Diagnostics => self.page_diagnostics(ui, cfg),
                         SettingsTab::About => self.page_about(ui, cfg),
@@ -590,7 +650,25 @@ impl SettingsWindow {
         changed
     }
 
-    fn page_general(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
+    /// 一张卡片（C# bento 首页的 `Border` 卡片）：标题小字 + 内容。
+    fn card<R>(
+        ui: &mut egui::Ui,
+        title: &str,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> R {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(title).size(12.0).weak());
+                ui.add_space(2.0);
+                add(ui)
+            })
+            .inner
+    }
+
+    /// 首页：C# 1.3.0 的"控制中心"（状态 / 当前手机屏 / 外观 / 细项 四张卡）。
+    fn page_home(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
         if !self.status.pipe_available {
             egui::Frame::group(ui.style())
                 .fill(egui::Color32::from_rgb(0x2B, 0x1F, 0x0E))
@@ -598,7 +676,7 @@ impl SettingsWindow {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new("虚拟显示器驱动尚未就绪")
+                                egui::RichText::new("虚拟显示器驱动未就绪")
                                     .strong()
                                     .color(egui::Color32::from_rgb(0xFC, 0xD3, 0x4D)),
                             );
@@ -610,7 +688,7 @@ impl SettingsWindow {
                                 .color(egui::Color32::from_rgb(0xFD, 0xE6, 0x8A)),
                             );
                         });
-                        if ui.button("一键安装驱动").clicked() {
+                        if ui.button("一键安装").clicked() {
                             self.actions.push(SettingsAction::InstallDriver);
                         }
                     });
@@ -618,68 +696,289 @@ impl SettingsWindow {
             ui.add_space(8.0);
         }
 
-        if Self::labeled_checkbox(
-            ui,
-            &mut cfg.phone_screen,
-            "手机连入时自动创建虚拟竖屏",
-            "检测到 UU远程连入即生成手机屏，断开后自动还原所有窗口",
-        ) {
-            self.actions.push(SettingsAction::SetPhoneScreen(cfg.phone_screen));
-        }
+        // ---- 状态卡 ----
+        let ready = self.status.phone_screen_ready;
+        let can_reenter = self.status.can_reenter;
+        let summary = self.status.status_summary.clone();
+        let elevated = self.status.elevated;
+        let pipe_ok = self.status.pipe_available;
+        Self::card(ui, "状态", |ui| {
+            ui.horizontal(|ui| {
+                let dot = if ready {
+                    egui::Color32::from_rgb(0x34, 0xD3, 0x99)
+                } else {
+                    egui::Color32::from_rgb(0x60, 0xA5, 0xFA)
+                };
+                ui.label(egui::RichText::new("●").size(12.0).color(dot));
+                ui.label(egui::RichText::new(&summary).size(15.0).strong());
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}",
+                    elevation_text(elevated),
+                    if pipe_ok { "管道已连接" } else { "管道未就绪" }
+                ))
+                .small()
+                .weak(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ready {
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(0x12, 0x2B, 0x22))
+                        .inner_margin(egui::Margin::symmetric(10, 4))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("已就绪")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(0x34, 0xD3, 0x99)),
+                            );
+                        });
+                } else if can_reenter && ui.button("进入手机屏").clicked() {
+                    self.actions.push(SettingsAction::ReenterScreen);
+                }
+                if !elevated && ui.button("提权重启").clicked() {
+                    self.actions.push(SettingsAction::RestartElevated);
+                }
+            });
+        });
+        ui.add_space(8.0);
 
-        if Self::labeled_checkbox(
-            ui,
-            &mut self.autostart,
-            "开机静默自启动（后台常驻托盘）",
-            "通过 Windows 任务计划以最高权限启动，登录桌面不再弹 UAC 提示",
-        ) {
-            self.actions.push(SettingsAction::SetAutoStart(self.autostart));
+        // ---- 当前手机屏卡 ----
+        let model_line = model_text(&cfg.phone);
+        let spec_line = spec_text(&cfg.phone);
+        let zoom_steps_now = cfg.zoom_steps;
+        let zoom_lbl = zoom_label(zoom_steps_now);
+        let enabled_screens = cfg.effective_screens().iter().filter(|s| s.enabled).count();
+        let mut go_screens = false;
+        let mut zoom_click: Option<i32> = None;
+        Self::card(ui, "当前手机屏", |ui| {
+            ui.label(egui::RichText::new(&model_line).size(15.0).strong());
+            ui.label(egui::RichText::new(&spec_line).small().weak());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("−").on_hover_text("字号小一级").clicked() {
+                    zoom_click = Some(zoom_steps_now - 1);
+                }
+                ui.label(egui::RichText::new(zoom_lbl).size(13.0));
+                if ui.button("+").on_hover_text("字号大一级").clicked() {
+                    zoom_click = Some(zoom_steps_now + 1);
+                }
+            });
+            ui.add_space(4.0);
+            let mut pick_model = false;
+            ui.horizontal(|ui| {
+                if ui.button("预览界面").clicked() {
+                    self.actions.push(SettingsAction::OpenPreview);
+                }
+                if ui.button("换机型...").clicked() {
+                    pick_model = true;
+                }
+            });
+            if pick_model {
+                self.model_picker = Some(0);
+                self.model_search.clear();
+            }
+            ui.add_space(4.0);
+            if ui
+                .add(egui::Button::new(format!("多屏 {enabled_screens}/4 ›")).frame(false))
+                .on_hover_text("多屏与设备管理")
+                .clicked()
+            {
+                go_screens = true;
+            }
+        });
+        if let Some(steps) = zoom_click {
+            cfg.zoom_steps = steps.clamp(0, ZOOM_LABELS.len() as i32 - 1);
         }
+        if go_screens {
+            self.tab = SettingsTab::Screens;
+        }
+        ui.add_space(8.0);
 
-        Self::labeled_checkbox(
-            ui,
-            &mut cfg.screenshot,
-            "在底部小横条左侧显示相机键",
-            "一键截取手机屏窗口到剪贴板，点击缩略图可 8 把手裁剪",
+        // ---- 外观卡 ----
+        Self::card(ui, "外观", |ui| {
+            ui.horizontal(|ui| {
+                for (mode, label) in [
+                    (AppThemeMode::Light, "浅色"),
+                    (AppThemeMode::Dark, "暗黑"),
+                    (AppThemeMode::Auto, "自动"),
+                ] {
+                    ui.selectable_value(&mut cfg.theme, mode, label);
+                }
+            });
+            ui.label(
+                egui::RichText::new("自动：跟随 Windows「设置 → 个性化 → 颜色」里的应用主题")
+                    .small()
+                    .weak(),
+            );
+        });
+        ui.add_space(8.0);
+
+        // ---- 细项卡 ----
+        Self::card(ui, "细项", |ui| {
+            if Self::labeled_checkbox(
+                ui,
+                &mut cfg.phone_screen,
+                "手机连入时自动创建虚拟竖屏",
+                "检测到 UU远程连入即生成手机屏，断开后自动还原所有窗口",
+            ) {
+                self.actions.push(SettingsAction::SetPhoneScreen(cfg.phone_screen));
+            }
+
+            if Self::labeled_checkbox(
+                ui,
+                &mut self.autostart,
+                "开机静默自启动（后台常驻托盘）",
+                "通过 Windows 任务计划以最高权限启动，登录桌面不再弹 UAC 提示",
+            ) {
+                self.actions.push(SettingsAction::SetAutoStart(self.autostart));
+            }
+
+            Self::labeled_checkbox(
+                ui,
+                &mut cfg.screenshot,
+                "在底部小横条左侧显示相机键",
+                "一键截取手机屏窗口到剪贴板，点击缩略图可 8 把手裁剪",
+            );
+
+            if Self::labeled_checkbox(
+                ui,
+                &mut self.manual_override,
+                "手动强制开启手机屏（测试 / 自动探测兜底）",
+                "跳过 UU远程 信号检测，直接在本地桌面旁模拟启用竖屏手机屏",
+            ) {
+                self.actions.push(SettingsAction::SetManualOverride(self.manual_override));
+            }
+        });
+
+        self.page_footer(ui, cfg);
+    }
+
+    /// 多屏与设备管理（C# 1.3.0 `PageScreens`）。
+    fn page_screens(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
+        // 老配置还没有 `screens` 字段：第一次进来先迁移出一块主手机屏。
+        if cfg.screens.is_none() {
+            cfg.screens = Some(cfg.effective_screens());
+        }
+        let mut screens = cfg.screens.clone().unwrap_or_default();
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+
+        ui.label(
+            egui::RichText::new(format!("最多 {} 块屏，每块对应一台设备", ScreenConfig::LIMIT))
+                .small()
+                .weak(),
         );
+        ui.add_space(6.0);
 
-        if Self::labeled_checkbox(
-            ui,
-            &mut self.manual_override,
-            "手动强制开启手机屏（测试 / 自动探测兜底）",
-            "跳过 UU远程 信号检测，直接在本地桌面旁模拟启用竖屏手机屏",
-        ) {
-            self.actions.push(SettingsAction::SetManualOverride(self.manual_override));
+        if screens.is_empty() {
+            ui.label(egui::RichText::new("还没有配置任何屏。").weak());
+        }
+
+        for (index, screen) in screens.iter_mut().enumerate() {
+            let title = screen.name.clone();
+            let badge = format!(
+                "{} · {}",
+                screen.device.kind.display_name(),
+                screen.orientation.display_name()
+            );
+            let spec = spec_text(&screen.device);
+            let mut remove_this = false;
+            let mut pick_this = false;
+            Self::card(ui, &title, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&badge)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(0x8A, 0xB4, 0xF8)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("删除")
+                            .on_hover_text("移除这块屏（已建的虚拟屏会撤掉）")
+                            .clicked()
+                        {
+                            remove_this = true;
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new(&spec).small().weak());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut screen.enabled, "启用")
+                        .on_hover_text("关掉后这台设备不建虚拟屏")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui.button("预览界面").clicked() {
+                        self.actions.push(SettingsAction::OpenPreview);
+                    }
+                    if ui.button("换机型...").clicked() {
+                        pick_this = true;
+                    }
+                });
+            });
+            if pick_this {
+                self.model_picker = Some(index);
+                self.model_search.clear();
+            }
+            if remove_this {
+                remove = Some(index);
+            }
+            ui.add_space(6.0);
+        }
+
+        if let Some(index) = remove {
+            screens.remove(index);
+            changed = true;
         }
 
         ui.separator();
         ui.add_space(6.0);
-
-        ui.label(egui::RichText::new("手机型号与屏幕比例").small().weak());
-        ui.label(egui::RichText::new(model_text(&cfg.phone)).size(15.0).strong());
-        ui.add_space(8.0);
-
+        ui.label(egui::RichText::new("添加一块屏").strong());
         ui.horizontal(|ui| {
-            ui.label("终端 / 编辑器默认字号放大：");
-            let mut index = zoom_index(cfg.zoom_steps);
-            egui::ComboBox::from_id_salt("snug-zoom")
-                .selected_text(zoom_label(cfg.zoom_steps))
-                .width(120.0)
-                .show_ui(ui, |ui| {
-                    for (candidate, label) in ZOOM_LABELS.iter().enumerate() {
-                        ui.selectable_value(&mut index, candidate, *label);
-                    }
-                });
-            cfg.zoom_steps = zoom_steps(index);
+            ui.label("类型");
+            for (kind, label) in [
+                (snug_core::DeviceKind::Phone, "手机"),
+                (snug_core::DeviceKind::Tablet, "平板"),
+                (snug_core::DeviceKind::Computer, "电脑"),
+            ] {
+                ui.selectable_value(&mut self.new_screen_kind, kind, label);
+            }
         });
+        ui.horizontal(|ui| {
+            ui.label("方向");
+            for (orientation, label) in [
+                (snug_core::ScreenOrientation::Portrait, "竖屏"),
+                (snug_core::ScreenOrientation::Landscape, "横屏"),
+            ] {
+                ui.selectable_value(&mut self.new_screen_orientation, orientation, label);
+            }
+        });
+        // 电脑屏固定横屏（C# `ScreenConfig.Sanitize` 也是这么兜的）。
+        if self.new_screen_kind == snug_core::DeviceKind::Computer {
+            self.new_screen_orientation = snug_core::ScreenOrientation::Landscape;
+        }
 
-        ui.add_space(10.0);
         if self.catalog.is_some() {
-            let mut selected = cfg.phone.model.clone().unwrap_or_default();
-            let current_label = model_text(&cfg.phone);
-            egui::ComboBox::from_id_salt("snug-model")
-                .selected_text(current_label)
-                .width(320.0)
+            let mut selected = self.new_screen_model.clone();
+            let selected_label = selected
+                .as_ref()
+                .map(|id| {
+                    self.catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.find_model(id))
+                        .map(|model| format!("{} {}", model.brand, model.name))
+                        .unwrap_or_else(|| id.clone())
+                })
+                .unwrap_or_else(|| "（选择机型）".to_string());
+            egui::ComboBox::from_id_salt("snug-new-screen-model")
+                .selected_text(selected_label)
+                .width(280.0)
                 .show_ui(ui, |ui| {
                     if let Some(catalog) = &self.catalog {
                         for model in catalog.models() {
@@ -688,19 +987,120 @@ impl SettingsWindow {
                                 "{} {}（{} × {}）",
                                 model.brand, model.name, model.screen.width, model.screen.height
                             );
-                            ui.selectable_value(&mut selected, id, label);
+                            ui.selectable_value(&mut selected, Some(id), label);
                         }
                     }
                 });
-            if selected != cfg.phone.model.clone().unwrap_or_default()
-                && let Some(catalog) = &self.catalog
-                && let Some(model) = catalog.find_model(&selected)
+            self.new_screen_model = selected;
+        }
+
+        let can_add = screens.len() < ScreenConfig::LIMIT && self.new_screen_model.is_some();
+        if ui
+            .add_enabled(can_add, egui::Button::new("选型号并添加"))
+            .on_disabled_hover_text(if screens.len() >= ScreenConfig::LIMIT {
+                "已经到上限 4 块"
+            } else {
+                "先选一个机型"
+            })
+            .clicked()
+        {
+            if let (Some(model_id), Some(catalog)) = (&self.new_screen_model, &self.catalog)
+                && let Some(model) = catalog.find_model(model_id)
             {
-                cfg.phone = PhoneChoice::from_model(model);
+                let mut device = PhoneChoice::from_model(model);
+                device.kind = self.new_screen_kind;
+                let screen = ScreenConfig {
+                    // id 留空，`sanitize()` 会补一个 GUID（C# `ScreenConfig.Sanitize` 同）。
+                    id: String::new(),
+                    orientation: self.new_screen_orientation,
+                    device: device.clone(),
+                    enabled: true,
+                    name: ScreenConfig::suggested_name(&device, self.new_screen_orientation),
+                }
+                .sanitize();
+                screens.push(screen);
+                changed = true;
             }
         }
-        if ui.button("更换机型 / 自定义...").clicked() {
-            self.actions.push(SettingsAction::OpenPhoneModels);
+
+        // ---- 机型选择器（C# `PhoneModelWindow` 的内嵌版）----
+        if let Some(index) = self.model_picker {
+            if index >= screens.len() {
+                self.model_picker = None;
+            } else {
+                let kind = screens[index].device.kind;
+                let mut chosen: Option<PhoneChoice> = None;
+                let mut cancel = false;
+                Self::card(ui, "选择机型", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.model_search)
+                                .hint_text("🔍 搜索品牌 / 型号")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    let needle = self.model_search.trim().to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .id_salt("snug-model-picker")
+                        .max_height(260.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let Some(catalog) = self.catalog.as_ref() else {
+                                ui.label(egui::RichText::new("没有加载到机型库").weak());
+                                return;
+                            };
+                            let mut shown = 0usize;
+                            for model in catalog.models() {
+                                if model.kind != kind {
+                                    continue;
+                                }
+                                let haystack =
+                                    format!("{} {}", model.brand, model.name).to_lowercase();
+                                if !needle.is_empty() && !haystack.contains(&needle) {
+                                    continue;
+                                }
+                                shown += 1;
+                                let label = format!(
+                                    "{} {}（{} × {}）",
+                                    model.brand, model.name, model.screen.width, model.screen.height
+                                );
+                                if ui.selectable_label(false, label).clicked() {
+                                    chosen = Some(PhoneChoice::from_model(model));
+                                }
+                            }
+                            if shown == 0 {
+                                ui.label(egui::RichText::new("没有匹配的机型").weak());
+                            }
+                        });
+                });
+                if let Some(mut device) = chosen {
+                    device.kind = kind;
+                    let orientation = screens[index].orientation;
+                    screens[index].name =
+                        ScreenConfig::suggested_name(&device, orientation);
+                    screens[index].device = device;
+                    changed = true;
+                    self.model_picker = None;
+                }
+                if cancel {
+                    self.model_picker = None;
+                }
+                ui.add_space(6.0);
+            }
+        }
+
+        if changed {
+            cfg.screens = Some(screens.clone());
+            // 旧字段跟随主手机屏，保持 `effective_screens()` 与保存出来的两套一致。
+            if let Some(primary) = screens.iter().find(|s| s.id == ScreenConfig::LEGACY_PHONE_ID)
+                .or_else(|| screens.first())
+            {
+                cfg.phone = primary.device.clone();
+                cfg.phone_screen = primary.enabled;
+            }
         }
 
         self.page_footer(ui, cfg);
@@ -858,13 +1258,12 @@ mod tests {
     }
 
     #[test]
-    fn zoom_entry_roundtrips_and_clamps() {
+    fn zoom_index_and_label_clamp() {
         for steps in 0..=4 {
-            assert_eq!(zoom_steps(zoom_index(steps)), steps);
+            assert_eq!(zoom_index(steps) as i32, steps);
         }
         assert_eq!(zoom_index(-3), 0);
         assert_eq!(zoom_index(99), 4);
-        assert_eq!(zoom_steps(99), 4);
         assert_eq!(zoom_label(0), "0 级（默认）");
         assert_eq!(zoom_label(9), "+4 级");
     }
@@ -896,17 +1295,45 @@ mod tests {
 
     #[test]
     fn tabs_map_to_csharp_order() {
-        assert_eq!(SettingsTab::from_index(0), SettingsTab::General);
+        assert_eq!(SettingsTab::from_index(0), SettingsTab::Home);
         assert_eq!(SettingsTab::from_index(3), SettingsTab::About);
-        assert_eq!(SettingsTab::from_index(99), SettingsTab::General);
+        assert_eq!(SettingsTab::from_index(4), SettingsTab::Screens);
+        assert_eq!(SettingsTab::from_index(99), SettingsTab::Home);
         for (index, tab) in SettingsTab::ALL.iter().enumerate() {
             assert_eq!(tab.index(), index);
         }
     }
 
     #[test]
-    fn phone_screen_and_updates_need_no_restart() {
+    fn theme_change_only_recolors() {
         let before = standard();
+        let mut after = before.clone();
+        after.theme = AppThemeMode::Dark;
+        assert_eq!(classify_change(&before, &after), ChangeImpact::Theme);
+        // 换主题不该弹"需要重来"的提示。
+        assert_eq!(change_hint(ChangeImpact::Theme), None);
+    }
+
+    #[test]
+    fn screen_list_change_is_reported() {
+        let before = standard();
+        let mut after = before.clone();
+        let mut screens = after.effective_screens();
+        screens[0].enabled = false;
+        after.screens = Some(screens);
+        assert_eq!(classify_change(&before, &after), ChangeImpact::Screens);
+        assert!(change_hint(ChangeImpact::Screens).is_some());
+    }
+
+    #[test]
+    fn spec_line_follows_screen_fit_dpi() {
+        // 标准 iPhone：200%（虚拟屏按 2 倍下发）。
+        let standard_phone = PhoneChoice::standard();
+        assert!(spec_text(&standard_phone).ends_with("200%"));
+    }
+
+    #[test]
+    fn phone_screen_and_updates_need_no_restart() {        let before = standard();
         let mut after = before.clone();
         after.phone_screen = false;
         after.auto_check_updates = false;

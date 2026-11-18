@@ -8,6 +8,7 @@ mod controller;
 mod library;
 mod logging;
 mod settings;
+mod theme;
 mod shots;
 mod tray;
 mod ui;

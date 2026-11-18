@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays, PhoneScreenPhase};
+use snug_core::desk::{
+    AppControl, DeskSet, DeskSetEvents, DeskSetOptions, DeskState, PhoneDisplays, PhoneScreenPhase,
+};
 use snug_core::touch::{TouchOptions, TouchRegion};
 use snug_core::windows::{AppInfo, WindowInfo};
-use snug_core::{AppConfig, Paths, Rect, ScreenFit};
+use snug_core::{AppConfig, Paths, Rect};
 use snug_win::{WinPhoneDisplays, WinWindows};
 
 /// `snug-win` 的 `WinApps` 已经实现了 core 的 [`AppControl`]
@@ -77,7 +79,13 @@ impl snug_win::touch::TouchEvents for HookEvents {
 
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
-    desk: Desk,
+    /// 多屏管理器（对应 C# `DeskSet`）：一块屏一个 desk，共用一条串行队列。
+    ///
+    /// `DeskSet` 的写操作（`set_wishes`/`set_remote`/`shutdown`）要 `&mut self`，
+    /// 所以外面套了 `Mutex`；锁只做很短的入队，不跨任何等待。
+    desks: Arc<std::sync::Mutex<snug_core::desk::DeskSet>>,
+    /// 最近一次屏配置（wishes 由它算，写屏列表时更新）。
+    config: Arc<std::sync::Mutex<AppConfig>>,
     /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
     displays: Arc<WinPhoneDisplays>,
     /// 手势钩子（C# `TouchHookService`）。
@@ -114,19 +122,18 @@ impl Controller {
         on_change: impl Fn() + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
-        let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
         let displays = Arc::new(WinPhoneDisplays::with_paths(paths));
         let windows = Arc::new(WinWindows::new());
         let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
 
-        // 会话状态机与它用的时钟：`DeskEvents::topology_changing` 回调也要用到
+        // 会话状态机与它用的时钟：`DeskSetEvents::topology_changing` 回调也要用到
         // （C# `_desks.TopologyChanging += () => _session.NoteSelfInducedChange(now)`），
         // 所以两边必须是同一个 `RemoteSession`、同一根时间轴。
         let clock = std::time::Instant::now();
         let session = Arc::new(std::sync::Mutex::new(snug_core::session::RemoteSession::new()));
 
-        let events = DeskEvents {
-            state_changed: Some(Arc::new(move |_state| on_change())),
+        let events = DeskSetEvents {
+            state_changed: Some(Arc::new(move || on_change())),
             gone: None,
             topology_changing: Some(Arc::new({
                 let session = session.clone();
@@ -138,33 +145,42 @@ impl Controller {
             })),
             log: Some(Arc::new(log)),
         };
-        let options = DeskOptions {
+        let options = DeskSetOptions {
             timeline: None,
             default_zoom: config.zoom_steps,
-            fit: Some(fit),
             events,
         };
 
-        let desk = Desk::new(displays.clone(), windows, apps, paths, options);
+        let desks = Arc::new(std::sync::Mutex::new(DeskSet::new(
+            displays.clone(),
+            windows,
+            apps,
+            paths,
+            options,
+        )));
         // 先把上次没撤干净的虚拟屏清掉（C# `CleanupOrphansAsync`）。真机上撞到过：
         // 进程被强杀后虚拟屏留在桌面上，下次启动必须先收尸。
         displays.cleanup_orphans();
-        // 再还上次没还回去的窗口（C# `AppController.Start` 里 `_desk.Recover()` 在
-        // 第一条 `SetWanted` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
-        desk.recover();
-        // 注意：这里**不**按 `config.phone_screen` 直接开屏。C# 的 `SetWanted` 由
-        // `OnTick` 每秒按会话算一次（见下面 worker），启动时 `_wanted` 是 false、
+        // 再还上次没还回去的窗口（C# `AppController.Start` 里 `_desks.Recover()` 在
+        // 第一条 `SetWishes` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
+        if let Ok(desks) = desks.lock() {
+            desks.recover();
+        }
+        // 注意：这里**不**按 `config.phone_screen` 直接开屏。C# 的 `SetWishes` 由
+        // `OnTick` 每秒按会话算一次（见下面 worker），启动时没有任何 wish、
         // 屏幕要等第一段远程会话才建。移植时漏了这一层，真机表现是"退出远控后
         // 虚拟屏还挂着，只有杀进程才消失"。
 
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
-        let desk_worker = desk.clone();
+        let desks_worker = desks.clone();
         let uu = Arc::new(snug_win::UuSensor::new());
         let uu_worker = uu.clone();
         let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
         let phone_enabled_worker = phone_enabled.clone();
         let session_worker = session.clone();
+        let config = Arc::new(std::sync::Mutex::new(config.clone()));
+        let config_worker = config.clone();
         // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
         let touch_events = Arc::new(TouchEventQueue::default());
         let touch = Arc::new(snug_win::TouchHook::with_parts(
@@ -189,12 +205,16 @@ impl Controller {
                 let mut last_connected = false;
                 let mut last_signals: Option<(bool, bool, Option<bool>, bool)> = None;
                 while stop.load(Ordering::Relaxed) {
-                    desk_worker.idle();
-                    desk_worker.check_returns();
-                    // 用户点了窗口自带的关闭按钮（C# `_desk.ClosePlaced(handle)`）。
+                    if let Ok(desks) = desks_worker.lock() {
+                        desks.idle();
+                        desks.check_returns();
+                    }
+                    // 用户点了窗口自带的关闭按钮（C# `_desks.ClosePlaced(handle)`）。
                     for handle in touch_events_worker.take_close() {
                         crate::info!("手势：点了窗口关闭按钮，关掉 {handle:#x}");
-                        desk_worker.close_placed(handle);
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.close_placed(handle);
+                        }
                     }
                     let now = started.elapsed().as_secs_f64();
                     if now - last_sample >= 1.0 {
@@ -221,23 +241,21 @@ impl Controller {
                         }
                         let signals = sampled.to_signals();
                         // 会话判定用 `RemoteSession`（不只是 ConnectionTracker）：C# 的
-                        // `_session.InEpisode` / `EpisodeControllers` 决定"该不该有手机屏"，
-                        // 中断后还有一段重连窗口，单用 `ConnectionTracker` 会把这段丢掉。
-                        let (wants, connected, in_episode, controllers_len, ended) = {
+                        // `_session.InEpisode` 决定"该不该有屏"，中断后还有一段重连窗口，
+                        // 单用 `ConnectionTracker` 会把这段丢掉。
+                        let (connected, in_episode, controllers_len, ended) = {
                             let mut session =
                                 session_worker.lock().unwrap_or_else(|e| e.into_inner());
                             let transitions = session.update(&signals, now);
                             let ended = transitions
                                 .iter()
                                 .any(|t| matches!(t, snug_core::session::SessionTransition::Ended));
-                            // C# `OnTick`：`_config.PhoneScreen && _session.InEpisode
-                            // && ControllerClassifier.WantsPhoneScreen(EpisodeControllers(now))`
-                            let wants = wants_screen_now(
-                                phone_enabled_worker.load(Ordering::Relaxed),
+                            (
+                                session.is_connected(),
                                 session.in_episode(),
-                                &session.episode_controllers(now),
-                            );
-                            (wants, session.is_connected(), session.in_episode(), session.controllers().len(), ended)
+                                session.controllers().len(),
+                                ended,
+                            )
                         };
                         if connected != last_connected {
                             last_connected = connected;
@@ -250,10 +268,23 @@ impl Controller {
                         if ended {
                             crate::info!("远程会话：本次会话结束，撤掉手机屏");
                         }
-                        // 每一拍都喂一次：`set_wanted` 内部比较，值没变就直接返回。
-                        desk_worker.set_wanted(wants);
-                        desk_worker.set_remote(in_episode);
-
+                        // C# `OnTick`：
+                        //   bool remote = _session.InEpisode || _sensor.ManualOverride;
+                        //   _desks.SetWishes(ScreenPlan.Wishes(_config, remote));
+                        //   _desks.SetRemote(_session.InEpisode);
+                        // 与 1.2 的区别：不再按控制端类型判断要不要开屏（多设备时代那套
+                        // 启发式已经不准了），只看"有没有会话/手动强制"，屏列表自己带 enabled。
+                        let remote = in_episode || uu_worker.manual_override();
+                        let enabled = phone_enabled_worker.load(Ordering::Relaxed);
+                        let wishes = {
+                            let config =
+                                config_worker.lock().unwrap_or_else(|e| e.into_inner());
+                            active_wishes(&config, enabled, remote)
+                        };
+                        if let Ok(mut desks) = desks_worker.lock() {
+                            desks.set_wishes(wishes);
+                            desks.set_remote(in_episode);
+                        }
                     }
                     if now - last_topology_check >= 2.0 {
                         last_topology_check = now;
@@ -278,7 +309,9 @@ impl Controller {
                                 previous.len(),
                                 topology.len()
                             );
-                            desk_worker.displays_changed();
+                            if let Ok(desks) = desks_worker.lock() {
+                                desks.displays_changed();
+                            }
                         }
                         last_topology = Some(topology);
                     }
@@ -289,7 +322,8 @@ impl Controller {
 
 
         Self {
-            desk,
+            desks,
+            config,
             displays,
             touch,
             uu,
@@ -304,14 +338,44 @@ impl Controller {
         }
     }
 
-    pub fn state(&self) -> DeskState {
-        self.desk.state()
+    /// 主触控屏的 id（单屏界面默认操作的那块）。
+    fn primary_screen_id(&self) -> Option<String> {
+        let config = self.config.lock().ok()?;
+        config.primary_touch_screen().map(|screen| screen.id)
     }
 
-    /// UU 远程连入/断开（由 `uu` 探测模块调用）。
-    #[allow(dead_code)] // 等 snug-win 的 uu 探测接上后由它调用
-    pub fn set_remote(&self, on: bool) {
-        self.desk.set_remote(on);
+    /// 当前要展示的那块屏的状态快照。
+    pub fn state(&self) -> DeskState {
+        let Ok(desks) = self.desks.lock() else {
+            return DeskState::default();
+        };
+        let screen_id = self.primary_screen_id();
+        if let Some(id) = &screen_id
+            && let Some(state) = desks.state_of(id)
+        {
+            return state;
+        }
+        desks.desk_for_screen(None).map(|desk| desk.state()).unwrap_or_default()
+    }
+
+    /// 屏列表变了（设置里增删改屏，对应 C# `_desks.SetWishes(ScreenPlan.Wishes(...))`）。
+    ///
+    /// 这里可以立刻生效：`DeskSet` 的写操作只是把动作排进共享队列，很短。
+    pub fn apply_screens(&self, config: &AppConfig) {
+        if let Ok(mut stored) = self.config.lock() {
+            *stored = config.clone();
+        }
+        let enabled = self.phone_enabled.load(Ordering::Relaxed);
+        let remote = self.in_session() || self.manual_override();
+        let wishes = active_wishes(config, enabled, remote);
+        crate::info!(
+            "屏配置变化：{} 块屏愿望（remote={remote} 总开关={enabled}）",
+            wishes.len()
+        );
+        if let Ok(mut desks) = self.desks.lock() {
+            desks.set_wishes(wishes);
+            desks.set_default_zoom(config.zoom_steps);
+        }
     }
 
     /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
@@ -321,7 +385,9 @@ impl Controller {
             return;
         }
         crate::info!("重新进入手机屏");
-        self.desk.reenter();
+        if let Ok(desks) = self.desks.lock() {
+            desks.reenter_screen(None);
+        }
     }
 
     /// 当前这一段远程会话还在不在（对应 C# `_session.InEpisode`）。
@@ -330,30 +396,32 @@ impl Controller {
     }
 
     /// 能不能"重新进入手机屏"（C# `CanReenterPhoneScreen`）：
-    /// 会话中（或手动强制）**且**手机屏被用户收起过。
+    /// 会话中（或手动强制）**且**有触控屏被用户收起过。
     pub fn can_reenter(&self) -> bool {
-        self.desk.state().dismissed && (self.in_session() || self.manual_override())
+        let dismissed = self
+            .desks
+            .lock()
+            .map(|desks| desks.has_any_dismissed_touch())
+            .unwrap_or(false);
+        dismissed && (self.in_session() || self.manual_override())
     }
 
     /// 设置里的手机屏开关。
     ///
     /// 只改"允许开屏"这个开关；真正开/关由采样线程每秒按会话算（和 C# 一样）。
-    /// 关掉时立刻 `SetWanted(false)`，不等下一拍。
+    /// 关掉时立刻把屏愿望清空，不等下一拍。
     pub fn set_phone_screen(&self, on: bool) {
         self.phone_enabled.store(on, Ordering::Relaxed);
-        if !on {
-            self.desk.set_wanted(false);
+        if !on && let Ok(mut desks) = self.desks.lock() {
+            desks.set_wishes(Vec::new());
         }
-    }
-
-    /// 机型/字号变了：换比例并重新铺窗（C# `SetFit` + `SetDefaultZoom`）。
-    pub fn set_fit(&self, fit: ScreenFit) {
-        self.desk.set_fit(fit);
     }
 
     /// 默认字号档位（设置窗的 zoom 滑杆）。
     pub fn set_default_zoom(&self, steps: i32) {
-        self.desk.set_default_zoom(steps);
+        if let Ok(mut desks) = self.desks.lock() {
+            desks.set_default_zoom(steps);
+        }
     }
 
     /// 手动强制（C# `AppController.SetManualOverride` → `UUSensor.ManualOverride`）。
@@ -373,7 +441,7 @@ impl Controller {
     /// 手机屏的屏幕矩形（物理像素）。界面窗口要搬到这块屏上，对应 C#
     /// `PhoneHomeWindow` 跟着 `_displays.BoundsOf(id)` 走。
     pub fn phone_bounds(&self) -> Option<Rect> {
-        let id = self.desk.state().display_id?;
+        let id = self.state().display_id?;
         self.displays.bounds_of(id)
     }
 
@@ -385,19 +453,23 @@ impl Controller {
     /// 手机屏底部指示条的区域（物理像素）。有窗口铺在屏上时，我们的界面窗口
     /// 要缩成这一条，对应 C# 的 `HomeBarWindow`（它是独立置顶窗口）。
     pub fn home_bar_area(&self) -> Option<Rect> {
-        let id = self.desk.state().display_id?;
+        let id = self.state().display_id?;
         self.displays.home_bar_area_of(id)
     }
 
     /// 回到资源库（C# `ShowList`）：界面切回列表，但铺着的窗口**仍留在手机屏上**
     /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
     pub fn show_list(&self) {
-        self.desk.show_list();
+        if let Ok(desks) = self.desks.lock() {
+            desks.show_list(None);
+        }
     }
 
     /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
     pub fn return_to_placed(&self) {
-        self.desk.return_to_placed();
+        if let Ok(desks) = self.desks.lock() {
+            desks.return_to_placed(None);
+        }
     }
 
     /// 取走钩子抛出的选区事件（界面每帧调一次）。
@@ -416,27 +488,53 @@ impl Controller {
 
     /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
     pub fn pull(&self, window: WindowInfo) {
-        self.desk.pull(window);
+        let Some(screen_id) = self.primary_screen_id() else {
+            crate::warn!("资源库：当前没有屏幕，忽略铺窗");
+            return;
+        };
+        if let Ok(desks) = self.desks.lock() {
+            desks.pull(&screen_id, window);
+        }
     }
 
     /// 启动一个 App（资源库里点没在跑的 App）。
     pub fn open(&self, app: AppInfo) {
-        self.desk.open(app);
+        let Some(screen_id) = self.primary_screen_id() else {
+            return;
+        };
+        if let Ok(desks) = self.desks.lock() {
+            desks.open(&screen_id, app);
+        }
     }
 
     /// 给一个已经在跑的 App 再开一个窗口（资源库行右侧的「+」）。
     pub fn new_window(&self, app: snug_core::windows::RunningApp) {
-        self.desk.new_window(app);
+        let Some(screen_id) = self.primary_screen_id() else {
+            return;
+        };
+        if let Ok(desks) = self.desks.lock() {
+            desks.new_window(&screen_id, app);
+        }
     }
 
     /// 关掉这个 App 的全部窗口（资源库行右侧的「×」）。
     pub fn quit(&self, app: snug_core::windows::RunningApp) {
-        self.desk.quit(app);
+        let Some(screen_id) = self.primary_screen_id() else {
+            return;
+        };
+        if let Ok(desks) = self.desks.lock() {
+            desks.quit(&screen_id, app);
+        }
     }
 
     /// 关掉某一个窗口（展开的窗口行右侧的「×」）。
     pub fn close_window(&self, window: WindowInfo) {
-        self.desk.close(window);
+        let Some(screen_id) = self.primary_screen_id() else {
+            return;
+        };
+        if let Ok(desks) = self.desks.lock() {
+            desks.close(&screen_id, window);
+        }
     }
 
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
@@ -457,7 +555,7 @@ impl Controller {
     ///
     /// 每帧调用是安全的：区域/选项没变时什么都不做，所以不会反复装钩子。
     pub fn sync_touch(&self, config: &AppConfig) {
-        let state = self.desk.state();
+        let state = self.state();
         let region = if config.gestures && state.screen_phase == PhoneScreenPhase::Ready {
             state
                 .display_id
@@ -502,7 +600,9 @@ impl Controller {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
-        self.desk.shutdown();
+        if let Ok(mut desks) = self.desks.lock() {
+            desks.shutdown();
+        }
     }
 }
 
@@ -511,62 +611,88 @@ impl Drop for Controller {
         self.running.store(false, Ordering::Relaxed);
     }
 }
-
-/// "这一刻该不该有手机屏"——对应 C# `AppController.OnTick` 里那行 `wantsPhone`：
+/// 当前该有哪些屏——对应 C# v1.3.0 `AppController.OnTick` 的两行：
 ///
 /// ```csharp
-/// bool wantsPhone = _config.PhoneScreen
-///                   && _session.InEpisode
-///                   && ControllerClassifier.WantsPhoneScreen(_session.EpisodeControllers(now));
-/// _desk.SetWanted(wantsPhone);
+/// bool remote = _session.InEpisode || _sensor.ManualOverride;
+/// _desks.SetWishes(ScreenPlan.Wishes(_config, remote));
 /// ```
 ///
-/// 抽成纯函数是为了能单测：这个三段判断漏掉任何一段都会在真机上表现为
-/// "该撤的屏不撤"或"人在电脑前屏自己冒出来"。
-fn wants_screen_now(enabled: bool, in_episode: bool, controllers: &[String]) -> bool {
-    enabled && in_episode && snug_core::session::wants_phone_screen(controllers)
+/// 与 1.2 的**关键区别**：不再按控制端类型（手机/平板/电脑）判断要不要开屏。
+/// 多设备时代那套启发性判断已经被上游去掉，屏开不开完全由配置里每块屏的
+/// `enabled` 决定；总开关（手机屏开关）关掉时一块屏都不要。
+///
+/// 抽成纯函数是为了能单测：漏掉 `remote` 那一段就是真机上那个
+/// "退出远控后虚拟屏还挂着"的 bug。
+fn active_wishes(
+    config: &AppConfig,
+    enabled: bool,
+    remote: bool,
+) -> Vec<snug_core::screen_plan::ScreenWish> {
+    if !enabled {
+        return Vec::new();
+    }
+    snug_core::screen_plan::ScreenPlan::wishes(config, remote, false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::wants_screen_now;
+    use super::active_wishes;
+    use snug_core::AppConfig;
 
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|name| name.to_string()).collect()
+    fn config_with_one_screen() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.screens = Some(config.effective_screens());
+        config
     }
 
-    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `in_episode` 这一段。
+    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `remote` 这一段。
     #[test]
     fn no_screen_outside_a_session() {
-        assert!(!wants_screen_now(true, false, &[]));
-        assert!(!wants_screen_now(true, false, &names(&["iPhone 17 Pro"])));
+        let config = config_with_one_screen();
+        assert!(active_wishes(&config, true, false).is_empty());
     }
 
     #[test]
-    fn screen_during_a_phone_session() {
-        assert!(wants_screen_now(true, true, &names(&["iPhone 17 Pro"])));
-    }
-
-    /// 纯桌面控制端（Mac/Windows）不占手机屏，C# 的 `WantsPhoneScreen` 同义。
-    #[test]
-    fn desktop_only_session_keeps_the_screen_off() {
-        assert!(!wants_screen_now(true, true, &names(&["MacBook Pro"])));
-        assert!(!wants_screen_now(true, true, &names(&["Windows PC"])));
-    }
-
-    #[test]
-    fn mixed_controllers_still_want_the_screen() {
-        assert!(wants_screen_now(true, true, &names(&["MacBook Pro", "iPhone 17 Pro"])));
-    }
-
-    /// 控制端表读不到时是空表，C# 里"没有控制端"也当成要开屏（保守）。
-    #[test]
-    fn unreadable_controller_table_defaults_to_on() {
-        assert!(wants_screen_now(true, true, &[]));
+    fn one_screen_during_a_session() {
+        let config = config_with_one_screen();
+        assert_eq!(active_wishes(&config, true, true).len(), 1);
     }
 
     #[test]
     fn master_switch_off_wins() {
-        assert!(!wants_screen_now(false, true, &names(&["iPhone 17 Pro"])));
+        let config = config_with_one_screen();
+        assert!(active_wishes(&config, false, true).is_empty());
+    }
+
+    /// 关掉某块屏就不该再有这个愿望。
+    #[test]
+    fn disabled_screen_drops_its_wish() {
+        let mut config = config_with_one_screen();
+        let mut screens = config.effective_screens();
+        screens[0].enabled = false;
+        config.screens = Some(screens);
+        assert!(active_wishes(&config, true, true).is_empty());
+    }
+
+    /// 多屏：两块启用的屏 → 两个愿望，顺序照配置。
+    #[test]
+    fn two_screens_give_two_wishes() {
+        use snug_core::{DeviceKind, ScreenConfig, ScreenOrientation};
+
+        let mut config = config_with_one_screen();
+        let mut screens = config.effective_screens();
+        let mut tablet = screens[0].clone();
+        tablet.id = "tablet-1".to_string();
+        tablet.name = "iPad".to_string();
+        tablet.device.kind = DeviceKind::Tablet;
+        tablet.orientation = ScreenOrientation::Landscape;
+        screens.push(tablet.sanitize());
+        config.screens = Some(screens);
+
+        let wishes = active_wishes(&config, true, true);
+        assert_eq!(wishes.len(), 2, "两块屏应该有两个愿望");
+        assert_eq!(wishes[0].id, ScreenConfig::LEGACY_PHONE_ID);
+        assert_eq!(wishes[1].id, "tablet-1");
     }
 }
