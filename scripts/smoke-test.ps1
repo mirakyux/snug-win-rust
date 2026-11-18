@@ -69,11 +69,18 @@ $beforeMonitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBas
 Write-Host "  跑之前显示器数：$($beforeMonitors.Count)"
 
 # ---- 启动 -------------------------------------------------------------------
-Write-Step "启动 snug.exe（会弹 UAC，请在弹窗里点『是』）"
+# 不要用 `Start-Process`：它走 ShellExecute，对一个刚编译出来、带 requireAdministrator
+# 清单的 exe，会先去问 Shell/提权通道，表现为「打开文件 - 安全警告」或迟迟不起进程。
+# 直接从本进程 CreateProcess 启动（UseShellExecute=$false）不经过 shell，行为可预期。
+Write-Step "启动 snug.exe"
 $env:SNUGWIN_HOME = $DataDir
 $startedAt = Get-Date
-$proc = Start-Process -FilePath $exePath -PassThru
-if (-not $proc) { Fail "Start-Process 没有返回进程（UAC 被取消？）" }
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $exePath
+$psi.WorkingDirectory = (Split-Path $exePath)
+$psi.UseShellExecute = $false
+$proc = [System.Diagnostics.Process]::Start($psi)
+if (-not $proc) { Fail "进程没有启动起来" }
 Write-Host "  pid=$($proc.Id)"
 
 Start-Sleep -Seconds $Seconds
