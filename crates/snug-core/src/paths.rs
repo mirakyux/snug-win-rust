@@ -23,10 +23,26 @@ impl Paths {
     }
 
     /// `%LOCALAPPDATA%\SnugWin`，与 C# 版 `SnugPaths.Default()` 相同。
+    ///
+    /// 环境变量 `SNUGWIN_HOME` 可以整体接管数据目录。这不是给最终用户用的开关，
+    /// 而是**联调/测试必需品**：这台机器上装着 C# 正式版，两边共用
+    /// `%LOCALAPPDATA%\SnugWin` 就会抢同一份 `config.json`、`logs/` 和单实例锁
+    /// （`snug.lock`），互相把对方踢下线。跑 Rust 版时设成独立目录即可互不干扰。
     pub fn from_env() -> Option<Self> {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)?;
+        Self::resolve(
+            std::env::var_os("SNUGWIN_HOME"),
+            std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA")),
+        )
+    }
+
+    /// `from_env` 的纯函数内核（便于测试，不去碰进程环境）。
+    fn resolve(override_dir: Option<std::ffi::OsString>, app_data: Option<std::ffi::OsString>) -> Option<Self> {
+        if let Some(dir) = override_dir {
+            if !dir.is_empty() {
+                return Some(Self::with_data_dir(dir));
+            }
+        }
+        let base = app_data.map(PathBuf::from)?;
         Some(Self::with_data_dir(base.join(DATA_FOLDER)))
     }
 
@@ -112,5 +128,31 @@ mod tests {
         assert!(p.data_dir().is_dir());
         assert!(p.log_directory().is_dir());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn home_override_wins_over_local_appdata() {
+        // 联调时用 SNUGWIN_HOME 把数据目录挪开，避免和已装的 C# 版抢配置与单锁。
+        let p = Paths::resolve(
+            Some(std::ffi::OsString::from(r"D:\snug-test")),
+            Some(std::ffi::OsString::from(r"C:\Users\test\AppData\Local")),
+        )
+        .expect("有覆盖目录就该解析成功");
+        assert_eq!(p.data_dir(), Path::new(r"D:\snug-test"));
+    }
+
+    #[test]
+    fn empty_home_override_is_ignored() {
+        let p = Paths::resolve(
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from(r"C:\Users\test\AppData\Local")),
+        )
+        .expect("空覆盖要退回默认布局");
+        assert_eq!(p.data_dir(), Path::new(r"C:\Users\test\AppData\Local\SnugWin"));
+    }
+
+    #[test]
+    fn no_override_and_no_appdata_is_none() {
+        assert!(Paths::resolve(None, None).is_none());
     }
 }
