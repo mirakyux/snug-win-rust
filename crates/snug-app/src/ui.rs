@@ -18,6 +18,10 @@ pub enum HomeTab {
     All,
 }
 
+/// 手机屏窗口的标题。托盘生命周期里靠它找到自己的 `HWND`（eframe 不对外暴露句柄），
+/// 改这里必须和 `main.rs` 里 `ViewportBuilder::with_title` 保持一致。
+pub const WINDOW_TITLE: &str = "Snug 手机屏";
+
 pub struct PhoneHomeApp {
     pub config: AppConfig,
     pub catalog: Option<PhoneCatalog>,
@@ -37,7 +41,16 @@ pub struct PhoneHomeApp {
     pub request_exit: bool,
     /// 托盘（这台机器没有托盘时为 `None`，界面照样能用）。
     pub tray: Option<Tray>,
+    /// 自己那个窗口的句柄（找到后缓存）。
+    pub phone_window: Option<u64>,
+    /// 上次把窗口摆到的手机屏矩形，用来避免每帧重复 `SetWindowPos`。
+    pub last_phone_rect: Option<snug_core::Rect>,
+    /// 正在跑的更新检查（后台线程结果从这里回来；`None` 表示没有任务）。
+    pub update_rx: Option<std::sync::mpsc::Receiver<UpdateCheckOutcome>>,
 }
+
+/// 后台检查更新的结果。
+pub type UpdateCheckOutcome = Result<snug_win::UpdateCheckResult, snug_win::UpdateError>;
 
 impl PhoneHomeApp {
     pub fn new(
@@ -75,7 +88,131 @@ impl PhoneHomeApp {
             elevated: snug_win::is_elevated(),
             request_exit: false,
             tray,
+            phone_window: None,
+            last_phone_rect: None,
+            update_rx: None,
         }
+    }
+
+    /// 后台查一次新版（C# `OnCheckUpdate`：`await _updates.CheckAsync()` 之后刷界面）。
+    ///
+    /// 发布仓库由编译期 `SNUG_RELEASES_REPO` 决定；没配置时更新器直接返回
+    /// `NotConfigured`，**一个请求都不发**——这样界面不会拿 C# 版的仓库去查。
+    fn start_update_check(&mut self) {
+        use crate::settings::UpdateUiState;
+
+        let app_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_default();
+        let service = snug_win::update::AppUpdateService::new(
+            snug_win::update::CurlHttpClient::default(),
+            app_dir,
+            std::env::temp_dir(),
+        );
+        if !service.is_configured() {
+            crate::warn!("设置：更新检查不可用——构建时没有设置 SNUG_RELEASES_REPO");
+            self.settings
+                .set_update_state(UpdateUiState::CheckFailed("未配置发布仓库".to_string()));
+            return;
+        }
+
+        crate::info!("设置：开始检查更新");
+        self.settings.set_update_state(UpdateUiState::Checking);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("snug-update-check".to_string())
+            .spawn(move || {
+                let _ = tx.send(service.check_for_update());
+            })
+            .ok();
+    }
+
+    /// 每帧收一次后台检查的结果。
+    fn poll_update_check(&mut self) {
+        use crate::settings::UpdateUiState;
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(rx) = &self.update_rx else { return };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.update_rx = None;
+                crate::warn!("设置：更新检查线程异常结束");
+                self.settings.set_update_state(UpdateUiState::CheckFailed(
+                    "检查线程异常结束".to_string(),
+                ));
+                return;
+            }
+        };
+        self.update_rx = None;
+
+        match outcome {
+            Ok(result) if result.has_update => {
+                crate::info!(
+                    "设置：发现新版本 v{}（当前 v{}）",
+                    result.latest_version,
+                    result.current_version
+                );
+                self.settings.set_update_state(UpdateUiState::Available {
+                    version: result.latest_version,
+                    downloadable: result.package_download_url.is_some(),
+                });
+            }
+            Ok(result) => {
+                crate::info!("设置：已是最新版本 v{}", result.current_version);
+                self.settings.set_update_state(UpdateUiState::UpToDate);
+            }
+            Err(err) => {
+                crate::warn!("设置：检查更新失败 {err}");
+                self.settings
+                    .set_update_state(UpdateUiState::CheckFailed(err.to_string()));
+            }
+        }
+    }
+
+    /// 让界面窗口跟着手机屏走：屏在就把窗口搬上去，屏没了就藏起来。
+    ///
+    /// 对应 C# 里 `PhoneHomeWindow` 始终待在虚拟屏上（由 `_displays.BoundsOf` 定位），
+    /// 没有手机屏时整个程序只剩托盘图标。这条是"Rust 版看起来像不像原版"的关键，
+    /// 所以失败时只记 warn，不阻塞界面。
+    fn sync_window(&mut self, ctx: &egui::Context) {
+        let ready = self.controller.state().screen_phase == PhoneScreenPhase::Ready;
+        let bounds = if ready { self.controller.phone_bounds() } else { None };
+
+        let Some(bounds) = bounds else {
+            // 手机屏不在了：窗口回主屏并藏起来，只留托盘。
+            self.last_phone_rect = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        };
+
+        if self.phone_window.is_none() {
+            self.phone_window = snug_win::find_own_window(WINDOW_TITLE);
+        }
+        let Some(hwnd) = self.phone_window else {
+            crate::warn!("找不到自己的窗口「{WINDOW_TITLE}」，手机屏界面暂留主屏");
+            return;
+        };
+
+        if self.last_phone_rect != Some(bounds) {
+            let request = snug_win::PlacementRequest::new(bounds);
+            if snug_win::apply_placement(hwnd, &request) {
+                crate::info!(
+                    "手机屏界面已搬到 ({}, {}) {}×{}",
+                    bounds.x,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height
+                );
+                self.last_phone_rect = Some(bounds);
+            } else {
+                crate::warn!("搬动手机屏界面失败（SetWindowPos 返回失败）");
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
 
     /// 开机自启服务（每次都按当前 exe 现取，换目录后也能对上）。
@@ -152,17 +289,15 @@ impl PhoneHomeApp {
                     }
                 }
             }
-            SettingsAction::CheckUpdate | SettingsAction::InstallUpdate => {
-                // 更新器（snug-win::update）已经移植好并测通，但它查的是 C# 版的仓库
-                // `nicocart/snug-win`：拿它查到的版本号会让我们去下载 C# 的安装包，
-                // 过不了 `snug.exe` 载荷校验。Rust 版有自己的 release 源之后再接线。
-                crate::warn!(
-                    "设置：更新动作未接线——发布仓库仍是 C# 版的 {}",
-                    snug_win::update::LATEST_API_URL
-                );
-                self.settings.set_update_state(crate::settings::UpdateUiState::CheckFailed(
-                    "发布仓库尚未配置（Rust 版还没有自己的 release 源）".to_string(),
-                ));
+            SettingsAction::CheckUpdate => self.start_update_check(),
+            SettingsAction::InstallUpdate => {
+                // 下载 + 校验 + 解包 + 换文件是下一步；先把"检查"做成真的，
+                // 免得按钮一点就假装在做事。
+                crate::warn!("设置：下载并安装更新尚未接线（检查已经可用）");
+                self.settings.set_update_state(crate::settings::UpdateUiState::InstallFailed {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    message: "下载与替换尚未接线，请等下一版".to_string(),
+                });
             }
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
@@ -242,7 +377,11 @@ impl eframe::App for PhoneHomeApp {
         // 让 `poll` 有节奏地跑起来（200ms 足够，不是每帧空转）。
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
+        // 界面窗口跟着手机屏走（对应 C# 里 PhoneHomeWindow 一直待在虚拟屏上）。
+        self.sync_window(ctx);
+
         // 设置窗：先执行上一帧排出的动作，再画这一帧（动作会影响配置和控制器状态）。
+        self.poll_update_check();
         for action in self.settings.take_actions() {
             self.apply_setting(action);
         }

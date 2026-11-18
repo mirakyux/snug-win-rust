@@ -57,7 +57,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Snug 手机屏")
+            .with_title(ui::WINDOW_TITLE)
             .with_decorations(false)
             .with_inner_size([logical.width as f32, logical.height as f32])
             .with_min_inner_size([540.0, 800.0]),

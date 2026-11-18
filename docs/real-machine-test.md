@@ -1,0 +1,64 @@
+# 真机联调步骤（Rust 版 vs 已装的 C# 正式版）
+
+这台机器上同时装着 C# 正式版 `C:\Program Files\SnugWin`（v1.2.0）和 Rust 版重写。
+两边是**同一个产品**，会抢同三样东西：
+
+- 数据目录 `%LOCALAPPDATA%\SnugWin`（`config.json`、`phone-screen.json`、`zoom.json`、`left-behind.json`、`logs\`）
+- 单实例锁 `%LOCALAPPDATA%\SnugWin\snug.lock`
+- 虚拟显示器驱动管道 `\\.\pipe\virtualdisplaydriver` 和"虚拟屏"这块显示设备
+
+所以联调时**必须**做两件事：先退掉 C# 版，再给 Rust 版一个独立数据目录。
+
+## 阶段 A：安全启动（不碰显示配置）
+
+目的：确认托盘、设置窗、单实例、日志、窗口搬运代码在真实环境不炸。
+**这一步不会建虚拟屏**，因为配置里 `phone_screen` 先关掉。
+
+```powershell
+# 1. 独立数据目录，配一份 phone_screen=false 的初始配置
+$home = "$env:USERPROFILE\snug-rs-test"
+New-Item -ItemType Directory -Force "$home\logs" | Out-Null
+'{"phoneScreen":false}' | Set-Content "$home\config.json" -Encoding utf8
+
+# 2. 用隔离目录启动（manifest 是 requireAdministrator，会弹 UAC）
+$env:SNUGWIN_HOME = $home
+.\target\release\snug.exe
+```
+
+要看到的：
+
+- 托盘出现 `snugwin-idle.ico`，提示文字 `SnugWin - 手机屏：关`
+- 双击托盘 / 右键"打开设置与诊断..." → 设置窗四页可翻
+- 设置窗"驱动与日志"页显示管道就绪（这台机器驱动已装）
+- `$home\logs\snug-YYYYMMDD.log` 里有启动行、数据目录行、托盘就绪行
+- 关闭设置窗、托盘"退出 SnugWin（先还原窗口）"能干净退出，托盘图标消失
+
+退出后检查：`%LOCALAPPDATA%\SnugWin\config.json` **时间戳没变**（证明没串到正式版目录）。
+
+## 阶段 B：真接管手机屏（会建虚拟屏，动显示配置）
+
+前提：C# 正式版已经退出（托盘右键退出），否则两边会抢同一个驱动管道。
+
+```powershell
+Stop-Process -Name SnugWin.App -ErrorAction SilentlyContinue
+$env:SNUGWIN_HOME = "$env:USERPROFILE\snug-rs-test"
+# 把 phone_screen 改回 true，或直接在设置窗里开"手机屏"
+.\target\release\snug.exe
+```
+
+要看到的（按日志顺序）：
+
+1. `desk:` 行出现建屏请求，`虚拟屏驱动管道：就绪`
+2. 手机屏阶段 `Preparing` → `Ready`，`display_id` 有值
+3. `手机屏界面已搬到 (x, y) W×H` —— 我们自己的 egui 窗口被 `SetWindowPos` 搬到了虚拟屏上
+4. Windows 显示设置里多出 `Virtual Display` 一块，分辨率符合机型比例
+5. App 资源库里能列出真实运行中的窗口（依赖 `apps` 模块接线完成）
+
+退出时检查归位：被搬到手机屏上的窗口回到原屏幕原位，虚拟屏撤掉，`phone-screen.json` 记下状态。
+
+## 出问题看哪里
+
+- 平台层告警走 `snug_win::set_warn_sink` → 应用日志的 `[Warn]`，不再只进 stderr。
+- 建屏/撤屏失败会按 `5 / 15 / 30` 秒重试三次（C# 同）；日志里能看到每次尝试。
+- 手机屏最短存活 2.5 秒、断开防抖 1.5 秒 + 静默期 5 秒、重连窗口 15 秒——这些是照抄 C# 的时序，
+  联调时如果看到"刚撤又建""建了马上撤"，先对照这几个数，不要先怀疑代码写错。

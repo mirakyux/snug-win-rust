@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState};
+use snug_core::desk::{AppControl, Desk, DeskEvents, DeskOptions, DeskState, PhoneDisplays};
 use snug_core::windows::{AppInfo, WindowInfo};
-use snug_core::{AppConfig, Paths, ScreenFit};
+use snug_core::{AppConfig, Paths, Rect, ScreenFit};
 use snug_win::{WinPhoneDisplays, WinWindows};
 
 /// 判空壳：`apps` 模块（应用枚举/启动/关闭）还没接上时使用。
@@ -48,6 +48,8 @@ impl AppControl for PendingApps {
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
     desk: Desk,
+    /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
+    displays: Arc<WinPhoneDisplays>,
     #[allow(dead_code)] // 后续设置界面/诊断要用
     paths: Paths,
     /// "手动强制手机屏"（C# `UUSensor.ManualOverride`），界面回显用。
@@ -84,7 +86,7 @@ impl Controller {
             events,
         };
 
-        let desk = Desk::new(displays, windows, apps, paths, options);
+        let desk = Desk::new(displays.clone(), windows, apps, paths, options);
         desk.set_wanted(config.phone_screen);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -101,7 +103,7 @@ impl Controller {
             })
             .ok();
 
-        Self { desk, paths: paths.clone(), manual_override: Arc::new(AtomicBool::new(false)), running, worker }
+        Self { desk, displays, paths: paths.clone(), manual_override: Arc::new(AtomicBool::new(false)), running, worker }
     }
 
     pub fn state(&self) -> DeskState {
@@ -141,6 +143,13 @@ impl Controller {
     /// 当前"手动强制"状态（设置窗回显用）。
     pub fn manual_override(&self) -> bool {
         self.manual_override.load(Ordering::Relaxed)
+    }
+
+    /// 手机屏的屏幕矩形（物理像素）。界面窗口要搬到这块屏上，对应 C#
+    /// `PhoneHomeWindow` 跟着 `_displays.BoundsOf(id)` 走。
+    pub fn phone_bounds(&self) -> Option<Rect> {
+        let id = self.desk.state().display_id?;
+        self.displays.bounds_of(id)
     }
 
     /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
