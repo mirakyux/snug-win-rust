@@ -810,8 +810,8 @@ impl eframe::App for PhoneHomeApp {
                     if self.library.needs_scan(false) {
                         self.library.start_scan();
                     }
-                    let apps = self.library.filter_installed(&self.search);
-                    if apps.is_empty() {
+                    let groups = self.library.grouped(&self.search);
+                    if groups.is_empty() {
                         let hint = if !self.library.scanned_once {
                             "正在读取已安装的 App…"
                         } else if self.search.trim().is_empty() {
@@ -824,7 +824,18 @@ impl eframe::App for PhoneHomeApp {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let mut clicked = None;
                         let columns = ((ui.available_width() / TILE).floor() as usize).max(1);
-                        for row in apps.chunks(columns) {
+                        for (letter, apps) in &groups {
+                            // 字母分组头（C# 的列表也是分段的）。
+                            if !letter.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(letter)
+                                        .strong()
+                                        .small()
+                                        .color(egui::Color32::from_gray(150)),
+                                );
+                            }
+                            for row in (*apps).chunks(columns) {
                             ui.horizontal(|ui| {
                                 for app in row {
                                     let texture = self.library.icon(ctx, app);
@@ -891,6 +902,7 @@ impl eframe::App for PhoneHomeApp {
                                     }
                                 }
                             });
+                            }
                         }
                         if let Some(app) = clicked {
                             match self.library.action_for(&app) {

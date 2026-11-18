@@ -173,6 +173,25 @@ impl Library {
         snug_core::apps::search(query, &self.installed, &self.running).apps
     }
 
+    /// 首字母分组（C# `AppList.GroupedByLetter`）：搜索时只有一组、不显示字母头。
+    ///
+    /// 124 个 App 平铺没法用，C# 的列表也是按字母分段的。
+    pub fn grouped(&self, query: &str) -> Vec<(String, Vec<AppInfo>)> {
+        if !query.trim().is_empty() {
+            let apps = self.filter_installed(query);
+            return if apps.is_empty() {
+                Vec::new()
+            } else {
+                vec![(String::new(), apps)]
+            };
+        }
+        let sorted = snug_core::apps::sorted(&self.installed);
+        snug_core::apps::grouped_by_letter(&sorted)
+            .into_iter()
+            .map(|group| (group.letter, group.apps))
+            .collect()
+    }
+
     /// 按查询过滤运行中的窗口（标题拼音匹配）。
     pub fn filter_windows(&self, query: &str) -> Vec<WindowInfo> {
         if query.trim().is_empty() {
