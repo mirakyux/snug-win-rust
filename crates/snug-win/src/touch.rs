@@ -205,7 +205,10 @@ impl HookOutcome {
 /// 时间由调用方给（`time`），所以整条判定链可以离线单测。
 #[derive(Debug)]
 pub struct HookEngine {
-    region: Option<TouchRegion>,
+    /// 全部生效区域（C# v1.3 `_regions`）。
+    regions: Vec<TouchRegion>,
+    /// 本次按住选中的区域（C# `_activeRegion`）；松手/换区域时清掉或重选。
+    active_region: Option<TouchRegion>,
     translator: TouchTranslator,
     options: TouchOptions,
     held_press_point: Option<Point>,
@@ -217,7 +220,8 @@ pub struct HookEngine {
 impl Default for HookEngine {
     fn default() -> Self {
         Self {
-            region: None,
+            regions: Vec::new(),
+            active_region: None,
             translator: TouchTranslator::default(),
             options: TouchOptions::default(),
             held_press_point: None,
@@ -234,12 +238,39 @@ impl HookEngine {
         Self::default()
     }
 
+    /// 当前生效区域：按住的区域优先，否则第一块（C# `region = _activeRegion ?? _regions[0]`）。
     pub fn region(&self) -> Option<TouchRegion> {
-        self.region
+        self.active_region.or_else(|| self.regions.first().copied())
     }
 
+    /// 全部区域（界面/测试用）。
+    pub fn regions(&self) -> &[TouchRegion] {
+        &self.regions
+    }
+
+    /// 换一组区域（C# v1.3 `SetRegions`）。
+    ///
+    /// 如果正按着某块屏（`_activeRegion` 非空），用**按下的那个点**在新列表里重选；
+    /// 清空列表时同时清活动区域并重置翻译器（C# `_translator = default`）。
+    pub fn set_regions(&mut self, regions: Vec<TouchRegion>) {
+        self.regions = regions;
+        if self.regions.is_empty() {
+            self.active_region = None;
+            self.translator = TouchTranslator::default();
+        } else if self.active_region.is_some() {
+            let held = self.held_press_point.unwrap_or(Point::ZERO);
+            self.active_region = self
+                .regions
+                .iter()
+                .find(|region| region.frame.contains(held))
+                .copied()
+                .or_else(|| self.regions.first().copied());
+        }
+    }
+
+    /// 单区域便捷入口（C# `SetRegion`）：`None` 等价于空列表。
     pub fn set_region(&mut self, region: Option<TouchRegion>) {
-        self.region = region;
+        self.set_regions(region.into_iter().collect());
     }
 
     pub fn options(&self) -> TouchOptions {
@@ -290,7 +321,19 @@ impl HookEngine {
         if replay_marked {
             return HookOutcome::pass();
         }
-        let Some(region) = self.region else {
+        if self.regions.is_empty() {
+            return HookOutcome::pass();
+        }
+
+        // C# v1.3：按下的那一刻按落点选区域（落空就留 None，下面退回第一块）。
+        if kind == TouchInputKind::Press {
+            self.active_region = self
+                .regions
+                .iter()
+                .find(|region| region.frame.contains(point))
+                .copied();
+        }
+        let Some(region) = self.region() else {
             return HookOutcome::pass();
         };
 
@@ -299,6 +342,9 @@ impl HookEngine {
         }
 
         if self.require_injected_flag && !injected {
+            if kind == TouchInputKind::Release {
+                self.active_region = None;
+            }
             return HookOutcome::pass();
         }
 
@@ -312,6 +358,7 @@ impl HookEngine {
         if self.passthrough_browser_chrome {
             if kind == TouchInputKind::Release {
                 self.passthrough_browser_chrome = false;
+                self.active_region = None;
             }
             return HookOutcome::pass();
         }
@@ -327,6 +374,7 @@ impl HookEngine {
         let press_origin = self.held_press_point.unwrap_or(Point::ZERO);
         if kind == TouchInputKind::Release {
             self.held_press_point = None;
+            self.active_region = None;
         }
 
         HookOutcome {
@@ -670,19 +718,26 @@ impl TouchHook {
 
     /// 设定生效区域：`None` 表示停掉钩子（手机屏撤了）。
     pub fn set_region(&self, region: Option<TouchRegion>) -> bool {
+        self.set_regions(region.into_iter().collect())
+    }
+
+    /// 设定多块手机屏的生效区域（C# v1.3 `SetRegions`）。
+    ///
+    /// 空列表等价于 `set_region(None)`：停掉钩子。非空时区域由 `HookEngine`
+    /// 按落点选（见 [`HookEngine::set_regions`]）。
+    pub fn set_regions(&self, regions: Vec<TouchRegion>) -> bool {
         {
             let mut engine = match self.engine.lock() {
                 Ok(engine) => engine,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            engine.set_region(region);
+            engine.set_regions(regions.clone());
         }
-        match region {
-            None => {
-                self.stop();
-                true
-            }
-            Some(_) => self.start(),
+        if regions.is_empty() {
+            self.stop();
+            true
+        } else {
+            self.start()
         }
     }
 
@@ -1183,6 +1238,127 @@ mod tests {
         assert!(engine.on_event(TouchInputKind::Release, Point::new(100.0, 390.0), 0.2, true, false, chrome).pass_original);
         // 抬起后旗标复位，下次按下重新接管。
         assert!(!engine.on_event(TouchInputKind::Press, Point::new(100.0, 300.0), 0.3, true, false, no_bubble).pass_original);
+    }
+
+    fn region_at(x: f64, scale: f64) -> TouchRegion {
+        TouchRegion { frame: Rect::new(x, 0.0, 540.0, 950.0), scale, close_button: None }
+    }
+
+    #[test]
+    fn press_selects_the_region_under_the_point() {
+        let first = region_at(0.0, 1.0);
+        let second = region_at(600.0, 2.0);
+        let mut engine = HookEngine::new();
+        engine.set_regions(vec![first, second]);
+
+        // 按在第二块上：之后拖动到第一块范围也仍归第二块（C# 一次按下只认按下点）。
+        let press = engine.on_event(
+            TouchInputKind::Press,
+            Point::new(700.0, 300.0),
+            0.0,
+            true,
+            false,
+            no_bubble,
+        );
+        assert!(!press.pass_original);
+        assert_eq!(engine.region(), Some(second));
+
+        engine.on_event(
+            TouchInputKind::Drag,
+            Point::new(100.0, 300.0),
+            0.05,
+            true,
+            false,
+            no_bubble,
+        );
+        assert_eq!(engine.region(), Some(second), "拖动跨过边界也不换区域");
+
+        // 松手清 active：`region()` 回到第一块（C# `_activeRegion ?? _regions[0]`）。
+        engine.on_event(
+            TouchInputKind::Release,
+            Point::new(700.0, 310.0),
+            0.1,
+            true,
+            false,
+            no_bubble,
+        );
+        assert_eq!(engine.region(), Some(first));
+    }
+
+    #[test]
+    fn press_outside_all_regions_falls_back_to_the_first() {
+        let first = region_at(0.0, 1.0);
+        let second = region_at(600.0, 1.0);
+        let mut engine = HookEngine::new();
+        engine.set_regions(vec![first, second]);
+
+        let outcome = engine.on_event(
+            TouchInputKind::Press,
+            Point::new(2000.0, 300.0),
+            0.0,
+            true,
+            false,
+            no_bubble,
+        );
+        assert!(outcome.pass_original, "区域外的事件要放行");
+        assert_eq!(engine.region(), Some(first), "落空时退回第一块");
+    }
+
+    #[test]
+    fn changing_regions_while_pressed_repicks_by_the_press_point() {
+        let a = region_at(0.0, 1.0);
+        let b = region_at(600.0, 1.0);
+        let c = region_at(600.0, 3.0); // 与 b 同位置，scale 不同，便于区分
+        let mut engine = HookEngine::new();
+        engine.set_regions(vec![a, b]);
+        engine.on_event(
+            TouchInputKind::Press,
+            Point::new(700.0, 300.0),
+            0.0,
+            true,
+            false,
+            no_bubble,
+        );
+        assert_eq!(engine.region(), Some(b));
+
+        // 按住没松时换区域列表：用按下的那个点在新列表里重选。
+        engine.set_regions(vec![a, c]);
+        assert_eq!(engine.region(), Some(c));
+
+        // 新列表谁都不覆盖按下的点 → 退回第一块。
+        engine.set_regions(vec![a]);
+        assert_eq!(engine.region(), Some(a));
+    }
+
+    #[test]
+    fn clearing_regions_resets_active_region_and_translator() {
+        let mut engine = HookEngine::new();
+        engine.set_regions(vec![region()]);
+        engine.on_event(
+            TouchInputKind::Press,
+            Point::new(100.0, 300.0),
+            0.0,
+            true,
+            false,
+            no_bubble,
+        );
+        engine.set_regions(Vec::new());
+        assert!(engine.region().is_none());
+        assert!(!engine.is_coasting(), "清空区域时翻译器也要复位");
+
+        engine.set_regions(vec![region()]);
+        assert_eq!(engine.region(), Some(region()));
+    }
+
+    #[test]
+    fn touch_hook_accepts_multiple_regions_and_stops_when_empty() {
+        let hook = TouchHook::with_parts(Arc::new(WinInput), Arc::new(NoopEvents));
+        assert!(hook.set_regions(Vec::new()));
+        assert!(!hook.is_running(), "空区域要停钩子（C# Stop）");
+
+        // 单区域入口仍可用：空 → 停，非空才装钩子（这里只验证空的那半）。
+        assert!(hook.set_region(None));
+        assert!(!hook.is_running());
     }
 
     #[test]
