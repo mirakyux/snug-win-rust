@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    几何对拍的真值生成器：直接编译参考版 C# 源码（只读引用，不拷贝），
+    导出 screen_fit / crop / placement 三组 TSV，供 Rust 侧 `geometry_parity` 测试断言。
+
+    与 `tools/refdump/refdump.csproj`（拼音 target）互不影响：这是独立工程。
+    跑法：dotnet run --project tools/refdump/geometry -c Release -- tools/geometry-ref
+
+    注意 placement 那组要真的创建 WPF 窗口并调 SetWindowPos（只动自己的窗口，
+    不碰用户任何窗口），所以目标框架是 net10.0-windows + UseWPF；
+    app.manifest 声明 PerMonitorV2，保证 GetWindowRect 返回物理像素而不是被 DPI 虚拟化。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>geometry-dump</AssemblyName>
+    <RootNamespace>GeometryDump</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="NamespaceAnchor.cs" />
+
+    <!-- 参考版源码（只读） -->
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\Geometry.cs" Link="ref\Geometry.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\PhoneModels.cs" Link="ref\PhoneModels.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\ScreenFit.cs" Link="ref\ScreenFit.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Core\PhoneScreen\CropGeometry.cs" Link="ref\CropGeometry.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.Windows\Native\Win32.cs" Link="ref\Win32.cs" />
+    <Compile Include="..\..\..\references\ref-snug-win\src\SnugWin.App\Views\WindowPlacementHelper.cs" Link="ref\WindowPlacementHelper.cs" />
+  </ItemGroup>
+
+</Project>
