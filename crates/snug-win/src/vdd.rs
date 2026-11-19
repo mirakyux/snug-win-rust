@@ -125,9 +125,44 @@ pub fn frame(json: &str) -> Vec<u8> {
     bytes
 }
 
-/// 管道是否可打开（`\\.\pipe\<name>` 存在且能连接）。
+/// 驱动管道在不在（`\\.\pipe\<name>` 存在，也就是"驱动装好且服务起着"）。
+///
+/// **不能只问 `Path::exists()`。** 命名管道的元数据查询依赖"有可用实例"，客户端连接
+/// 占满实例时会直接失败；而且同一个 exe 在不同进程上下文里的结果还不一样——真机上
+/// 从计划任务（开机自启）启动时报"未检测到"，手动双击却报"就绪"，同一台机器同一次连接。
+/// 这道判断题一旦答错，代价是**误判成没装驱动、白跑一遍 msiexec 安装**。
+///
+/// 所以先走 `Path::exists()` 快路，失败再用 `WaitNamedPipe(0)` 复查：它只是问
+/// "有没有可用实例"，不占用实例、不建立连接。只有 `ERROR_FILE_NOT_FOUND` /
+/// `ERROR_PATH_NOT_FOUND` 才算真不存在；`ERROR_SEM_TIMEOUT`（实例全忙，管道在）、
+/// 拒绝访问（管道在但不给我们连）都算存在。
 pub fn is_driver_pipe_available(name: &str) -> bool {
-    pipe_path(name).exists()
+    if pipe_path(name).exists() {
+        return true;
+    }
+    wait_named_pipe_exists(name)
+}
+
+/// [`is_driver_pipe_available`] 的兜底判定：见那里的注释。
+fn wait_named_pipe_exists(name: &str) -> bool {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+
+    unsafe extern "system" {
+        fn WaitNamedPipeW(lp_named_pipe_name: *const u16, n_time_out: u32) -> i32;
+    }
+
+    let mut wide: Vec<u16> = format!(r"\\.\pipe\{name}").encode_utf16().collect();
+    wide.push(0);
+    // 超时 0 = 只问一句，不排队等。
+    let ok = unsafe { WaitNamedPipeW(wide.as_ptr(), 0) };
+    if ok != 0 {
+        return true;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND)
+    )
 }
 
 fn pipe_path(name: &str) -> std::path::PathBuf {
@@ -564,6 +599,69 @@ mod tests {
     fn pipe_availability_is_false_without_driver() {
         // 真机上没装驱动时必须安全返回 false，不能 panic。
         assert!(!is_driver_pipe_available("snug-rs-test-pipe-that-does-not-exist"));
+    }
+
+    /// 真机 bug 的回归：**已连接（实例全忙）的管道必须算"存在"**。
+    ///
+    /// 只问 `Path::exists()` 的老实现在这里就会答错——元数据查询依赖可用实例，
+    /// 而计划任务上下文里它就是这么失败的。答错的代价是白跑一遍驱动安装。
+    #[test]
+    fn busy_pipe_still_counts_as_available() {
+        let name = format!("snug-rs-test-busy-{}", std::process::id());
+        let _server = PipeServer::create(&name);
+        // 连上一个客户端 → 这个只有 1 个实例的管道就"忙"了。
+        let _client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_path(&name))
+            .expect("客户端应当能连上测试管道");
+        assert!(
+            is_driver_pipe_available(&name),
+            "管道存在且正忙时不能说驱动没装"
+        );
+    }
+
+    /// 一个只有 1 个实例的命名管道服务端，只用于测试探测逻辑。
+    struct PipeServer(*mut core::ffi::c_void);
+
+    impl PipeServer {
+        fn create(name: &str) -> Self {
+            const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+            unsafe extern "system" {
+                fn CreateNamedPipeW(
+                    lp_name: *const u16,
+                    dw_open_mode: u32,
+                    dw_pipe_mode: u32,
+                    n_max_instances: u32,
+                    n_out_buffer_size: u32,
+                    n_in_buffer_size: u32,
+                    n_default_time_out: u32,
+                    lp_security_attributes: *mut core::ffi::c_void,
+                ) -> *mut core::ffi::c_void;
+            }
+            let mut wide: Vec<u16> = format!(r"\\.\pipe\{name}").encode_utf16().collect();
+            wide.push(0);
+            let handle = unsafe {
+                CreateNamedPipeW(wide.as_ptr(), PIPE_ACCESS_DUPLEX, 0, 1, 4096, 4096, 0, std::ptr::null_mut())
+            };
+            assert_ne!(
+                handle as isize, -1,
+                "CreateNamedPipeW 失败：{}",
+                std::io::Error::last_os_error()
+            );
+            Self(handle)
+        }
+    }
+
+    impl Drop for PipeServer {
+        fn drop(&mut self) {
+            unsafe extern "system" {
+                fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            }
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
 
     // ----- 连接缓存与重连（假管道，绝不碰真驱动） -----

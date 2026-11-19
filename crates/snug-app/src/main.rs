@@ -48,7 +48,20 @@ fn main() -> eframe::Result<()> {
             crate::warn!("已有实例在运行，本次退出");
             logging::shutdown();
             return Ok(());
-        }    };
+        }
+    };
+
+    // `--minimized` 是开机自启那条计划任务的参数（C# `StartupTaskDefinition.MinimizedArg`）。
+    // 以前这个参数没人解析，等于自启和手动启动长得一样；现在它决定"要不要闪一次窗"。
+    let start_minimized = has_minimized_flag(std::env::args().skip(1));
+    crate::info!(
+        "启动形态：{}",
+        if start_minimized {
+            "开机自启（--minimized，不闪窗、不抢焦点）"
+        } else {
+            "手动启动"
+        }
+    );
 
     crate::debug!("数据目录 {}", paths.data_dir().display());
 
@@ -77,14 +90,22 @@ fn main() -> eframe::Result<()> {
     let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
     let logical = fit.size(fit.base_width());
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(ui::WINDOW_TITLE)
+        .with_decorations(false)
+        // 不进任务栏：手机屏界面不是"应用程序窗口"，和 C# 的 HomeBar/PhoneHome 一样。
+        .with_taskbar(false)
+        .with_inner_size([logical.width as f32, logical.height as f32])
+        .with_min_inner_size([540.0, 800.0]);
+    if start_minimized {
+        // 开机自启时**别在主屏上闪一下**：先建在屏幕外，等手机屏就绪由 `sync_window`
+        // 摆到虚拟屏上。这里不用 `Visible(false)`——真机验证过，窗口一隐藏 eframe
+        // 就不再出帧，托盘点击、退出请求、搬窗会全部失效。
+        viewport = viewport.with_position([-30_000.0, -30_000.0]);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(ui::WINDOW_TITLE)
-            .with_decorations(false)
-            // 不进任务栏：手机屏界面不是"应用程序窗口"，和 C# 的 HomeBar/PhoneHome 一样。
-            .with_taskbar(false)
-            .with_inner_size([logical.width as f32, logical.height as f32])
-            .with_min_inner_size([540.0, 800.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -119,6 +140,7 @@ fn main() -> eframe::Result<()> {
                 catalog,
                 paths.clone(),
                 pipe_ready,
+                start_minimized,
                 controller,
             )))
         }),
@@ -217,5 +239,35 @@ fn acquire_single_instance(paths: &Paths) -> Option<File> {
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(_) => None,
+    }
+}
+
+/// 命令行里有没有 `--minimized`。
+///
+/// C# 用 `StringComparison.OrdinalIgnoreCase` 比，这里也一样：计划任务里写的是小写，
+/// 但有人手动拼 `--MINIMIZED` 也应当认。
+fn has_minimized_flag(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg.eq_ignore_ascii_case("--minimized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_minimized_flag;
+
+    #[test]
+    fn minimized_flag_is_recognized_regardless_of_case() {
+        assert!(has_minimized_flag(["--minimized".to_string()]));
+        assert!(has_minimized_flag(["--MINIMIZED".to_string()]));
+        assert!(has_minimized_flag(["--Minimized".to_string()]));
+    }
+
+    #[test]
+    fn minimized_flag_needs_other_args_to_be_ignored() {
+        assert!(!has_minimized_flag(Vec::new()));
+        assert!(!has_minimized_flag(["--other".to_string(), "minimized".to_string()]));
+        assert!(has_minimized_flag([
+            "--other".to_string(),
+            "--minimized".to_string()
+        ]));
     }
 }

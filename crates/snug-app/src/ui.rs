@@ -62,6 +62,12 @@ pub struct PhoneHomeApp {
     pub shots: crate::shots::Shots,
     /// "选后复制"的气泡（选区结束才弹）。
     pub bubble: crate::bubble::CopyBubble,
+    /// 启动时带了 `--minimized`（开机自启，C# `StartupTaskDefinition.MinimizedArg`）。
+    ///
+    /// 我们只有一个窗口，没有 C# 那种"启动就弹设置窗"的行为，所以这个标记的全部作用就是
+    /// **不闪窗、不抢焦点**：窗口先建在屏幕外，等手机屏就绪再摆上去；升级后重启也沿用
+    /// 这个形态。
+    pub start_minimized: bool,
     /// 界面窗口当前是不是被挪到屏幕外待命（避免反复 SetWindowPos）。
     pub last_offscreen: Option<bool>,
     /// 收尾是否已经做过（`on_exit` 与 `Drop` 都会调，必须幂等）。
@@ -118,6 +124,7 @@ impl PhoneHomeApp {
         catalog: Option<PhoneCatalog>,
         paths: Paths,
         pipe_ready: bool,
+        start_minimized: bool,
         controller: Controller,
     ) -> Self {
         let mut settings = SettingsWindow::new();
@@ -156,6 +163,7 @@ impl PhoneHomeApp {
             shots: crate::shots::Shots::new(std::sync::Arc::new(|| {})),
             bubble: crate::bubble::CopyBubble::new(),
             finished: false,
+            start_minimized,
             last_offscreen: None,
             preview: None,
             // 真正的应用发生在 `update()` 第一帧（那里才拿得到 `Context`）。
@@ -412,7 +420,11 @@ impl PhoneHomeApp {
                                 prepared.version
                             );
                             self.settings.set_update_state(UpdateUiState::Ready);
-                            match snug_win::update::launch_apply_script(&prepared, true) {
+                            // 换完再起来的那个实例要沿用这次的启动形态（C#
+                            // `ApplyPreparedUpdateAndRestartAsync` 也是读自己的命令行）：
+                            // 开机自启起来的就该还是静默的，不该因为一次升级变成弹窗。
+                            let relaunch_minimized = self.start_minimized;
+                            match snug_win::update::launch_apply_script(&prepared, relaunch_minimized) {
                                 Ok(script) => {
                                     crate::info!("设置：替换脚本已启动 {}，本进程退出", script.display());
                                     self.request_exit = true;
