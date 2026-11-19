@@ -316,6 +316,14 @@ pub fn zoom_step_keys(steps: i32) -> Vec<u16> {
 pub trait WindowApi: Send + Sync {
     /// 所有顶层窗口的状态（`EnumWindows` 的批量版本）。
     fn probes(&self) -> Vec<WindowProbe>;
+    /// 只探测某个进程的顶层窗口。
+    ///
+    /// 默认实现是"全量探测再过滤"，语义一样但白扫一遍：真机上 708 个顶层窗口，
+    /// 每多扫一次就是几毫秒到一秒半（见 [`WinDesktop::probes`]）。真机实现改成在
+    /// `EnumWindows` 回调里先比 pid，只对命中的窗口做完整探测。
+    fn probes_of(&self, pid: i32) -> Vec<WindowProbe> {
+        self.probes().into_iter().filter(|probe| probe.pid == pid).collect()
+    }
     /// 单个窗口的状态；窗口已经没了（或不是窗口）返回 `None`。
     fn probe(&self, handle: u64) -> Option<WindowProbe>;
     fn process_meta(&self, pid: i32) -> ProcessMeta;
@@ -424,7 +432,12 @@ impl<A: WindowApi> Windows<A> {
     /// 这批窗口的可见边框（C# `FramesAsync` / `SnapshotAsync` 的公共部分）。
     fn frames_of(&self, pid_filter: Option<i32>) -> HashMap<WindowKey, Rect> {
         let self_pid = std::process::id() as i32;
-        let probes = self.api.probes();
+        // 按 pid 查时走 `probes_of`：真机上一个 pid 通常只有 1–2 个窗口，
+        // 全量探测 708 个再过滤纯属白扫（标题缓存那条路径曾是 1.5 秒）。
+        let probes = match pid_filter {
+            Some(pid) if pid != self_pid => self.api.probes_of(pid),
+            _ => self.api.probes(),
+        };
         let windows = enumerate_standard(&probes, self_pid, pid_filter, false, |pid| {
             self.api.process_meta(pid)
         });
@@ -545,14 +558,16 @@ impl<A: WindowApi> WindowControl for Windows<A> {
 
     fn shown_windows(&self, pid: i32) -> Vec<WindowInfo> {
         let self_pid = std::process::id() as i32;
-        let probes = self.api.probes();
+        let probes = if pid == self_pid { self.api.probes() } else { self.api.probes_of(pid) };
         enumerate_standard(&probes, self_pid, Some(pid), false, |pid| {
             self.api.process_meta(pid)
         })
     }
 
     fn asking_window(&self, pid: i32) -> Option<WindowInfo> {
-        asking_window(&self.api.probes(), pid, |pid| self.api.process_meta(pid))
+        let self_pid = std::process::id() as i32;
+        let probes = if pid == self_pid { self.api.probes() } else { self.api.probes_of(pid) };
+        asking_window(&probes, pid, |pid| self.api.process_meta(pid))
     }
 
     fn close(&self, window: WindowKey) -> bool {
@@ -664,34 +679,26 @@ impl WinDesktop {
         String::from_utf16_lossy(&buffer[..len as usize])
     }
 
-    /// 读窗口标题。
+    /// 读窗口标题（**只用于别的进程的窗口**）。
     ///
-    /// **不能用 `GetWindowTextW`**：对同进程窗口它会同步投递 `WM_GETTEXT`，如果那个窗口
-    /// 所属线程此刻正阻塞（收尾时 UI 线程在等 desk 线程完成撤屏），就会自己等自己 ——
-    /// 真机上「退出卡死、虚拟屏残留」正是这条路径：desk 线程扫窗口快照时读到了我们自己
-    /// 的 egui 窗口。改成带超时的发送，读不到就返回空串（快照本来也不需要自己的标题）。
+    /// 真机实测（708 个顶层窗口）：用 `SendMessageTimeoutW(WM_GETTEXT, 150ms)` 逐个同步问，
+    /// 累计 **1499ms**；用 `GetWindowTextW` 只读窗口标题缓存，累计 **0.8ms**，
+    /// 而且 438 个非空标题**一个字符都不差**。这一秒半原先全花在共享 lane 上：
+    /// `check_returns` 每 5 秒要枚举两次窗口，于是点 App 的动作排在它后面等 3 秒，
+    /// 表现为「点了半天才反应」。
+    ///
+    /// 这里**不能**用 `GetWindowTextW` 读自己进程的窗口：那会同步投递 `WM_GETTEXT`，
+    /// 自己的界面线程若正阻塞（收尾时在等 desk 线程撤屏）就会自己等自己——真机上
+    /// 「退出卡死、虚拟屏残留」正是这条路径。所以调用方（[`Self::probe_window`]）对
+    /// 自己的进程直接跳过标题。跨进程的 `GetWindowTextW` 只读缓存、不发消息，
+    /// 对端卡死也不会拖住我们（MSDN 明确说明这正是它的设计意图）。
     fn window_title(window: HWND) -> String {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_GETTEXT,
-        };
         let mut buffer = [0u16; 512];
-        let mut result = 0usize;
-        let ok = unsafe {
-            SendMessageTimeoutW(
-                window,
-                WM_GETTEXT,
-                WPARAM(buffer.len()),
-                LPARAM(buffer.as_mut_ptr() as isize),
-                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                150,
-                Some(&mut result),
-            )
-        };
-        if ok.0 == 0 {
+        let len = unsafe { GetWindowTextW(window, &mut buffer) };
+        if len <= 0 {
             return String::new();
         }
-        let written = result.min(buffer.len());
-        String::from_utf16_lossy(&buffer[..written])
+        String::from_utf16_lossy(&buffer[..(len as usize).min(buffer.len())])
     }
 
     /// 一次把这个窗口的样式、状态、类名、标题全查出来。
@@ -751,6 +758,26 @@ unsafe extern "system" fn collect_window(window: HWND, data: LPARAM) -> BOOL {
     if data.0 != 0 {
         let handles = unsafe { &mut *(data.0 as *mut Vec<u64>) };
         handles.push(window.0 as usize as u64);
+    }
+    BOOL(1)
+}
+
+/// `probes_of` 的枚举状态：只要命中 pid 的句柄。
+struct CollectOfPid<'a> {
+    pid: i32,
+    handles: &'a mut Vec<u64>,
+}
+
+/// 与 [`collect_window`] 相同，但先在 `EnumWindows` 回调里按 pid 过滤，
+/// 避免为无关窗口做完整探测（真机上那是 700 多个窗口）。
+unsafe extern "system" fn collect_window_of_pid(window: HWND, data: LPARAM) -> BOOL {
+    if data.0 != 0 {
+        let state = unsafe { &mut *(data.0 as *mut CollectOfPid) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        if pid as i32 == state.pid {
+            state.handles.push(window.0 as usize as u64);
+        }
     }
     BOOL(1)
 }
@@ -847,6 +874,20 @@ impl WindowApi for WinDesktop {
             }
         }
         out
+    }
+
+    fn probes_of(&self, pid: i32) -> Vec<WindowProbe> {
+        let mut handles: Vec<u64> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(
+                Some(collect_window_of_pid),
+                LPARAM(&mut CollectOfPid { pid, handles: &mut handles } as *mut _ as isize),
+            );
+        }
+        handles
+            .into_iter()
+            .filter_map(Self::probe_window)
+            .collect()
     }
 
     fn probe(&self, handle: u64) -> Option<WindowProbe> {
