@@ -8,7 +8,7 @@
 | 项 | 大小 | 时间 |
 | --- | --- | --- |
 | `target/release-check/release/snug.exe`（1.3.0） | 6,906,368 B（6.59 MiB） | 2026-11-19 |
-| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 3,206,336 B（3.06 MiB） | 2026-11-19 |
+| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 3,206,182 B（3.06 MiB） | 2026-11-19 |
 
 历史：5.09 MiB → 6.13 MiB（加托盘、截图、UU 探测、App 资源库）
 → 6.26 MiB（修 bug）→ 6.56 MiB（多屏 `DeskSet`、主题、控制中心设置页、重入胶囊）
