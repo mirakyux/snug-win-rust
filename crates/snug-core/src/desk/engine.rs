@@ -1390,6 +1390,19 @@ impl DeskCore {
 
     /// 对应 C# `FillAsync`：把窗口挪进手机屏（必要时换更宽的档位）。
     fn fill(&mut self, placement: &mut Placement, id: u32) -> Option<Rect> {
+        self.fill_steps(placement, id, 0)
+    }
+
+    /// 换档最多走几轮。
+    ///
+    /// C# 是无限递归（换到不再需要换为止），但它没遇到过"窗口永远比可放区域高一截"
+    /// 的情况。真机上 QQ 就是这样：850 宽时窗口高 2990、可放区域 2818，差 172；
+    /// 加到 910 又差 178；加到 970 还差——**每加宽一档，窗口跟着长高**，屏幕只会
+    /// 被无限推宽，而每次加宽都是一次显示模式变更（0.5–0.9 秒）。
+    /// 所以这里封顶：走两轮还铺不满就先这样，别再为它改显示配置。
+    const WIDEN_STEPS_LIMIT: usize = 2;
+
+    fn fill_steps(&mut self, placement: &mut Placement, id: u32, steps: usize) -> Option<Rect> {
         // 每一步都量一下：真机上"点 App 要等 5 秒"，光看日志看不出是换屏宽、
         // 挪窗口还是 UIA 找关闭按钮吃掉的。单步超过 300ms 就记一行。
         let mut started = std::time::Instant::now();
@@ -1410,11 +1423,16 @@ impl DeskCore {
         // 不必去查（真机单轮 500–1500ms）。阶梯换成最终档后才查一次。
         let placed_at_origin = (got.min_x() - area.min_x()).abs() < 2.0
             && (got.min_y() - area.min_y()).abs() < 2.0;
+        // **只有高度溢出一点点时不要换档。** 窗口的最小尺寸常常跟着屏宽一起长：
+        // 真机上 QQ 在 850 宽时高 2990、可放区域 2818（差 6%），加到 910 还是差 6%，
+        // 加到 970 还差——每加宽一档它就再长高一点，屏幕被无限推宽，而每次加宽
+        // 都是一次 0.5–0.9 秒的显示模式变更。宽度已经放得下就别再追高度了。
+        let height_overflow_is_small = got.width <= area.width + 2.0 && got.height < area.height * 1.1;
         let next_width = self
             .shared
             .displays
             .width_of(id)
-            .filter(|_| placed_at_origin)
+            .filter(|_| placed_at_origin && !height_overflow_is_small)
             .map(|current| {
                 self.current_screen_fit()
                     .width_to_fit(got.size(), area.size(), current)
@@ -1429,16 +1447,12 @@ impl DeskCore {
         if placement.asking {
             self.set_state(self.state().with_close_button(None));
         } else if next_width.is_none() {
-            started = std::time::Instant::now();
-            let close_button = self.shared.windows.close_button(placement.window.key).map(|rect| {
-                CloseButton {
-                    frame: rect,
-                    window_handle: placement.window.key.handle,
-                    window_frame: got,
-                }
-            });
-            self.set_state(self.state().with_close_button(close_button));
-            ms_close = started.elapsed().as_secs_f64() * 1000.0;
+            // 找关闭按钮要问 UIA，真机 0.6–1.5 秒。它挡在"窗口已经铺好"这条状态
+            // **前面**，用户看到的就是"点完等半天界面才变"。改成排在当前动作之后再查：
+            // 铺好的状态立刻发布，按钮晚一秒出现（拖动窗口时才用得上）。
+            let key = placement.window.key;
+            self.slot.run(move |core: &mut DeskCore| core.refresh_close_button(key));
+            ms_close = 0.0;
         }
         for (what, ms) in [("换屏宽", ms_switch), ("挪窗口", ms_move), ("找关闭按钮", ms_close)] {
             if ms >= 300.0 {
@@ -1451,6 +1465,21 @@ impl DeskCore {
             self.learn_width(&placement.window, placement.width);
             return Some(got);
         };
+        if steps >= Self::WIDEN_STEPS_LIMIT {
+            // 已经换过几档还铺不满：窗口自己不肯缩（比如它的最小尺寸跟着屏宽一起长）。
+            // 再换下去只会无限推宽屏幕、每轮多花半秒多，先按现状铺着，并记住这一档，
+            // 免得下次又从基础宽重走一遍。
+            self.log(format!(
+                "{} 换了 {} 档屏宽仍铺不满（可放区域 {}，实际 {}），先按 {} 宽铺着",
+                placement.window.label(),
+                steps,
+                area.short(),
+                got.short(),
+                placement.width
+            ));
+            self.learn_width(&placement.window, placement.width);
+            return Some(got);
+        }
         self.log(format!(
             "{} 在 {} 宽铺不满（可放区域 {}，实际 {}），换到 {} 宽",
             placement.window.label(),
@@ -1460,7 +1489,29 @@ impl DeskCore {
             next_width
         ));
         placement.width = next_width;
-        self.fill(placement, id)
+        self.fill_steps(placement, id, steps + 1)
+    }
+
+    /// 后排一次"去问 UIA 要关闭按钮位置"（真机 0.6–1.5 秒，不能挡在铺好状态前面）。
+    fn refresh_close_button(&mut self, key: WindowKey) {
+        let started = std::time::Instant::now();
+        let rect = self.shared.windows.close_button(key);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms >= 300.0 {
+            self.log(format!("[耗时] 找关闭按钮 {ms:.0}ms（铺好之后补）"));
+        }
+        // 期间用户可能已经回列表或换了窗口，结果只认还是同一个铺着的窗口。
+        let Some(placement) = self.placement.clone() else {
+            return;
+        };
+        if placement.window.key != key {
+            return;
+        }
+        let Some(window_frame) = placement.settled else {
+            return;
+        };
+        let button = rect.map(|frame| CloseButton { frame, window_handle: key.handle, window_frame });
+        self.set_state(self.state().with_close_button(button));
     }
 
     /// 记住"这个 App 上次铺满用的是哪一档屏宽"（存在共享盘上，跨进程有效）。

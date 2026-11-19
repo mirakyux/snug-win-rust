@@ -590,7 +590,18 @@ impl PhoneHomeApp {
             //
             // 这里**不能**再发 `ViewportCommand::InnerSize`：那是 egui 的逻辑点，eframe 会按
             // `pixels_per_point` 换算回物理像素，和 `SetWindowPos` 抢同一个窗口尺寸。
-            let request = snug_win::PlacementRequest::new(bounds);
+            let mut request = snug_win::PlacementRequest::new(bounds);
+            // `WS_EX_NOACTIVATE` 不能一直钉着：钉住以后这个窗口**永远拿不到键盘焦点**，
+            // 资源库上的搜索框点了也打不出字（真机反馈）。
+            //
+            // C# 是按需设的（`PhoneHomeWindow.ShowOnDisplay` 里
+            // `noActivate: !AcceptsKeys`）：只有"屏幕上是一个铺好的 App、界面只剩底下那条"
+            // 时才不抢焦点。我们照这个口径：整屏资源库、设置、预览这些"要输入"的形态
+            // 允许被点击激活；只剩底部指示条/胶囊时仍然不抢。
+            //
+            // 注意 `focus_if_activated` 保持 false：允许被**点**激活，但绝不主动抢前台，
+            // 否则每一帧摆窗口都会把焦点从用户正在用的窗口上抢走。
+            request.no_activate = showing_bar || self.pill_mode();
             if snug_win::apply_placement(hwnd, &request) {
                 crate::info!(
                     "{}：{}，搬到 ({}, {}) {}×{}",
@@ -1152,27 +1163,27 @@ impl eframe::App for PhoneHomeApp {
                 );
 
                 ui.add_space(8.0);
-                let half = ((ui.available_width() - 8.0) / 2.0).max(120.0);
+                // 两个页签平分配对宽度，并且**始终画底**。
+                //
+                // 原先用 `egui::Button::selectable`，它等价于 `frame_when_inactive(false)`：
+                // 没选中、没悬停时连底板都不画，只剩一行字贴在面板底色上——真机上
+                // "未选中的那个页签看不见"。这里改成显式给底色与文字色，
+                // 不再依赖 `WidgetVisuals` 的默认值。
+                let spacing = ui.spacing().item_spacing.x;
+                let tab_width = ((ui.available_width() - spacing) / 2.0).max(120.0);
+                let palette = self.palette;
+                let mut switched_to = None;
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            [half, 44.0],
-                            egui::Button::selectable(self.tab == HomeTab::Running, "运行中"),
-                        )
-                        .clicked()
-                    {
-                        self.tab = HomeTab::Running;
+                    if tab_button(ui, tab_width, palette, self.tab == HomeTab::Running, "运行中") {
+                        switched_to = Some(HomeTab::Running);
                     }
-                    if ui
-                        .add_sized(
-                            [half, 44.0],
-                            egui::Button::selectable(self.tab == HomeTab::All, "全部"),
-                        )
-                        .clicked()
-                    {
-                        self.tab = HomeTab::All;
+                    if tab_button(ui, tab_width, palette, self.tab == HomeTab::All, "全部") {
+                        switched_to = Some(HomeTab::All);
                     }
                 });
+                if let Some(tab) = switched_to {
+                    self.tab = tab;
+                }
 
                 // 多屏：一块屏一个 desk，这里选当前显示哪块（C# 是一块屏一个窗口）。
                 let screens = self.controller.touch_screens();
@@ -1486,6 +1497,33 @@ impl eframe::App for PhoneHomeApp {
 /// 资源库图标网格的列数：横屏 6 列、竖屏 4 列（C# `UpdateResponsiveLayout` 同）。
 fn grid_columns(landscape: bool) -> usize {
     if landscape { 6 } else { 4 }
+}
+
+/// 资源库顶部的一个页签（"运行中" / "全部"）。
+///
+/// 不用 `egui::Button::selectable`：它等价于 `frame_when_inactive(false)`，
+/// 没选中也没悬停时连底板都不画，真机上那个页签看起来就是"不见了"。
+/// 这里显式给底色与文字色，两种主题下都有足够对比。
+fn tab_button(
+    ui: &mut egui::Ui,
+    width: f32,
+    palette: crate::theme::Palette,
+    selected: bool,
+    label: &str,
+) -> bool {
+    let (fill, text_color) = if selected {
+        (palette.accent, egui::Color32::WHITE)
+    } else {
+        (palette.card, palette.text)
+    };
+    let text = egui::RichText::new(label).size(15.0).color(text_color);
+    ui.add_sized(
+        [width, 44.0],
+        egui::Button::new(text)
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0_f32, palette.card_hover)),
+    )
+    .clicked()
 }
 
 fn locate_driver_script() -> Option<std::path::PathBuf> {
