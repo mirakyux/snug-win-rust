@@ -90,6 +90,11 @@ impl Tray {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            // 这个初始值同时会成为 tray-icon 那个隐藏窗口的**窗口标题**，后续
+            // `set_tooltip` 只改 szTip、不改标题。所以 UIA 里读到的是
+            // "<初始值> <当前 szTip>" 两段（真机：`SnugWin - UU远程手机竖屏伴侣
+            // SnugWin - 手机屏：关`）；鼠标悬停看到的是 szTip，是正确的。
+            // crate 没有"改窗口标题"的接口，这里不折腾，保留产品名。
             .with_tooltip("SnugWin - UU远程手机竖屏伴侣")
             .with_icon(icon)
             .build()

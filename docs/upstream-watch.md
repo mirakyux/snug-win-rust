@@ -90,8 +90,14 @@ GitHub API（`api.github.com`）直连可用，查提交列表用它最快。
 
 ### 仍未知 / 未验证
 
-- 托盘右键菜单与双击行为：UIA 能读到图标（`SnugWin - 手机屏：关`），但用 `SendInput` 模拟点击始终没命中（DPI 虚拟化导致坐标偏差，`SetProcessDpiAwarenessContext` 无效）。用户实际点过是好的。
-- 托盘 tooltip 在 UIA 里两段粘在一起（`SnugWin - UU远程手机竖屏伴侣 SnugWin - 手机屏：在线`），未确认是否 bug。
+- 托盘右键菜单与双击行为：UIA 能读到图标（`SnugWin - 手机屏：关`），`SendInput` 模拟点击
+  始终没命中（DPI 虚拟化导致坐标偏差，`SetProcessDpiAwarenessContext` 无效）；
+  2026-11-19 又试了 **UIA 的 `InvokePattern`**，日志没有任何反应（`tray-icon` 的按钮不响应
+  UIA 调用）。结论：托盘/设置窗只能手点。用户实际点过是好的。
+- 托盘 tooltip 在 UIA 里两段粘在一起（`SnugWin - UU远程手机竖屏伴侣 SnugWin - 手机屏：在线`）：
+  **已确认不是 bug**。`tray-icon` 把初始 tooltip 同时用作隐藏窗口的窗口标题，之后
+  `set_tooltip` 只改 `NOTIFYICONDATA.szTip`、不改标题，于是 UIA 的 Name = 标题 + szTip；
+  鼠标悬停看到的是 szTip（干净的一行）。crate 没有改窗口标题的接口，保留现状（`tray.rs` 有注释）。
 
 ## C# 1.3.0 里其它小改动（逐文件数过）
 
