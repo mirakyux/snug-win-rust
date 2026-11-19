@@ -234,6 +234,7 @@ impl Controller {
                 let started = clock;
                 let mut last_sample = -1.0_f64;
                 let mut last_topology_check = -1.0_f64;
+                let mut last_check_returns = -1.0_f64;
                 let mut last_connected = false;
                 let mut last_signals: Option<(bool, bool, Option<bool>, bool)> = None;
                 while stop.load(Ordering::Relaxed) {
@@ -259,8 +260,17 @@ impl Controller {
                     // 更糟的是这期间 `set_wishes` 进不去，会话结束时撤屏会被推迟，
                     // "退出远控后虚拟屏还挂着"那个 bug 会原样复现。
                     // 重试与 watch 都是独立线程、自己会推进；`check_returns` 只是入队。
-                    if let Ok(desks) = desks_worker.lock() {
-                        desks.check_returns();
+                    // `check_returns` 在有 left-behind 条目时要枚举窗口、读标题，
+                    // 单次真机实测 **3 秒**。原先每拍（500ms）入队 → 生产 2 个/秒、
+                    // 消费 0.33 个/秒 → 共享队列无限积压（`[lane] 动作排队 219.8s`），
+                    // 用户点 App 要排几分钟才执行。现在 5 秒一次：被接管的窗口晚几秒
+                    // 回来用户无感，队列也不会被堵。
+                    let now = started.elapsed().as_secs_f64();
+                    if now - last_check_returns >= 5.0 {
+                        last_check_returns = now;
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.check_returns();
+                        }
                     }
                     publish_snapshots(&desks_worker, &snapshots_worker);
                     // 用户点了窗口自带的关闭按钮（C# `_desks.ClosePlaced(handle)`）。

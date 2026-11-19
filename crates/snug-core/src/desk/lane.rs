@@ -13,11 +13,19 @@
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
+/// 单个动作排队或执行超过这个时长就写一行 stderr。
+///
+/// 界面里"点了没反应"最常见的原因就是队列积压或单个动作过慢（改显示配置、枚举窗口），
+/// 正常动作都是毫秒级，超过 3 秒一定有问题。真机联调时把 stderr 重定向到文件即可看到。
+const SLOW_THRESHOLD: f64 = 3.0;
+
 enum LaneJob<T> {
     Run {
         run: Box<dyn FnOnce(&mut T) + Send>,
         /// `call()` 用来等这一条执行完；`run()` 不填。
         done: Option<Sender<()>>,
+        /// 入队时刻：执行时算"排了多久"，真机调试队列积压用。
+        queued_at: std::time::Instant,
     },
     /// 关闭工作线程。桌面状态自己攥着发送端，靠这条消息才能停下来。
     Stop,
@@ -47,8 +55,19 @@ impl<T: Send + 'static> SerialLane<T> {
                 let mut state = state;
                 while let Ok(job) = rx.recv() {
                     match job {
-                        LaneJob::Run { run, done } => {
+                        LaneJob::Run { run, done, queued_at } => {
+                            // 队列积压/动作过慢是"界面点了没反应"的头号嫌疑，超过阈值
+                            // 就写一行 stderr（真机联调时把 stderr 重定向到文件看）。
+                            let waited = queued_at.elapsed().as_secs_f64();
+                            if waited > SLOW_THRESHOLD {
+                                eprintln!("[lane] 动作排队 {waited:.1}s 才轮到");
+                            }
+                            let started = std::time::Instant::now();
                             run(&mut state);
+                            let took = started.elapsed().as_secs_f64();
+                            if took > SLOW_THRESHOLD {
+                                eprintln!("[lane] 单个动作执行了 {took:.1}s");
+                            }
                             if let Some(done) = done {
                                 let _ = done.send(());
                             }
@@ -69,7 +88,7 @@ impl<T: Send + 'static> SerialLane<T> {
 
     /// 入队一个动作，不等它执行（对应 C# `_lane.Run`）。
     pub(crate) fn run(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
-        let _ = self.tx.send(LaneJob::Run { run: Box::new(operation), done: None });
+        let _ = self.tx.send(LaneJob::Run { run: Box::new(operation), done: None, queued_at: std::time::Instant::now() });
     }
 
     /// 入队并等它执行完；供 watch 线程等一次桌面动作返回。
@@ -77,11 +96,28 @@ impl<T: Send + 'static> SerialLane<T> {
     /// 不要在队列里的动作内部调用，否则工作线程会等自己（死锁）。
     pub(crate) fn call(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
         let (done, wait) = channel();
-        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done) }).is_err() {
+        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done), queued_at: std::time::Instant::now() }).is_err() {
             // 工作线程已经退出，不再等待。
             return;
         }
         let _ = wait.recv();
+    }
+
+    /// 入队并等它执行完，最多等 `timeout`；返回是否真的执行完了。
+    ///
+    /// 给**收尾**用：退出时不能无限等在飞的长动作（一次建屏 = 8 秒 × 候选数，
+    /// 后面还可能跟着最短存活 2.5 秒与拓扑沉降 1 秒）。超时说明这条动作没跑完，
+    /// 调用方要把"没撤干净"记进日志；虚拟屏由归属记录在下次启动时兜底清理。
+    pub(crate) fn call_timeout(
+        &self,
+        timeout: std::time::Duration,
+        operation: impl FnOnce(&mut T) + Send + 'static,
+    ) -> bool {
+        let (done, wait) = channel();
+        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done), queued_at: std::time::Instant::now() }).is_err() {
+            return false;
+        }
+        wait.recv_timeout(timeout).is_ok()
     }
 
     /// 等此前入队的动作全部执行完（对应 C# `DrainAsync`）。

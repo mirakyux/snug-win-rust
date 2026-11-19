@@ -1460,7 +1460,7 @@ impl eframe::App for PhoneHomeApp {
             close_window = None;
         }
         if let Some(window) = pull_window {
-            crate::info!("资源库：铺开 {}", window.label());
+            crate::info!("资源库：铺开 {}（{:#x}）", window.label(), window.key.handle);
             self.controller.pull(self.active_screen.as_deref(), window);
         }
         if let Some(app) = open_app {

@@ -357,14 +357,33 @@ impl DeskSet {
         self.reenter_all_dismissed_touch();
     }
 
+    /// 把一行日志送进 set 级的 log 通道（`DeskSetEvents::log`）。
+    fn log(&self, message: impl Into<String>) {
+        if let Some(sink) = &self.events.log {
+            sink(&message.into());
+        }
+    }
+
     /// 对应 C# `Pull`：把窗口放到目标屏；若它正铺在别的屏上，先摘出那条还原记录，
     /// 新屏沿用**原始的还原坐标**（而不是把它放回原位再重新记一次）。
     pub fn pull(&self, target_screen_id: &str, window: WindowInfo) {
+        // 静默返回是调试黑洞：真机上出现过"点了 App 什么都不发生、日志只有一行铺开"，
+        // 就是因为这里找不到屏或行为不对。两个分支都留一条日志，代价是一行。
         let Some(target) = self.desk_for_screen(Some(target_screen_id)) else {
+            self.log(format!(
+                "放 {}：找不到屏 {target_screen_id}（现有 {:?}）",
+                window.label(),
+                self.wishes().into_iter().map(|wish| wish.id.clone()).collect::<Vec<_>>()
+            ));
             return;
         };
         // 这两条与 C# `PhoneDesk.Pull` 入队前的判断一致。
         if target.behavior() != ScreenBehavior::TouchScreen {
+            self.log(format!(
+                "放 {}：屏 {target_screen_id} 不是触屏（{:?}）",
+                window.label(),
+                target.behavior()
+            ));
             return;
         }
         if target.state().quitting.contains(&window.key.pid) {
@@ -377,11 +396,25 @@ impl DeskSet {
         let window_key = window.key;
         let ready = target.state().screen_phase == PhoneScreenPhase::Ready;
         let lane = self.lane.clone();
+        let log = self.events.log.clone();
+        let label = window.label();
+        let key_label = target_key.clone();
+        self.log(format!(
+            "放 {label}：入队（屏 {key_label} ready={ready} 队列中还有多少动作看不到）"
+        ));
         lane.run(move |hub: &mut DeskHub| {
+            if let Some(log) = &log {
+                log(&format!("放 {label}：桌面队列开始执行"));
+            }
             // 屏没就绪时不要先摘别处的记录：C# 在 `PlaceAsync` 里也是先过 `ReadyDisplay`。
             let transfer = if ready { hub.detach_for_transfer(&target_key, window_key) } else { None };
-            if let Some(core) = hub.core_mut(&target_key) {
-                core.pull_with(window, transfer);
+            match hub.core_mut(&target_key) {
+                Some(core) => core.pull_with(window, transfer),
+                None => {
+                    if let Some(log) = &log {
+                        log(&format!("放 {label}：桌面队列里没有屏 {key_label}"));
+                    }
+                }
             }
         });
     }
@@ -432,8 +465,16 @@ impl DeskSet {
     pub fn shutdown(&mut self) {
         let desks: Vec<Desk> = self.desks.drain().map(|(_, desk)| desk).collect();
         self.wishes.clear();
+        let mut timed_out = Vec::new();
         for desk in &desks {
-            desk.shutdown();
+            if !desk.shutdown() {
+                timed_out.push(desk.screen_id());
+            }
+        }
+        if !timed_out.is_empty() {
+            self.log(format!(
+                "收尾：{timed_out:?} 的撤屏动作 20 秒内没做完，先退出；残留屏由归属记录在下次启动时清理"
+            ));
         }
         self.lane.run(|hub: &mut DeskHub| hub.clear());
         self.notify_state_changed();

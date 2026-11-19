@@ -14,14 +14,22 @@
 //! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 为 `None` 表示"读不到"，
 //! 与 `false`（确定没在推流）区分开——C# 读不到时给 `false`，这里按需求给 `None`。
 //!
-//! **有意偏离 C#（A：日志增长不再单独判在场）**：真机实测这台机器的
-//! `GameViewerServer` 空闲时（没人连、`connection_log_controlled_*` 三天没动）
-//! 也会按 ~3.05 秒的周期刷推流日志，每次 148–933 字节；C# 的判定阈值正好是
-//! "两次增长间隔 <= 3.0 秒"，一秒采样把 3.05 秒量化成 3.0 秒就会命中。用同一套
-//! 判定回放 60 秒真实日志，`capture_active` 有 2 个采样点是 `true`——和真机上
-//! "16:25:20 亮、16:25:22 灭"的幽灵会话完全同型。所以现在 `capture_active=true`
-//! 必须另有佐证（活动 TCP 对端 / 可见覆盖窗 / 控制端表非空）才会上报；日志增长
-//! 本身降级为诊断字段 [`UuSignalSet::log_growth`]，留给以后拿真机会话校准。
+//! **在场判定就是推流日志增长（照 C# 1.3）**。这里踩过一次坑，别再改回去：
+//! 曾经加过"日志增长必须另有佐证（活动 TCP 对端 / 可见覆盖窗 / 控制端表非空）"
+//! （`2702cf1`），理由是这台机器空闲时 server 也按 ~3.05 秒刷日志、C# 的
+//! "两次增长间隔 ≤ 3.0 秒"会把它量化成命中。
+//!
+//! 但真机（2026-11-19）证明那个修改把主信号掐死了：手机连着、人没在操作时，
+//! 对端连接会断（UU 的传输走 UDP，TCP 只是信令）、覆盖窗不可见、控制端表又读不到
+//! （UU 客户端在托盘里），三项佐证恒为假 → 每 15 秒判一次断开 → 撤屏，
+//! 用户看到手机屏反复消失、App 点开也落空。日志里就是这样：
+//! `10:49:22 已断开 → 10:49:38 本次会话结束，撤掉手机屏`，
+//! 而同一时刻 `streamer_log_controlled_*.slog` 仍在稳定增长。
+//!
+//! 所以现在回到 C# 的语义：`IsPresent = overlay || 控制端非空 || CaptureActive == true`，
+//! 而 `CaptureActive` 就是日志增长本身；TCP 对端降回纯诊断（[`UuSignalSet::peer_active`]）。
+//! 若将来又看到"没连手机、屏自己弹出来"，先用真机日志确认**那时候 slog 是否真的在长**，
+//! 再决定动哪里——不要凭想象加佐证。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -58,12 +66,14 @@ pub struct UuSignalSet {
     pub controllers: ControllerTable,
     /// `None` = 读不到（进程不在、日志目录读不到），`Some(false)` = 确定没在推流。
     ///
-    /// 只有 `peer_active` / `client_visible` / 控制端表非空时才会是 `Some(true)`，
-    /// 见模块注释里 A 的说明。
+    /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。**这是在场判定的主信号**：
+    /// 真机上覆盖窗基本不可见、控制端表读不到（UU 客户端躲在托盘），只有它可用。
     pub capture_active: Option<bool>,
-    /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。
+    /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。**只作诊断**，不参与判定。
     pub peer_active: bool,
-    /// 日志增长信号（**诊断/校准用**，不参与在场判定）：`None` = 读不到。
+    /// 推流日志的"持续增长"（与 `capture_active` 同值，保留原名供诊断/校准读）。
+    ///
+    /// `None` = 读不到。
     pub log_growth: Option<bool>,
     /// 控制端表读不到的原因（可读、或客户端没跑时为 `None`）。
     pub controller_diagnosis: Option<ControllerDiagnosis>,
@@ -206,6 +216,17 @@ pub fn is_streamer_log_name(name: &str, server_pid: i32) -> bool {
         && name.ends_with(&format!("_{server_pid}.slog"))
 }
 
+/// 两次"增长"之间最多隔多久才算连续推流。
+///
+/// C# 是 3 秒。**我们放宽到 15 秒**：真机实测 UU 的推流心跳在空闲（人没操作手机）
+/// 时会从 2–3 秒拉到 **8–10 秒**一次，C# 的 3 秒判据在空闲时恒为 false，于是每 15 秒
+/// 判一次"断开"→ 撤屏，用户看到手机屏反复消失（2026-11-19 真机日志：
+/// `11:01:10 推流=false → 11:01:27 本次会话结束`）。15 秒能覆盖空闲心跳，
+/// 又短到"真的断开、日志停止增长"时能在 15 秒内收敛。
+const ADVANCE_PAIR_MAX_GAP: f64 = 15.0;
+/// 最近一次增长之后还保持"在推流"多久。C# 是 2 秒，放宽理由同上。
+const ACTIVE_HOLD_WINDOW: f64 = 15.0;
+
 /// 推流日志的"持续增长"判定（C# `SampleCaptureActive` 里的 Signal B）。
 #[derive(Debug, Default)]
 struct LogGrowth {
@@ -239,9 +260,9 @@ impl LogGrowth {
         }
         let continuous = matches!(
             (self.previous_advance, self.last_advance),
-            (Some(previous), Some(last)) if last - previous <= 3.0
+            (Some(previous), Some(last)) if last - previous <= ADVANCE_PAIR_MAX_GAP
         );
-        continuous && self.last_advance.is_some_and(|last| now - last < 2.0)
+        continuous && self.last_advance.is_some_and(|last| now - last < ACTIVE_HOLD_WINDOW)
     }
 }
 
@@ -369,15 +390,14 @@ impl UuSensor {
 
         let log_growth = self.log_signal(server_pid, log_files.as_deref(), now);
 
-        // 有意偏离 C#（见模块注释 A）：日志增长只能当"弱信号"，必须另有佐证。
-        let corroborated =
-            peer_active || client_visible || !controllers.names.is_empty();
-        let capture_active = match (peer_active, log_growth) {
-            // C# 先看 TCP 对端；对端在就直接算在推流。
-            (true, _) => Some(true),
-            (false, None) => None,
-            (false, Some(growing)) => Some(growing && corroborated),
-        };
+        // 在场判定照 C# 1.3：`UUSignals.IsPresent = overlay || 控制端非空 || CaptureActive == true`，
+        // 而 `CaptureActive` 就是**推流日志增长**本身。TCP 对端在 C# 里只是诊断
+        // （`LastPeerTcpObserved`），不参与判定。
+        //
+        // 曾经加过"增长必须另有佐证（对端/覆盖窗/控制端）"（`2702cf1`），真机上证明是错的：
+        // 空闲时对端与覆盖窗都没有、控制端表又读不到（UU 客户端在托盘里），于是佐证恒为假
+        // → 每 15 秒判一次断开 → 撤屏，用户看着手机屏反复消失。见 `docs/upstream-watch.md`。
+        let capture_active = log_growth;
 
         UuSignalSet {
             client_running: client_pid.is_some(),
@@ -743,15 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn log_growth_needs_two_advances_within_three_seconds() {
+    fn log_growth_keeps_presence_through_idle_heartbeat() {
         let mut growth = LogGrowth::default();
         assert!(!growth.observe(7, 100, 0.0), "第一次只建基线");
         assert!(!growth.observe(7, 200, 1.0), "第一次增长还不够");
-        assert!(growth.observe(7, 300, 2.0), "3 秒内第二次增长");
-        assert!(growth.observe(7, 300, 3.5), "增长后 2 秒内保持");
-        assert!(!growth.observe(7, 300, 4.1), "超过 2 秒不再保持");
+        assert!(growth.observe(7, 300, 2.0), "两次增长之间成立");
+        // 空闲心跳：8–10 秒才增长一次也不能掉（C# 的 2/3 秒在这里会误判断开）。
+        assert!(growth.observe(7, 400, 12.0), "10 秒后心跳再次增长，仍在场");
+        assert!(growth.observe(7, 500, 22.0), "再隔 10 秒，继续保持");
+        assert!(!growth.observe(7, 500, 40.0), "超过保持窗口就不再算在场");
         // 换 pid 会清基线。
-        assert!(!growth.observe(8, 1000, 5.0));
+        assert!(!growth.observe(8, 1000, 41.0));
     }
 
     // ---- 假探测 ----
@@ -850,7 +872,9 @@ mod tests {
         assert!(signals.client_visible);
         assert!(!signals.controllers.readable, "没有窗口时就是不可读");
         assert!(signals.peer_active);
-        assert_eq!(signals.capture_active, Some(true));
+        // 日志读不到 → `None`（"不知道"），不是 `false`（"确定没推流"）。
+        // 对端只在诊断字段里，按 C# 不参与 capture 判定。
+        assert_eq!(signals.capture_active, None);
         assert_eq!(signals.log_tail, None);
     }
 
@@ -910,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_log_growth_is_recorded_but_never_presence() {
+    fn log_growth_marks_presence_like_csharp() {
         let bytes = std::sync::Arc::new(Mutex::new(100u64));
         let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
 
@@ -920,37 +944,56 @@ mod tests {
         *bytes.lock().unwrap() = 300;
         let signals = sensor.sample(2.0);
         assert_eq!(signals.log_growth, Some(true), "日志确实在持续增长");
-        // A：日志增长单独不足以判在场（真机空闲就会这样长）。
-        assert_eq!(signals.capture_active, Some(false));
-        assert!(!signals.to_signals().is_present());
+        // 照 C#：日志增长**就是**在场信号。真机上覆盖窗不可见、控制端表读不到，
+        // 推流日志是唯一稳定的证据（见模块顶部的踩坑记录）。
+        assert_eq!(signals.capture_active, Some(true));
+        assert!(signals.to_signals().is_present());
         assert_eq!(
             sensor.sample(2.0).log_tail.as_deref(),
             Some("last line\n"),
             "日志尾部原样给上层"
         );
-        // 2 秒后不再"持续"。
-        assert_eq!(sensor.sample(4.1).log_growth, Some(false));
+        // 心跳间隔 2.1 秒仍在保持窗口内 → 继续在场。
+        assert_eq!(sensor.sample(4.1).log_growth, Some(true));
+        // 彻底停止增长 15 秒后才掉。
+        assert_eq!(sensor.sample(20.0).log_growth, Some(false));
     }
 
     #[test]
-    fn idle_log_cadence_does_not_mark_present() {
-        // 用 16:25 那次真机采样到的节奏：~3.05 秒一次、每次 148–933 字节。
+    fn three_second_cadence_is_not_continuous_by_the_csharp_rule() {
         let bytes = std::sync::Arc::new(Mutex::new(1000u64));
         let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
 
+        // 3.05 秒一次的心跳（真机空闲节奏）必须一直保持在场。
         let mut t = 0.0;
+        let mut advances = 0;
         for delta in [0u64, 148, 933, 500, 819] {
             *bytes.lock().unwrap() += delta;
             let signals = sensor.sample(t);
-            assert_eq!(signals.capture_active, Some(false), "t={t} 空闲增长不能算在场");
-            assert!(!signals.to_signals().is_present(), "t={t} 不能误判连入");
+            // 前两次增长还凑不成"一对"（第一次建基线、第二次才记下前一个点）。
+            if advances < 2 {
+                assert_eq!(signals.capture_active, Some(false), "t={t} 还在建基线");
+            } else {
+                assert_eq!(
+                    signals.capture_active,
+                    Some(true),
+                    "t={t} 3.05 秒心跳仍在保持窗口内"
+                );
+                assert!(signals.to_signals().is_present(), "t={t} 判连入");
+            }
+            advances += 1;
             t += 3.05;
         }
-        assert_eq!(sensor.sample(t).log_growth, Some(false), "3.05s 间隔不算连续");
+        assert_eq!(sensor.sample(t).log_growth, Some(true), "心跳停止后 3 秒仍在保持窗口");
+        assert_eq!(
+            sensor.sample(t + 16.0).log_growth,
+            Some(false),
+            "彻底停止增长超过保持窗口才掉"
+        );
     }
 
     #[test]
-    fn peer_alone_marks_present_without_log_growth() {
+    fn peer_alone_is_diagnostic_only_like_csharp() {
         let mut probe = FakeProbe::default();
         probe.pids.insert("GameViewerServer".into(), 7);
         probe.dir = Some(r"C:\gv\log".into());
@@ -966,8 +1009,10 @@ mod tests {
         let signals = sensor.sample(0.0);
         assert!(signals.peer_active);
         assert_eq!(signals.log_growth, Some(false));
-        assert_eq!(signals.capture_active, Some(true), "对端是独立佐证");
-        assert!(signals.to_signals().is_present());
+        // C# 从不让 TCP 对端单独判在场（断开后残留的 keepalive socket 会骗人），
+        // 它只是 `LastPeerTcpObserved` 诊断字段。
+        assert_eq!(signals.capture_active, Some(false));
+        assert!(!signals.to_signals().is_present());
     }
 
     #[test]

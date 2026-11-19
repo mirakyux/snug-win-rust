@@ -50,6 +50,9 @@ const TOPOLOGY_SETTLE: f64 = 1.0;
 const RETRY_DELAYS: [f64; 3] = [5.0, 15.0, 30.0];
 /// C# SettleDelay：摆好/改字号后等一下再继续。
 const SETTLE_DELAY: f64 = 0.3;
+/// 收尾时等"撤屏"这条动作的上限。超过就不等了：一次在飞的建屏可能 8 秒 × 4 个候选，
+/// 再叠最短存活与拓扑沉降；进程不能为了撤屏卡到用户以为死机（屏由归属记录兜底）。
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// C# RecheckDelay：显示器配置变化后的重查延迟。
 const RECHECK_DELAY: f64 = 1.5;
 /// C# ReplaceWait：窗口被外部关掉后，等它换新窗口回来的窗口期。
@@ -302,6 +305,20 @@ impl DeskSlot {
         });
     }
 
+    /// 同 [`Self::call`]，但最多等 `timeout`（收尾用）。
+    fn call_timeout(
+        &self,
+        timeout: std::time::Duration,
+        operation: impl FnOnce(&mut DeskCore) + Send + 'static,
+    ) -> bool {
+        let id = self.id.clone();
+        self.lane.call_timeout(timeout, move |hub: &mut DeskHub| {
+            if let Some(core) = hub.core_mut(&id) {
+                operation(core);
+            }
+        })
+    }
+
     /// 只给 `idle()`（测试）用：生产路径不等队列，见 `docs/desk-threading.md`。
     #[cfg(test)]
     fn drain(&self) {
@@ -325,6 +342,8 @@ impl Drop for HubOwner {
 struct DeskHandle {
     slot: DeskSlot,
     shared: Arc<DeskShared>,
+    /// 已经排了一个 `check_returns` 在队列里（去重，防止每拍入队把队列堵死）。
+    check_pending: Arc<AtomicBool>,
     /// 共享队列的拥有者；字段本身不读，靠它的 `Drop` 在工作线程用完时退出。
     _owner: Option<Arc<HubOwner>>,
 }
@@ -461,7 +480,14 @@ impl Desk {
                 replaced: None,
             });
         });
-        Desk { inner: Arc::new(DeskHandle { slot, shared, _owner: owner }) }
+        Desk {
+            inner: Arc::new(DeskHandle {
+                slot,
+                shared,
+                check_pending: Arc::new(AtomicBool::new(false)),
+                _owner: owner,
+            }),
+        }
     }
 
     /// 屏 id（C# `ScreenId`）。
@@ -823,16 +849,46 @@ impl Desk {
 
     /// 对应 C# `CheckReturns`：看看有没有窗口带着手机屏上的样子回来了。
     pub fn check_returns(&self) {
-        self.inner.slot.run(|core: &mut DeskCore| core.check_returns());
+        // **去重**：app worker 每拍（500ms）都会调这里，而 `check_returns` 在有
+        // left-behind 条目时要枚举窗口、读标题，单次能到 3 秒。不去重就是生产 2 个/秒、
+        // 消费 0.33 个/秒 → 队列无限积压，用户点 App 要排一分钟以上才执行（真机 2026-11-19
+        // 实测：`[lane] 动作排队 52.3s 才轮到`）。队列里已经有一个就不再加。
+        if self.inner.check_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pending = Arc::clone(&self.inner.check_pending);
+        self.inner.slot.run(move |core: &mut DeskCore| {
+            core.check_returns();
+            pending.store(false, Ordering::SeqCst);
+        });
     }
 
     /// 对应 C# `ShutdownAsync`：退出前把手机屏撤干净（阻塞到做完）。
-    pub fn shutdown(&self) {
+    /// 撤屏并等它做完；返回 `false` 表示超时没等完（调用方要留痕）。
+    ///
+    /// 真机上踩过两次，改动前先读：
+    /// 1. **先在队列外取消重试**。重试线程每档（5/15/30 秒）都会往共享 lane 里塞一个
+    ///    `reconcile`，而每次建屏最长 8 秒 × 4 个候选——退出时正好撞上重试阶梯，
+    ///    收尾会排在它们后面等到天荒地老（2026-11-19 实测卡了 3 分钟以上、进程不响应）。
+    /// 2. 即使取消重试，仍可能有一个**已经在跑**的建屏动作（32 秒）加最短存活 2.5 秒
+    ///    加拓扑沉降 1 秒。所以这里带 20 秒上限，超时就放弃等待、由归属记录兜底。
+    pub fn shutdown(&self) -> bool {
         self.inner.shared.wanted.store(false, Ordering::SeqCst);
-        self.inner.slot.call(|core: &mut DeskCore| {
+        if let Some(handle) = self
+            .inner
+            .shared
+            .pending_retry
+            .lock()
+            .expect("retry")
+            .take()
+        {
+            handle.token.cancel();
+            handle.finished.store(true, Ordering::SeqCst);
+        }
+        self.inner.slot.call_timeout(SHUTDOWN_TIMEOUT, |core: &mut DeskCore| {
             core.cancel_retry();
             core.reconcile();
-        });
+        })
     }
 
     /// 只入队撤屏、不等它做完（`DeskSet` 摘掉一块屏时用，避免界面线程被长动作卡住）。
@@ -1009,6 +1065,7 @@ impl DeskCore {
 
     /// 对应 C# `AddScreenAsync`。
     fn add_screen(&mut self) {
+        self.log("加屏：开始");
         self.set_state(self.state().with_screen_phase(PhoneScreenPhase::Preparing));
         if let Some(old) = self.retiring.take() {
             self.warn(format!("上一块手机屏 #{} 还没下线就又要加屏，放弃旧的善后记录", old.id));
@@ -1043,10 +1100,12 @@ impl DeskCore {
                 self.schedule_retry();
             }
         }
+        self.log("加屏：结束");
     }
 
     /// 对应 C# `RemoveScreenAsync`。
     fn remove_screen(&mut self) {
+        self.log("撤屏：开始");
         if let Some(placement) = self.placement.clone() {
             let mut record = placement.record;
             self.put_back(&mut record, true);
@@ -1075,6 +1134,7 @@ impl DeskCore {
             .with_quitting_cleared()
             .with_closing_cleared();
         self.set_state(state);
+        self.log("撤屏：结束");
     }
 
     /// 对应 C# `RetireDisplayAsync`。
@@ -1130,6 +1190,7 @@ impl DeskCore {
 
     /// 对应 C# `SettleAsync`：等系统稳定，恢复被动改掉的其他屏模式，再把窗口挪回去。
     fn settle(&self, before: Surroundings, after_what: &str, permanently: bool) {
+        self.log(format!("{after_what}：等拓扑沉降 {TOPOLOGY_SETTLE}s"));
         self.sleep(TOPOLOGY_SETTLE);
 
         let now_modes: HashMap<u32, DisplayModeInfo> = self
@@ -1422,6 +1483,11 @@ impl DeskCore {
         if let Some(look) = self.shared.windows.look(window.key) {
             return Some(look);
         }
+        self.warn(format!(
+            "{}（{:#x}）碰不到：窗口已关或读不到状态，不铺",
+            window.label(),
+            window.key.handle
+        ));
         let notice = self.unreachable(window);
         self.set_state(self.state().with_notice(Some(notice)));
         None
@@ -1455,6 +1521,9 @@ impl DeskCore {
         };
 
         if self.placement.as_ref().map(|placement| placement.window.key) == Some(window.key) {
+            // 同一个窗口再点一次 = "回到它"，不是重新铺。留一行日志，
+            // 否则真机上"点了没反应"分不清是这条还是根本没进来。
+            self.log(format!("{} 已经铺在手机上，回到它", window.label()));
             self.reveal();
             return;
         }
