@@ -61,6 +61,16 @@ impl Library {
         &self.running
     }
 
+    /// 只给测试：塞一份现成的 App 列表进去（真机构造要走 COM，测试里不要碰）。
+    #[cfg(test)]
+    pub fn with_data(installed: Vec<AppInfo>, running: Vec<RunningApp>) -> Self {
+        let mut library = Self::new();
+        library.installed = installed;
+        library.running = running;
+        library.scanned_once = true;
+        library
+    }
+
     /// 该不该重扫。`force` 用于"手动刷新"按钮或手机屏刚就绪时。
     pub fn needs_scan(&self, force: bool) -> bool {
         if self.scan.is_some() {
@@ -159,6 +169,22 @@ impl Library {
         snug_core::apps::search(query, &self.installed, &self.running).apps
     }
 
+    /// 某个 App 是否匹配搜索词（与「全部」页同一套拼音搜索）。
+    ///
+    /// 「运行中」页签也要按搜索词过滤：原版 C# 的搜索是独立子页面，
+    /// 一输入就换成搜索结果页，跟当前页签无关；我们做成内嵌输入框后，
+    /// 只在「全部」页过滤会让用户在「运行中」页输入后看不到任何变化。
+    pub fn matches_search(&self, app: &AppInfo, query: &str) -> bool {
+        if query.trim().is_empty() {
+            return true;
+        }
+        // 运行中列表要传空：`search` 会把 `running` 里没装过的 App 也加进候选，
+        // 传 `self.running` 会让所有运行中的 App 都"命中"。
+        let none: [RunningApp; 0] = [];
+        let hits = snug_core::apps::search(query, std::slice::from_ref(app), &none);
+        !hits.apps.is_empty()
+    }
+
     /// 首字母分组（C# `AppList.GroupedByLetter`）：搜索时只有一组、不显示字母头。
     ///
     /// 124 个 App 平铺没法用，C# 的列表也是按字母分段的。
@@ -176,5 +202,54 @@ impl Library {
             .into_iter()
             .map(|group| (group.letter, group.apps))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(id: &str, name: &str) -> AppInfo {
+        AppInfo {
+            app_id: id.to_string(),
+            name: name.to_string(),
+            executable_path: None,
+            launch_target: None,
+            arguments: None,
+            working_directory: None,
+        }
+    }
+
+    fn running(app: AppInfo, pid: i32) -> RunningApp {
+        RunningApp { app, pid, windows: Vec::new() }
+    }
+
+    /// 「运行中」页签也要按搜索词过滤：真机上用户在那一页输入 `QQ` 什么都没变。
+    #[test]
+    fn running_tab_honours_the_search_query() {
+        let qq = running(app("QQ.exe", "QQ"), 100);
+        let code = running(app("Code.exe", "Visual Studio Code"), 200);
+        let library = Library::with_data(
+            vec![app("QQ.exe", "QQ"), app("Code.exe", "Visual Studio Code")],
+            vec![qq, code],
+        );
+
+        let hits: Vec<&str> = library
+            .running()
+            .iter()
+            .filter(|app| library.matches_search(&app.app, "qq"))
+            .map(|app| app.app.name.as_str())
+            .collect();
+        assert_eq!(hits, vec!["QQ"], "只有 QQ 命中");
+
+        // 空查询放行全部（没输入时列表不该被过滤掉）。
+        assert_eq!(
+            library
+                .running()
+                .iter()
+                .filter(|app| library.matches_search(&app.app, "  "))
+                .count(),
+            2
+        );
     }
 }

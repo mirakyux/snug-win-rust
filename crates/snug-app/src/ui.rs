@@ -33,6 +33,8 @@ pub struct PhoneHomeApp {
     pub controller: Controller,
     pub tab: HomeTab,
     pub search: String,
+    /// 上一帧这个窗口有没有键盘焦点（只在变化时记一行，排查"输入不进来"）。
+    pub window_focused: bool,
     /// 手机屏的逻辑宽度（点），用于把界面元素按屏宽等比放大。
     /// 设置窗（无人操作时它自己返回 `Idle`，不画任何东西）。
     pub settings: SettingsWindow,
@@ -139,6 +141,7 @@ impl PhoneHomeApp {
             controller,
             tab: HomeTab::Running,
             search: String::new(),
+            window_focused: false,
             settings,
             elevated: snug_win::is_elevated(),
             request_exit: false,
@@ -1156,11 +1159,31 @@ impl eframe::App for PhoneHomeApp {
                             .weak(),
                     );
                 }
-                ui.add(
+                // 诊断：真机反馈"搜索框打不出字"，要区分三种情况——
+                // ①窗口根本没拿到键盘焦点；②焦点在但按键没进 egui；③按键进了、过滤没生效。
+                let window_focused = ui.ctx().input(|input| input.focused);
+                if window_focused != self.window_focused {
+                    self.window_focused = window_focused;
+                    crate::info!(
+                        "搜索框诊断：窗口焦点 {}",
+                        if window_focused { "有" } else { "无" }
+                    );
+                }
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("🔍 搜索 App")
                         .desired_width(f32::INFINITY),
                 );
+                if response.gained_focus() {
+                    crate::info!("搜索框诊断：输入框拿到焦点");
+                }
+                if response.changed() {
+                    crate::info!(
+                        "搜索框诊断：内容变成「{}」（{} 字节）",
+                        self.search,
+                        self.search.len()
+                    );
+                }
 
                 ui.add_space(8.0);
                 // 两个页签平分配对宽度，并且**始终画底**。
@@ -1282,14 +1305,28 @@ impl eframe::App for PhoneHomeApp {
                 ui.add_space(8.0);
                 match self.tab {
                     HomeTab::Running => {
-                        let apps = self.library.running().to_vec();
+                        // 搜索对两个页签都生效。原版 C# 里搜索是**独立子页面**
+                        // （`SubPage.Search`），一输入就换成搜索结果页，跟当前页签无关；
+                        // 我们把它做成了内嵌输入框，就更不能让"运行中"页无视搜索词——
+                        // 真机反馈"输了 qq 没反应"就是这条。
+                        let apps: Vec<_> = self
+                            .library
+                            .running()
+                            .iter()
+                            .filter(|app| self.library.matches_search(&app.app, &self.search))
+                            .cloned()
+                            .collect();
                         if apps.is_empty() {
-                            ui.label(egui::RichText::new("没有正在运行的窗口").size(16.0).weak());
-                            ui.label(
-                                egui::RichText::new("启动一个 App 后，它的窗口会列在这里，点一下铺满手机屏")
-                                    .size(14.0)
-                                    .weak(),
-                            );
+                            let (title, hint) = if self.search.trim().is_empty() {
+                                (
+                                    "没有正在运行的窗口",
+                                    "启动一个 App 后，它的窗口会列在这里，点一下铺满手机屏",
+                                )
+                            } else {
+                                ("没有匹配的运行中 App", "换个关键词试试，或切到「全部」")
+                            };
+                            ui.label(egui::RichText::new(title).size(16.0).weak());
+                            ui.label(egui::RichText::new(hint).size(14.0).weak());
                         }
                         for app in apps {
                             let texture = self.library.icon(ctx, &app.app);
