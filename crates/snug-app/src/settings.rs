@@ -22,7 +22,9 @@
 //! 5. 首页切浅色/暗黑/自动，界面配色立刻变（自动跟系统）。
 
 use eframe::egui;
-use snug_core::{AppConfig, AppThemeMode, PhoneCatalog, PhoneChoice, ScreenConfig, ScreenFit};
+use snug_core::{
+    AppConfig, AppThemeMode, PhoneCatalog, PhoneChoice, PhoneScreenSpec, ScreenConfig, ScreenFit,
+};
 
 /// 字号放大档位（C# `ZoomCombo` 的 0~4），与 core 的 `MIN_ZOOM_STEPS`/`MAX_ZOOM_STEPS` 一致。
 pub const ZOOM_LABELS: [&str; 5] = ["0 级（默认）", "+1 级", "+2 级", "+3 级", "+4 级"];
@@ -380,11 +382,16 @@ pub struct SettingsWindow {
     new_screen_kind: snug_core::DeviceKind,
     new_screen_orientation: snug_core::ScreenOrientation,
     new_screen_model: Option<String>,
+    /// 添加屏时填的名字（C# `AddScreenNameBox`）：空就用建议名。
+    new_screen_name: String,
     /// 正在给第几块屏挑机型（`None` = 没在挑）。对应 C# 的 `PhoneModelWindow`，
     /// 我们把它做成多屏页里的内嵌选择器，不再单开一个窗口。
     model_picker: Option<usize>,
     /// 机型选择器的搜索词。
     model_search: String,
+    /// 机型选择器里的自定义分辨率（C# `CustomWidthBox` / `CustomHeightBox`）。
+    custom_width: String,
+    custom_height: String,
 }
 
 impl Default for SettingsWindow {
@@ -410,9 +417,37 @@ impl SettingsWindow {
             new_screen_kind: snug_core::DeviceKind::Phone,
             new_screen_orientation: snug_core::ScreenOrientation::Portrait,
             new_screen_model: None,
+            new_screen_name: String::new(),
             model_picker: None,
             model_search: String::new(),
+            custom_width: String::new(),
+            custom_height: String::new(),
         }
+    }
+
+    /// 打开机型选择器（`index` 是 `screens` 里的第几块）。
+    ///
+    /// 三件事一起做，避免调用点各写一遍写漏：清搜索词、清自定义输入框，
+    /// 当前这块屏如果本来就是自定义分辨率，就把它的宽高填进去方便微调
+    /// （C# `PhoneHomeWindow.xaml.cs:689-695` 的判断：`Model is null` 且输入框为空）。
+    fn open_model_picker(&mut self, index: usize, device: Option<&PhoneChoice>) {
+        self.model_picker = Some(index);
+        self.model_search.clear();
+        self.custom_width.clear();
+        self.custom_height.clear();
+        if let Some(device) = device
+            && device.model.is_none()
+        {
+            self.custom_width = device.screen.width.to_string();
+            self.custom_height = device.screen.height.to_string();
+        }
+    }
+
+    /// 把输入框里的宽高解析成自定义规格；两个都填且合法才返回（C# `Custom(w, h)`）。
+    fn custom_spec_from_inputs(&self) -> Option<PhoneScreenSpec> {
+        let width = self.custom_width.trim().parse::<i32>().ok();
+        let height = self.custom_height.trim().parse::<i32>().ok();
+        PhoneScreenSpec::custom(width, height)
     }
 
     /// 打开窗口（C# 里是 `new SettingsWindow(...)` + `Show()`）。
@@ -778,8 +813,10 @@ impl SettingsWindow {
             });
             if pick_model {
                 // 机型选择器画在「多屏与设备」页里，所以要跟着跳过去。
-                self.model_picker = Some(0);
-                self.model_search.clear();
+                // 首页这块卡对应 `screens[0]`，预填也用它的设备（不是 `cfg.phone`：
+                // 多屏时主手机屏未必是第一块）。
+                let first = cfg.effective_screens().into_iter().next();
+                self.open_model_picker(0, first.as_ref().map(|screen| &screen.device));
                 self.tab = SettingsTab::Screens;
             }
             ui.add_space(4.0);
@@ -925,8 +962,7 @@ impl SettingsWindow {
                 });
             });
             if pick_this {
-                self.model_picker = Some(index);
-                self.model_search.clear();
+                self.open_model_picker(index, Some(&screen.device));
             }
             if remove_this {
                 remove = Some(index);
@@ -996,6 +1032,16 @@ impl SettingsWindow {
             self.new_screen_model = selected;
         }
 
+        // 名字（C# `AddScreenNameBox`）：留空就按机型与方向自动取。
+        ui.horizontal(|ui| {
+            ui.label("名字");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_screen_name)
+                    .hint_text("留空 = 按机型自动取名")
+                    .desired_width(240.0),
+            );
+        });
+
         let can_add = screens.len() < ScreenConfig::LIMIT && self.new_screen_model.is_some();
         if ui
             .add_enabled(can_add, egui::Button::new("选型号并添加"))
@@ -1011,16 +1057,22 @@ impl SettingsWindow {
             {
                 let mut device = PhoneChoice::from_model(model);
                 device.kind = self.new_screen_kind;
+                let typed_name = self.new_screen_name.trim().to_string();
                 let screen = ScreenConfig {
                     // id 留空，`sanitize()` 会补一个 GUID（C# `ScreenConfig.Sanitize` 同）。
                     id: String::new(),
                     orientation: self.new_screen_orientation,
                     device: device.clone(),
                     enabled: true,
-                    name: ScreenConfig::suggested_name(&device, self.new_screen_orientation),
+                    name: if typed_name.is_empty() {
+                        ScreenConfig::suggested_name(&device, self.new_screen_orientation)
+                    } else {
+                        typed_name
+                    },
                 }
                 .sanitize();
                 screens.push(screen);
+                self.new_screen_name.clear();
                 changed = true;
             }
         }
@@ -1032,6 +1084,7 @@ impl SettingsWindow {
             } else {
                 let kind = screens[index].device.kind;
                 let mut chosen: Option<PhoneChoice> = None;
+                let mut custom_apply = false;
                 let mut cancel = false;
                 Self::card(ui, "选择机型", |ui| {
                     ui.horizontal(|ui| {
@@ -1045,6 +1098,8 @@ impl SettingsWindow {
                         }
                     });
                     let needle = self.model_search.trim().to_lowercase();
+                    // 自定义区块的显示条件要用命中数，所以它得活到 ScrollArea 外面。
+                    let mut shown = 0usize;
                     egui::ScrollArea::vertical()
                         .id_salt("snug-model-picker")
                         .max_height(260.0)
@@ -1054,7 +1109,6 @@ impl SettingsWindow {
                                 ui.label(egui::RichText::new("没有加载到机型库").weak());
                                 return;
                             };
-                            let mut shown = 0usize;
                             for model in catalog.models() {
                                 if model.kind != kind {
                                     continue;
@@ -1077,8 +1131,44 @@ impl SettingsWindow {
                                 ui.label(egui::RichText::new("没有匹配的机型").weak());
                             }
                         });
+                    // 自定义分辨率（C# `CustomModelSection`）：没在搜索、或搜索没结果时露出来，
+                    // 免得一搜机型就被这块占地方。
+                    if needle.is_empty() || shown == 0 {
+                        ui.separator();
+                        ui.label(egui::RichText::new("自定义分辨率").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("宽");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_width)
+                                    .desired_width(70.0)
+                                    .hint_text("1080"),
+                            );
+                            ui.label("高");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_height)
+                                    .desired_width(70.0)
+                                    .hint_text("2400"),
+                            );
+                            if ui.button("应用自定义").clicked() {
+                                custom_apply = true;
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("两个都要填；横向填的宽高会自动摆成竖屏")
+                                .small()
+                                .weak(),
+                        );
+                    }
                 });
-                if let Some(mut device) = chosen {
+                // 列表里点选的机型优先；没点选就是"应用自定义"。
+                let picked = chosen.or_else(|| {
+                    if !custom_apply {
+                        return None;
+                    }
+                    self.custom_spec_from_inputs()
+                        .map(|spec| PhoneChoice { model: None, screen: spec, kind })
+                });
+                if let Some(mut device) = picked {
                     device.kind = kind;
                     let orientation = screens[index].orientation;
                     screens[index].name =
@@ -1232,7 +1322,7 @@ impl SettingsWindow {
         ui.label(egui::RichText::new("开源信息").strong());
         ui.label(
             egui::RichText::new(
-                "• 本项目基于 MIT License 开源（nicocart/snug-win），1:1 承接上游 zephyr4123/snug（v2.5.0）交互设计",
+                "• 本项目基于 MIT License 开源（nicocart/snug-win），1:1 承接上游 zephyr4123/snug（v2.6.x）交互设计",
             )
             .small()
             .weak(),
@@ -1279,6 +1369,54 @@ mod tests {
         };
         assert_eq!(model_text(&choice), "自定义（1080 × 2400）");
         assert!(model_text(&PhoneChoice::standard()).starts_with("Apple iPhone 17 Pro Max（1320 × 2868"));
+    }
+
+    #[test]
+    fn custom_resolution_inputs_need_both_sides_and_normalise_orientation() {
+        let mut window = SettingsWindow::new();
+        // 只填一边不算：C# `Custom(w, h)` 任何一边为 null 都返回 null，界面点了也没反应。
+        window.custom_width = "1080".to_string();
+        assert!(window.custom_spec_from_inputs().is_none());
+
+        window.custom_height = "2400".to_string();
+        let spec = window.custom_spec_from_inputs().expect("两个都填且合法");
+        assert_eq!((spec.width, spec.height), (1080, 2400));
+
+        // 横向填的宽高自动摆成竖屏（0 也走同一条 `custom`，别在这里另写规则）。
+        window.custom_width = "2400".to_string();
+        window.custom_height = "1080".to_string();
+        let spec = window.custom_spec_from_inputs().expect("横向输入也合法");
+        assert_eq!((spec.width, spec.height), (1080, 2400));
+
+        // 越界与非数字一律 None。
+        window.custom_width = "0".to_string();
+        assert!(window.custom_spec_from_inputs().is_none());
+        window.custom_width = "abc".to_string();
+        assert!(window.custom_spec_from_inputs().is_none());
+    }
+
+    #[test]
+    fn opening_the_model_picker_prefills_only_custom_resolutions() {
+        let custom = PhoneChoice {
+            model: None,
+            screen: snug_core::PhoneScreenSpec::new(1080, 2400, None),
+            kind: snug_core::DeviceKind::Phone,
+        };
+        let mut window = SettingsWindow::new();
+        window.open_model_picker(1, Some(&custom));
+        assert_eq!(window.model_picker, Some(1));
+        assert_eq!(window.custom_width, "1080");
+        assert_eq!(window.custom_height, "2400");
+
+        // 有型号名的屏不预填，而且要清掉上一次留下的输入与搜索词。
+        let mut window = SettingsWindow::new();
+        window.custom_width = "999".to_string();
+        window.custom_height = "999".to_string();
+        window.model_search = "iphone".to_string();
+        window.open_model_picker(0, Some(&PhoneChoice::standard()));
+        assert!(window.custom_width.is_empty());
+        assert!(window.custom_height.is_empty());
+        assert!(window.model_search.is_empty());
     }
 
     #[test]
