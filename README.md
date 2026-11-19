@@ -19,9 +19,10 @@ driver\install-driver.cmd                   # 上面的批处理入口（双击�
 driver\virtual-desktop-driver-installer-x64.zip   # 官方驱动安装包（SHA-256 已核对）
 ```
 
-双击 `snug.exe`（允许 UAC），如果还没装过虚拟屏驱动，在设置页点「安装驱动」即可——
-安装脚本会核对安装包与证书的 SHA-256，用的是
-[virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 0.3.1。
+双击 `snug.exe`（允许 UAC）。**驱动不用你管**：程序启动时探到
+`\\.\pipe\virtualdisplaydriver` 不在，会自己在后台跑包里的安装脚本装好
+（脚本核对安装包与证书的 SHA-256，已装过同款驱动则原样保留），装完直接建屏。
+设置页的「安装驱动」按钮留着做修复用。
 
 ## 为什么重写
 

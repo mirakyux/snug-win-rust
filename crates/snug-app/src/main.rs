@@ -5,6 +5,7 @@
 
 mod bubble;
 mod controller;
+mod driver;
 mod library;
 mod logging;
 mod settings;
@@ -47,8 +48,7 @@ fn main() -> eframe::Result<()> {
             crate::warn!("已有实例在运行，本次退出");
             logging::shutdown();
             return Ok(());
-        }
-    };
+        }    };
 
     crate::debug!("数据目录 {}", paths.data_dir().display());
 
@@ -67,6 +67,12 @@ fn main() -> eframe::Result<()> {
         "虚拟屏驱动管道：{}",
         if pipe_ready { "就绪" } else { "未检测到（手机屏功能需要驱动）" }
     );
+    // 没有驱动就**自己装**：发布包里带着官方安装包，本进程清单是 requireAdministrator，
+    // 不需要用户去别处下载、也不需要额外点一次 UAC。后台线程做，别挡启动；
+    // 装完命名管道起来后，建屏的重试阶梯自然就把手机屏拉起来。
+    if !pipe_ready {
+        driver::spawn_ensure_installed();
+    }
 
     let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
     let logical = fit.size(fit.base_width());

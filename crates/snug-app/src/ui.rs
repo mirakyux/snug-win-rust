@@ -1564,15 +1564,7 @@ fn tab_button(
 }
 
 fn locate_driver_script() -> Option<std::path::PathBuf> {
-    let mut dir = std::env::current_exe().ok()?.parent().map(|dir| dir.to_path_buf())?;
-    for _ in 0..5 {
-        let candidate = dir.join("driver").join("Install-SnugDriver.ps1");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = dir.parent()?.to_path_buf();
-    }
-    None
+    crate::driver::locate_script()
 }
 
 /// 用 PowerShell 跑驱动脚本。本进程已经是管理员（清单 requireAdministrator），
