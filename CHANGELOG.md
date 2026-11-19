@@ -107,10 +107,14 @@ exe 资源版本、更新器比较用的版本都从这里来。
   4. 脚本判定"驱动已装"是按显示名匹配 `*Virtual Display*`，把 UU 的
      `GameViewer Virtual Display Adapter` 也算成了自己。改成按 HardwareID
      `virtualdisplaydriver` 认。
+- **登录早期的竞态**：开机自启那一下，驱动是装着的、但用户态服务还没把管道拉起来。
+  原先"管道不在就装"会把驱动重装一遍（一次 msiexec 修复安装，慢且没意义）。
+  现在先查注册表里有没有那块设备（`display::virtual_display_instance_id`）：
+  装着就等 20 秒管道，等不到也不重装，交给建屏的重试阶梯。
 
 ### 体积与发布包
 
-`snug.exe` **6.67 MiB**（6,999,040 B），上限 8 MiB。明细见
+`snug.exe` **6.67 MiB**（6,996,480 B），上限 8 MiB。明细见
 [`docs/size-budget.md`](docs/size-budget.md)。
 
 发布 zip **6.21 MiB**，里面是 `snug.exe` + `driver\`（官方虚拟显示器驱动安装包 3.27 MB

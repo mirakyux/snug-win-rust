@@ -66,7 +66,7 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
 | 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
 
-全仓 **497 条单测**（core 221 / win 218 / app 54 / 几何对拍 3 / SHA-256 对拍 1），
+全仓 **499 条单测**（core 221 / win 218 / app 56 / 几何对拍 3 / SHA-256 对拍 1），
 `rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
 
 **开机自启**在设置里开（「开机静默自启动」）。它注册一条计划任务
