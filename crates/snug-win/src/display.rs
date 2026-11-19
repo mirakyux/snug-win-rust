@@ -1418,6 +1418,14 @@ fn rect_of(rect: RECT) -> Rect {
 
 /// 在注册表 `HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY` 下找虚拟屏设备实例
 /// （C# `FindVirtualDisplayInstanceId`）。
+///
+/// 对外也用它回答"驱动装没装"：**管道起没起来**和**驱动装没装**是两件事——
+/// 登录早期用户态服务还没把管道拉起来，这时候不该把驱动重装一遍（见
+/// `snug-app/src/driver.rs` 的 `ensure_installed`）。
+pub fn virtual_display_instance_id() -> Option<String> {
+    find_virtual_display_instance_id()
+}
+
 fn find_virtual_display_instance_id() -> Option<String> {
     unsafe {
         let mut root = HKEY(std::ptr::null_mut());

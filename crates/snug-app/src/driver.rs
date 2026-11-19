@@ -36,12 +36,45 @@ pub fn pipe_available() -> bool {
     snug_win::vdd::is_driver_pipe_available(snug_win::vdd::DEFAULT_PIPE_NAME)
 }
 
+/// 驱动**装没装**（注册表里有没有那块设备），和管道起没起来是两件事。
+fn driver_installed() -> bool {
+    snug_win::display::virtual_display_instance_id().is_some()
+}
+
+/// 等命名管道起来，最多等 `budget`。
+fn wait_for_pipe(budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if pipe_available() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    pipe_available()
+}
+
 /// 没驱动就自动装一次。返回 `true` 表示最后管道可用（本来就可用，或装成功了）。
 ///
 /// 这个函数会阻塞到安装结束，调用方要放在后台线程里。
 pub fn ensure_installed() -> bool {
     if pipe_available() {
         return true;
+    }
+    // **驱动装着、只是管道还没起来**：登录早期最常见（用户态服务还没把管道拉出来），
+    // 开机自启正好卡在这个时间点上。这时候绝不能重装一遍驱动——msiexec 会跑一次
+    // 修复安装，慢且没有任何意义。等一小会儿，等不到就交给建屏的重试阶梯
+    // （`5/15/30` 秒），或者让用户重启一下设备。
+    if driver_installed() {
+        crate::info!("驱动：已安装，但命名管道还没就绪（登录早期常见），等一会…");
+        if wait_for_pipe(Duration::from_secs(20)) {
+            crate::info!("驱动：命名管道已就绪");
+            return true;
+        }
+        crate::warn!(
+            "驱动：等 20 秒管道仍没起来，先不重装（驱动是装着的）。\
+             手机屏会按重试阶梯继续尝试；实在不行在设备管理器里重启一次 Cherry Virtual Display。"
+        );
+        return false;
     }
     let Some(script) = locate_script() else {
         crate::warn!("驱动：没有命名管道，也没找到 driver\\Install-SnugDriver.ps1（程序目录及其上 5 层）");
@@ -220,6 +253,18 @@ mod tests {
     fn pipe_probe_does_not_panic() {
         // 只是探一下，真机有没有驱动都行：不能崩。
         let _ = pipe_available();
+    }
+
+    #[test]
+    fn device_probe_does_not_panic() {
+        // "驱动装没装"的注册表查询：装没装都要能安全回答。
+        let _ = driver_installed();
+    }
+
+    #[test]
+    fn zero_budget_wait_just_reports_the_current_state() {
+        // 预算为 0 时不该睡、也不该谎报：结果必须与当前探测一致。
+        assert_eq!(wait_for_pipe(Duration::ZERO), pipe_available());
     }
 
     #[test]
