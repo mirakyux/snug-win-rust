@@ -77,6 +77,7 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 - [docs/display-parity.md](docs/display-parity.md) — 虚拟屏链路与原版逐行对拍
 - [docs/ui-parity.md](docs/ui-parity.md) — 界面与原版对照
 - [docs/size-budget.md](docs/size-budget.md) — 体积预算与已做的取舍
+- [docs/quality.md](docs/quality.md) — 质量门禁（rustc 零警告、clippy 怎么用）
 
 ## 许可
 

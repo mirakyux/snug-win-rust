@@ -150,11 +150,12 @@ pub fn dpi_rel_for_percent(target_percent: i32, min_rel: i32, max_rel: i32) -> O
 pub fn round_ties_even(value: f64) -> f64 {
     let floor = value.floor();
     let fraction = value - floor;
+    // 三个区间照 C# `Math.Round` 的分支写：>0.5 进位、<0.5 舍去、正好 0.5 取偶。
+    // 后两个分支都返回 `floor`（fraction<0.5 或 floor 已经是偶数），clippy 会提
+    // `if_same_then_else`——这里合并条件而不是留两个同值分支，语义一样且少一层。
     if fraction > 0.5 {
         floor + 1.0
-    } else if fraction < 0.5 {
-        floor
-    } else if (floor as i64) % 2 == 0 {
+    } else if fraction < 0.5 || (floor as i64) % 2 == 0 {
         floor
     } else {
         floor + 1.0

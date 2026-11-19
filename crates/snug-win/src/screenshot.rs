@@ -72,19 +72,10 @@ impl PixelImage {
 }
 
 /// C# `Math.Round` 的"四舍六入五成双"。
-pub fn round_ties_even(value: f64) -> f64 {
-    let floor = value.floor();
-    let fraction = value - floor;
-    if fraction > 0.5 {
-        floor + 1.0
-    } else if fraction < 0.5 {
-        floor
-    } else if (floor as i64) % 2 == 0 {
-        floor
-    } else {
-        floor + 1.0
-    }
-}
+///
+/// 实现只留一份（[`crate::display::round_ties_even`]）：这两处当初是各抄一遍，
+/// 改一处忘另一处就是两种舍入混用。这里 re-export，调用路径与测试都不用改。
+pub use crate::display::round_ties_even;
 
 /// C# `Math.Clamp(int, int, int)`。
 fn clamp_int(value: i32, min: i32, max: i32) -> i32 {

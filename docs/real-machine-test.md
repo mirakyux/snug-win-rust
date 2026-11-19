@@ -1,13 +1,26 @@
 # 真机联调步骤（Rust 版 vs 已装的 C# 正式版）
 
-这台机器上同时装着 C# 正式版 `C:\Program Files\SnugWin`（v1.2.0）和 Rust 版重写。
-两边是**同一个产品**，会抢同三样东西：
+这台机器上同时装着 C# 正式版 `C:\Program Files\SnugWin` 和 Rust 版重写（现在两边都是 1.3 功能面）。
+两边是**同一个产品**，会抢同几样东西：
 
-- 数据目录 `%LOCALAPPDATA%\SnugWin`（`config.json`、`phone-screen.json`、`zoom.json`、`left-behind.json`、`logs\`）
+- 数据目录 `%LOCALAPPDATA%\SnugWin`（`config.json`、`phone-screen.json` / `screen-<id>.json`、
+  `zoom.json`、`left-behind.json`、`owned-displays.json`、`logs\`）
 - 单实例锁 `%LOCALAPPDATA%\SnugWin\snug.lock`
 - 虚拟显示器驱动管道 `\\.\pipe\virtualdisplaydriver` 和"虚拟屏"这块显示设备
 
 所以联调时**必须**做两件事：先退掉 C# 版，再给 Rust 版一个独立数据目录。
+
+> 1.3 起两边同机不再互拆屏幕：各自只清理 `owned-displays.json` 里自己登记的虚拟屏
+> （`docs/upstream-watch.md` 的"归属记录"一条）。但配置文件和单实例锁仍然共用，
+> 所以独立数据目录这件事没变。
+
+## 阶段 0：静态门禁（不启动程序）
+
+```powershell
+pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe
+```
+
+版本、体积、清单、依赖、发行包一次查完。全 PASS 再往下；行为验收照 `docs/acceptance.md` 八组。
 
 ## 阶段 A：安全启动（不碰显示配置）
 
@@ -28,7 +41,7 @@ $env:SNUGWIN_HOME = $home
 要看到的：
 
 - 托盘出现 `snugwin-idle.ico`，提示文字 `SnugWin - 手机屏：关`
-- 双击托盘 / 右键"打开设置与诊断..." → 设置窗四页可翻
+- 双击托盘 / 右键"打开设置与诊断..." → 设置窗五个页签可翻（控制中心 / 手势与交互 / 驱动与日志 / 关于与更新 / 多屏与设备）
 - 设置窗"驱动与日志"页显示管道就绪（这台机器驱动已装）
 - `$home\logs\snug-YYYYMMDD.log` 里有启动行、数据目录行、托盘就绪行
 - 关闭设置窗、托盘"退出 SnugWin（先还原窗口）"能干净退出，托盘图标消失
@@ -49,10 +62,11 @@ $env:SNUGWIN_HOME = "$env:USERPROFILE\snug-rs-test"
 要看到的（按日志顺序）：
 
 1. `desk:` 行出现建屏请求，`虚拟屏驱动管道：就绪`
-2. 手机屏阶段 `Preparing` → `Ready`，`display_id` 有值
-3. `手机屏界面已搬到 (x, y) W×H` —— 我们自己的 egui 窗口被 `SetWindowPos` 搬到了虚拟屏上
+2. 手机屏阶段 `Preparing` → `Ready`，日志 `手机屏 #N 已就绪（W 宽）`，`display_id` 有值
+3. `手机屏界面：铺满资源库，搬到 (x, y) W×H` —— 我们自己的 egui 窗口被 `SetWindowPos` 搬到了虚拟屏上
+   （收成底部条时是 `收成底部指示条`，预览窗是 `预览窗：预览（只读），搬到 …`）
 4. Windows 显示设置里多出 `Virtual Display` 一块，分辨率符合机型比例
-5. App 资源库里能列出真实运行中的窗口（依赖 `apps` 模块接线完成）
+5. App 资源库里能列出真实运行中的窗口
 
 退出时检查归位：被搬到手机屏上的窗口回到原屏幕原位，虚拟屏撤掉，`phone-screen.json` 记下状态。
 
@@ -68,7 +82,7 @@ Set-Content "$env:SNUGWIN_HOME\quit.request" -Value quit -Encoding ascii
 
 1. **30 秒内进程退出，退出码 0**。卡住不动的，看下面「已知陷阱」第一条。
 2. 日志按顺序走完：`收到退出请求文件，开始收尾` → `收尾：开始（撤托盘 + 撤屏 + 归位窗口 + 存配置）`
-   → `已撤掉手机屏 #N` 与铺上去的窗口 `已放回原位` → `收尾：完成`。
+   → `已撤掉手机屏 #N` 与铺上去的窗口 `… 已放回原位` → `收尾：完成`。
 3. `Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams` 的条数
    **回到建屏之前的数量**——虚拟屏真的撤掉了，没留孤儿屏。
 4. `Get-Process -Name snug` 为空。
