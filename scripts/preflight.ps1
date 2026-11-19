@@ -246,6 +246,18 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+        # 顺手读一下安装脚本的头三个字节（archive 关掉之后就读不到了）。
+        $scriptHead = $null
+        $driverEntry = $archive.GetEntry('driver/Install-SnugDriver.ps1')
+        if ($null -ne $driverEntry) {
+            $stream = $driverEntry.Open()
+            try {
+                $scriptHead = New-Object byte[] 3
+                $scriptRead = $stream.Read($scriptHead, 0, 3)
+            } finally {
+                $stream.Dispose()
+            }
+        }
     } finally {
         $archive.Dispose()
     }
@@ -263,6 +275,16 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
         Fail ("zip 结构不对：缺少 [{0}]，多出 [{1}]" -f ($missing -join ', '), ($extra -join ', '))
     } else {
         Pass 'zip 里是 snug.exe + driver\（安装脚本与官方驱动包）'
+    }
+
+    # 包里的安装脚本必须是 UTF-8 带 BOM：程序用 `powershell.exe` 5.1 拉它，
+    # 没 BOM 就按 ANSI 读，中文注释会让脚本解析失败（真机上第一次自动安装就是这么挂的）。
+    if ($null -eq $scriptHead) {
+        Fail 'zip 里没有 driver/Install-SnugDriver.ps1，无法检查 BOM'
+    } elseif ($scriptRead -eq 3 -and $scriptHead[0] -eq 0xEF -and $scriptHead[1] -eq 0xBB -and $scriptHead[2] -eq 0xBF) {
+        Pass '安装脚本是 UTF-8 with BOM（powershell.exe 5.1 能正确读中文）'
+    } else {
+        Fail '安装脚本缺 UTF-8 BOM：powershell.exe 5.1 会按 ANSI 解析，中文注释让脚本报错'
     }
 
     if (-not (Test-Path -LiteralPath $checksumsPath)) {

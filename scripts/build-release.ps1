@@ -132,6 +132,14 @@ $driverScript = Join-Path $driverDir 'Install-SnugDriver.ps1'
 if (-not (Test-Path -LiteralPath $driverScript)) {
     throw "缺少 driver\Install-SnugDriver.ps1（设置页的「安装驱动」按钮靠它）。"
 }
+# 必须是 **UTF-8 带 BOM**：脚本里有中文，而程序是用 `powershell.exe`（5.1）拉它的，
+# 5.1 对没有 BOM 的文件按系统 ANSI 代码页读，中文注释会把语法读崩——真机上第一次
+# 自动安装就是这么失败的（ParserError: switch 语句缺少代码块）。
+$scriptBytes = [System.IO.File]::ReadAllBytes($driverScript)
+$hasBom = $scriptBytes.Length -ge 3 -and $scriptBytes[0] -eq 0xEF -and $scriptBytes[1] -eq 0xBB -and $scriptBytes[2] -eq 0xBF
+if (-not $hasBom) {
+    throw "driver\Install-SnugDriver.ps1 缺 UTF-8 BOM：powershell.exe 5.1 会按 ANSI 读，中文注释会让脚本解析失败。用编辑器存成「UTF-8 with BOM」再打包。"
+}
 
 $stage = Join-Path $outPath '.stage'
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }

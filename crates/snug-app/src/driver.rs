@@ -49,23 +49,30 @@ pub fn ensure_installed() -> bool {
     };
     crate::info!("驱动：检测到虚拟显示器驱动未就绪，自动安装（{}）", script.display());
     let started = Instant::now();
+    // 用 `-Command` 包一层，而不是 `-File`：顺手把子进程的控制台输出编码钉成 UTF-8。
+    //
+    // 不钉的话输出按系统代码页（简中 936/GBK）编码，我们按 UTF-8 读会整段变成替换符，
+    // 日志里就只剩「驱动：����λ��…」——真机上安装失败时用户完全看不出哪里出错。
+    let escaped = script.to_string_lossy().replace('\'', "''");
+    let command = format!(
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
+         & '{escaped}' -Action Install; exit $LASTEXITCODE"
+    );
     let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script.to_string_lossy(),
-            "-Action",
-            "Install",
-        ])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
+        // **别把 PowerShell 7 的 `PSModulePath` 传下去。**
+        // 真机踩到过：本程序的父进程若是 PS7（开发环境、或从 PS7 里启动的批处理），
+        // 子进程 `powershell.exe`（5.1）会先在 PS7 的模块目录里找 `Microsoft.PowerShell.Utility`，
+        // 那个模块是 PS7 专用的、5.1 加载不了，于是 `Get-FileHash` 这类 cmdlet 全部"不存在"，
+        // 安装脚本在校验哈希那一步直接失败。删掉这个变量，5.1 会用它自己的默认模块路径。
+        .env_remove("PSModulePath")
         .creation_flags_hidden()
         .output();
     match output {
         Ok(output) => {
             let ms = started.elapsed().as_millis();
-            let text = String::from_utf8_lossy(&output.stdout);
-            let err = String::from_utf8_lossy(&output.stderr);
+            let text = decode_console(&output.stdout);
+            let err = decode_console(&output.stderr);
             for line in text.lines().chain(err.lines()).filter(|line| !line.trim().is_empty()) {
                 crate::info!("驱动：{line}");
             }
@@ -95,6 +102,81 @@ pub fn ensure_installed() -> bool {
     }
     crate::warn!("驱动：装完了但命名管道还没起来（可能重启 Windows 后才生效）");
     false
+}
+
+/// 解出子进程的控制台输出。
+///
+/// `powershell.exe` 的输出按**控制台代码页**编码（简中机器上是 936/GBK），
+/// 直接 `from_utf8_lossy` 会把中文变成一串替换符——真机日志里就是这样，
+/// 用户根本看不出安装脚本到底报了什么错。先按 UTF-8 严格解码，不成立再按系统
+/// ANSI 代码页转一次。
+fn decode_console(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    // 兜底：系统 ANSI 与 OEM 代码页都试一次，挑替换符少的那个。
+    // 简中机器上两者都是 936，一样；但开了「Beta: 使用 Unicode UTF-8」的机器
+    // ANSI 会变成 65001，这时只有 OEM 能解对。
+    let ansi = codepage_to_string(bytes, CP_ACP);
+    let oem = codepage_to_string(bytes, CP_OEMCP);
+    match (ansi, oem) {
+        (Some(ansi), Some(oem)) => {
+            if replacement_count(&oem) < replacement_count(&ansi) {
+                oem
+            } else {
+                ansi
+            }
+        }
+        (Some(ansi), None) => ansi,
+        (None, Some(oem)) => oem,
+        (None, None) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+const CP_ACP: u32 = 0;
+const CP_OEMCP: u32 = 1;
+
+fn replacement_count(text: &str) -> usize {
+    text.chars().filter(|c| *c == '\u{FFFD}').count()
+}
+
+/// `MultiByteToWideChar(code_page)`：指定代码页 → `String`。
+fn codepage_to_string(bytes: &[u8], code_page: u32) -> Option<String> {
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let needed = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        MultiByteToWideChar(code_page, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), needed)
+    };
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    Some(String::from_utf16_lossy(&wide))
 }
 
 /// 起一个后台线程做 [`ensure_installed`]，不挡启动。
@@ -139,4 +221,19 @@ mod tests {
         // 只是探一下，真机有没有驱动都行：不能崩。
         let _ = pipe_available();
     }
+
+    #[test]
+    fn utf8_output_is_kept_as_is() {
+        assert_eq!(decode_console("[OK] 安装成功".as_bytes()), "[OK] 安装成功");
+    }
+
+    #[test]
+    fn non_utf8_output_never_panics() {
+        // 系统 ANSI 代码页的输出（简中机器上是 GBK）：解出来成不成字不重要，
+        // 重要的是不能 panic、不能整段字符串丢掉。
+        let gbk = b"\xd7\xb0\xb1\xb8\xa3\xbaOK";
+        let text = decode_console(gbk);
+        assert!(!text.is_empty(), "ANSI 输出不该被丢成空串");
+    }
 }
+

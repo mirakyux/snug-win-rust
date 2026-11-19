@@ -1,4 +1,4 @@
-# 虚拟显示器驱动：安装 / 卸载 / 状态
+﻿# 虚拟显示器驱动：安装 / 卸载 / 状态
 #
 # 驱动本身是 MolotovCherry/virtual-display-rs（MIT），我们不重编、不改造，
 # 只做「校验 + 安装 + 归属记录」三件事：
@@ -36,14 +36,30 @@ $StateDir = Join-Path $env:ProgramData "Snug"
 $OwnershipPath = Join-Path $StateDir "driver-ownership.json"
 
 function Test-ExistingDriver {
-    $pipeExists = [System.IO.Directory]::GetFiles("\\.\pipe\") -contains "\\.\pipe\virtualdisplaydriver"
+    # 管道在不在：**两种问法都要试**。`GetFiles("\\.\pipe\")` 在有些上下文里列不全，
+    # `[IO.File]::Exists` 依赖"有可用实例"；任一个说在就算在（宁可当它装好了，
+    # 也别为了个误判去重装一遍驱动）。
+    $pipePath = "\\.\pipe\virtualdisplaydriver"
+    $pipeExists = [System.IO.File]::Exists($pipePath)
+    if (-not $pipeExists) {
+        try {
+            $pipeExists = [System.IO.Directory]::GetFiles("\\.\pipe\") -contains $pipePath
+        } catch {
+            $pipeExists = $false
+        }
+    }
     $svc = Get-Service -Name "vdd-user-session-service" -ErrorAction SilentlyContinue
     $rootKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY"
     $hasDevice = $false
     if (Test-Path $rootKey) {
         foreach ($sub in Get-ChildItem $rootKey -ErrorAction SilentlyContinue) {
             $props = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue
-            if ($props.DeviceDesc -like "*Virtual Display*" -or $props.Mfg -like "*Cherry*") {
+            # 认 **HardwareID** 而不是显示名：UU 的 "GameViewer Virtual Display Adapter"
+            # 同样挂在 ROOT\DISPLAY 下、名字里也有 "Virtual Display"，
+            # 按名字匹配会把它当成我们的驱动（真机实测过），于是"已装好"被误判。
+            # 我们的驱动 HardwareID 是 `Root\VirtualDisplayDriver`（没有空格）。
+            $hwIds = @($props.HardwareID)
+            if ($hwIds -match '(?i)virtualdisplaydriver') {
                 $hasDevice = $true
                 break
             }
@@ -64,25 +80,60 @@ function Assert-Admin {
     }
 }
 
+# SHA-256 自己算，不用 Get-FileHash。
+#
+# 真机踩到过：从 PS7 的进程里拉起 `powershell.exe` 时，子进程继承 PS7 的 `PSModulePath`，
+# 5.1 会先去 PS7 的模块目录找 `Microsoft.PowerShell.Utility`（PS7 专用、5.1 加载不了），
+# 结果 `Get-FileHash` 直接"不是 cmdlet"，安装在校验那一步就挂了。
+# .NET 的 SHA256 一定在，绕开模块自动加载这条路。
+function Get-FileSha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $hash = $sha.ComputeHash($stream)
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToUpperInvariant()
+}
+
+# 解压同理：优先 .NET（不依赖 Expand-Archive），失败再退回 cmdlet。
+function Expand-ZipPackage([string]$Zip, [string]$Destination) {
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Destination, $true)
+    } catch {
+        if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+            Expand-Archive -Path $Zip -DestinationPath $Destination -Force
+        } else {
+            throw "解压驱动包失败：$($_.Exception.Message)"
+        }
+    }
+}
+
 function Assert-PackageIntegrity {
     if (-not (Test-Path $MsiPath) -or -not (Test-Path $CertPath)) {
         if (Test-Path $ZipPath) {
-            $zipHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+            $zipHash = Get-FileSha256 $ZipPath
             if ($zipHash -ne $ExpectedZipSha256) {
                 throw "驱动压缩包 SHA256 校验失败: $zipHash"
             }
-            Expand-Archive -Path $ZipPath -DestinationPath $InstallerDir -Force
+            Expand-ZipPackage $ZipPath $InstallerDir
         } else {
             throw "未找到 virtual-display-rs $ExpectedVersion 安装包，请从 https://github.com/MolotovCherry/virtual-display-rs/releases 下载。"
         }
     }
 
-    $msiHash = (Get-FileHash $MsiPath -Algorithm SHA256).Hash
+    $msiHash = Get-FileSha256 $MsiPath
     if ($msiHash -ne $ExpectedMsiSha256) {
         throw "MSI SHA256 校验失败 ($msiHash != $ExpectedMsiSha256)"
     }
 
-    $certHash = (Get-FileHash $CertPath -Algorithm SHA256).Hash
+    $certHash = Get-FileSha256 $CertPath
     if ($certHash -ne $ExpectedCertSha256) {
         throw "证书 SHA256 校验失败 ($certHash != $ExpectedCertSha256)"
     }
