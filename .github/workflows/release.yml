@@ -80,14 +80,10 @@ jobs:
       - name: Build release
         run: cargo build --release -p snug-app
 
-      - name: Preflight (version / size / manifest / deps)
+      - name: Fetch virtual display driver
+        # 驱动跟着包一起发：下载官方安装包并核对 SHA-256（脚本里写死版本与哈希）。
         shell: pwsh
-        run: |
-          $exe = 'target\release\snug.exe'
-          $cliArgs = @('-File', 'scripts\preflight.ps1', '-Exe', $exe)
-          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
-          pwsh @cliArgs
-          if ($LASTEXITCODE -ne 0) { throw "preflight 未通过 ($LASTEXITCODE)" }
+        run: pwsh -File scripts\fetch-driver.ps1
 
       - name: Package assets
         shell: pwsh
@@ -97,6 +93,16 @@ jobs:
           pwsh @cliArgs
           if ($LASTEXITCODE -ne 0) { throw "打包失败 ($LASTEXITCODE)" }
           Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Preflight (version / size / manifest / deps / package)
+        # 放在打包之后：门禁里有一项是核对 dist 里那个 zip 的结构与校验和。
+        shell: pwsh
+        run: |
+          $exe = 'target\release\snug.exe'
+          $cliArgs = @('-File', 'scripts\preflight.ps1', '-Exe', $exe)
+          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
+          pwsh @cliArgs
+          if ($LASTEXITCODE -ne 0) { throw "preflight 未通过 ($LASTEXITCODE)" }
 
       - name: Generate release notes
         shell: pwsh

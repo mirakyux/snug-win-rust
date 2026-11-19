@@ -16,3 +16,7 @@ tools/refdump/geometry/obj/
 
 # 提交用的临时消息文件（每笔提交前写这里，别进仓库）
 .commitmsg.txt
+
+# 驱动安装包（3 MB，打包时由 scripts/fetch-driver.ps1 下载并核对 SHA-256）
+driver/virtual-desktop-driver-installer-x64.zip
+driver/installer/

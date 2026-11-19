@@ -9,11 +9,19 @@ SnugWin 的 Rust 重写。原项目是 [zephyr4123/snug](https://github.com/zeph
 
 ## 下载
 
-到 [Releases](../../releases) 下最新的 `Snug-v1.3.0-win-x64-selfcontained.zip`，
-解压就是一个 `snug.exe`（**6.64 MiB**，不需要 .NET / VC++ 运行库），双击运行、允许 UAC 即可。
+到 [Releases](../../releases) 下最新的 `Snug-v1.3.0-win-x64-selfcontained.zip`
+（6.19 MiB），解压得到：
 
-需要先装一次虚拟显示器驱动 [virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 0.3.x
-（本项目不打包驱动）；装好后 `\\.\pipe\virtualdisplaydriver` 存在，才会建出手机屏。
+```text
+snug.exe                                    # 6.64 MiB 单文件，不需要 .NET / VC++ 运行库
+driver\Install-SnugDriver.ps1               # 一键安装/修复虚拟屏驱动
+driver\install-driver.cmd                   # 上面的批处理入口（双击即可）
+driver\virtual-desktop-driver-installer-x64.zip   # 官方驱动安装包（SHA-256 已核对）
+```
+
+双击 `snug.exe`（允许 UAC），如果还没装过虚拟屏驱动，在设置页点「安装驱动」即可——
+安装脚本会核对安装包与证书的 SHA-256，用的是
+[virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 0.3.1。
 
 ## 为什么重写
 

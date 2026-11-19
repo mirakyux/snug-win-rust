@@ -11,14 +11,27 @@ Windows 上的 **网易 UU远程** 伴侣程序：在电脑上开一块竖直的
 
 | 资产 | 说明 |
 | --- | --- |
-| `Snug-v{{VERSION}}-win-x64-selfcontained.zip` | 绿色便携版：解压得到单文件 `snug.exe`，无运行时依赖，双击即用（会请求管理员权限） |
+| `Snug-v{{VERSION}}-win-x64-selfcontained.zip` | 绿色便携版：解压即用，无运行时依赖（不需要 .NET / VC++ 运行库），已内置虚拟显示器驱动安装包 |
 | `checksums.txt` | 资产的 SHA-256 |
 
-### 安装前提
+解压后：
 
-本项目**不含**虚拟显示器驱动，需要先装一次
-[virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs)（0.3.x）。
-装好后 `\\.\pipe\virtualdisplaydriver` 存在，Snug 才能建屏。
+```text
+snug.exe                                         单文件程序
+driver\Install-SnugDriver.ps1                    一键安装/修复驱动
+driver\install-driver.cmd                        上面的批处理入口
+driver\virtual-desktop-driver-installer-x64.zip  官方驱动安装包（SHA-256 已核对）
+```
+
+### 安装两步
+
+```text
+1. 双击 snug.exe（允许 UAC 管理员权限）；
+2. 设置页 → 驱动 → 「安装驱动」。脚本会校验安装包与证书 SHA-256，
+   已装过同款驱动则原样保留，不会覆盖用户自装的版本。
+```
+
+也可以先双击 `driver\install-driver.cmd` 装驱动，再启动 `snug.exe`。
 
 ### 本版变化
 

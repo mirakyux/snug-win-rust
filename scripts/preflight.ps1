@@ -249,10 +249,20 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
     } finally {
         $archive.Dispose()
     }
-    if ($entries.Count -ne 1 -or $entries[0] -ne 'snug.exe') {
-        Fail ("zip 结构不对：应为且仅为 snug.exe，实际 [{0}]" -f ($entries -join ', '))
+    # 发行包结构：根目录 snug.exe + driver\ 里的安装脚本与官方驱动安装包。
+    # 驱动必须跟着发——用户解压就能装，不该先去别处找驱动。
+    $expected = @(
+        'snug.exe',
+        'driver/Install-SnugDriver.ps1',
+        'driver/install-driver.cmd',
+        'driver/virtual-desktop-driver-installer-x64.zip'
+    )
+    $missing = @($expected | Where-Object { $entries -notcontains $_ })
+    $extra = @($entries | Where-Object { $expected -notcontains $_ })
+    if ($missing.Count -gt 0 -or $extra.Count -gt 0) {
+        Fail ("zip 结构不对：缺少 [{0}]，多出 [{1}]" -f ($missing -join ', '), ($extra -join ', '))
     } else {
-        Pass 'zip 根目录只有 snug.exe'
+        Pass 'zip 里是 snug.exe + driver\（安装脚本与官方驱动包）'
     }
 
     if (-not (Test-Path -LiteralPath $checksumsPath)) {
