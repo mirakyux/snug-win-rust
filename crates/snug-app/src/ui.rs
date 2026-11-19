@@ -28,8 +28,14 @@ pub const WINDOW_TITLE: &str = "Snug 手机屏";
 pub struct PhoneHomeApp {
     pub config: AppConfig,
     pub paths: Paths,
-    /// 虚拟屏驱动管道是否就绪（平台层尚未接通时只用于界面提示）。
+    /// 虚拟屏驱动管道是否就绪。
+    ///
+    /// **不是启动那一刻的死快照**：驱动自动安装是在运行过程中完成的，用启动时的值
+    /// 会让设置窗在装完驱动后还写着「未检测到」（真机反馈）。所以这个字段是缓存，
+    /// 由 [`Self::refresh_settings_status`] 定时刷新。
     pub pipe_ready: bool,
+    /// 上次查驱动状态的时间（设置窗开着时每帧都会问一次，按 250ms 节流）。
+    pipe_checked: Option<std::time::Instant>,
     pub controller: Controller,
     pub tab: HomeTab,
     pub search: String,
@@ -145,6 +151,7 @@ impl PhoneHomeApp {
             config,
             paths,
             pipe_ready,
+            pipe_checked: None,
             controller,
             tab: HomeTab::Running,
             search: String::new(),
@@ -735,6 +742,7 @@ impl PhoneHomeApp {
 
     /// 把界面读到的运行态喂给设置窗（对应 C# 每次打开设置窗时的 `Refresh`）。
     fn refresh_settings_status(&mut self) {
+        self.refresh_pipe_state();
         let state = self.state();
         let status = StatusInfo {
             pipe_available: self.pipe_ready,
@@ -751,6 +759,32 @@ impl PhoneHomeApp {
         // 日志框：只在"驱动与日志"页增量刷新，别每帧把整个文件读进文本框。
         if self.settings.tab() == SettingsTab::Diagnostics {
             self.refresh_logs();
+        }
+    }
+
+    /// 重新查一次驱动管道状态（250ms 节流；只在设置窗开着时被调）。
+    ///
+    /// 没有这一步，自动装完驱动后设置窗会一直显示「未检测到」——因为它读的是启动
+    /// 那一刻的值。状态翻转记一行日志，便于和安装日志对上时间。
+    fn refresh_pipe_state(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        let stale = self
+            .pipe_checked
+            .map(|last| now.duration_since(last) >= INTERVAL)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        self.pipe_checked = Some(now);
+        let live = crate::driver::pipe_available();
+        if live != self.pipe_ready {
+            crate::info!(
+                "驱动：管道状态 {} → {}",
+                if self.pipe_ready { "就绪" } else { "未就绪" },
+                if live { "就绪" } else { "未就绪" }
+            );
+            self.pipe_ready = live;
         }
     }
 
