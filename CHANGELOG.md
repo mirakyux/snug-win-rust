@@ -114,7 +114,7 @@ exe 资源版本、更新器比较用的版本都从这里来。
 
 ### 体积与发布包
 
-`snug.exe` **6.67 MiB**（6,996,480 B），上限 8 MiB。明细见
+`snug.exe` **6.67 MiB**（6,995,968 B），上限 8 MiB。明细见
 [`docs/size-budget.md`](docs/size-budget.md)。
 
 发布 zip **6.21 MiB**，里面是 `snug.exe` + `driver\`（官方虚拟显示器驱动安装包 3.27 MB

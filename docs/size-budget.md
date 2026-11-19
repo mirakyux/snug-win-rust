@@ -7,8 +7,8 @@
 
 | 项 | 大小 | 时间 |
 | --- | --- | --- |
-| `target/release-check/release/snug.exe`（1.3.0） | 6,996,480 B（6.67 MiB） | 2026-11-19 |
-| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 6,510,239 B（6.21 MiB） | 2026-11-19 |
+| `target/release-check/release/snug.exe`（1.3.0） | 6,995,968 B（6.67 MiB） | 2026-11-19 |
+| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 6,510,526 B（6.21 MiB） | 2026-11-19 |
 
 > zip 里现在带 `driver\`（官方驱动安装包 3.27 MB + 两个安装脚本），所以整包从 3.08 MiB
 > 涨到 6.21 MiB。这是必须的：用户解压就要能装驱动，不该先去别处找。
