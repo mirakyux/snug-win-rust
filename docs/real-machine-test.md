@@ -109,8 +109,62 @@ Shell / 提权通道，表现为弹「打开文件 - 安全警告」或长时间
 `scripts/smoke-test.ps1` 已改成 `ProcessStartInfo(UseShellExecute=$false)`；手工测时在
 PowerShell 里直接 `.\target\release\snug.exe` 即可。
 
-## 出问题看哪里
+## 开机自启（计划任务）怎么验
 
+```powershell
+# 1. 注册/核对：设置里的开关调的就是这一段（StartupService → schtasks /Create /XML）
+schtasks /Query /TN SnugWinAutoStart /XML |
+    Select-String '<Command>|<Arguments>|<WorkingDirectory>|RunLevel'
+#    期望：Command=当前 exe、Arguments=--minimized、WorkingDirectory=exe 目录、RunLevel=HighestAvailable
+
+# 2. 立刻跑一次（等价于"登录时触发"）
+schtasks /Run /TN SnugWinAutoStart
+
+# 3. 日志里应当有两行
+#    [Info] 启动形态：开机自启（--minimized，不闪窗、不抢焦点）
+#    [Info] 虚拟屏驱动管道：就绪
+```
+
+实测结论（2026-11-19）：**任务调度器直启这个 exe 是好用的**，登录触发 / 最高权限 /
+工作目录都对，起来后正常常驻、正常写日志。带 `--minimized` 时窗口创建在屏幕外
+（实测 `-32768,-32768`），不带时创建在 `76,76`（自启时会闪一下，这就是这个参数的意义）。
+
+> 以前这里写过"从任务启动会秒退、连日志都不写"，那是**误判**，别再照着查。
+> 真正容易看错的是单实例：同一个数据目录下已有实例时，任务拉起的进程会按单实例锁
+> 正常退出（日志 `已有实例在运行，本次退出`），看起来就像"没起来"。
+
+## 驱动自动安装怎么验
+
+```powershell
+# 卸掉本机的官方 0.3.1（本机装的就是它）
+Start-Process msiexec.exe -Wait -ArgumentList '/x "{605D17E8-32FF-4B09-9247-122A1AACFAAD}" /passive /norestart'
+[IO.File]::Exists('\\.\pipe\virtualdisplaydriver')   # 应当 False
+
+# 冷启动程序，日志应当依次出现：
+#   驱动：检测到虚拟显示器驱动未就绪，自动安装（…\driver\Install-SnugDriver.ps1）
+#   驱动：[OK] SHA256 & 证书指纹校验通过 (5DFA…)
+#   驱动：[2/3] 安装 virtual-display-driver-0.3.1-x86_64.msi...
+#   驱动：命名管道已就绪，可以建手机屏了
+#   desk: 手机屏 #0 已就绪（540 宽）
+```
+
+真机耗时：脚本 2.6 秒装完，冷启动到手机屏就绪约 6 秒。
+
+**四个坑（都已在代码里修掉；改脚本或改调用方式前先读一遍）：**
+
+1. `driver\Install-SnugDriver.ps1` 必须 **UTF-8 with BOM**。程序用 `powershell.exe`（5.1）
+   拉它，5.1 对没有 BOM 的文件按系统 ANSI 代码页读，中文注释会把语法读崩
+   （`ParserError: switch 语句缺少代码块`）。`build-release.ps1` / `preflight.ps1` 都加了
+   检查，缺 BOM 直接失败——**用编辑工具改完这个脚本后要重新存成带 BOM 的 UTF-8**。
+2. 拉起 `powershell.exe` 时**不要**把父进程的 `PSModulePath` 传下去。父进程若是 PS7，
+   5.1 会去 PS7 的模块目录找 `Microsoft.PowerShell.Utility` 并失败，`Get-FileHash` 之类
+   cmdlet 全部"不存在"（`driver.rs` 里 `.env_remove("PSModulePath")`）。
+3. 子进程输出是控制台代码页（简中 936），按 UTF-8 读进日志全是替换符。
+   现在用 `-Command` 先把 `[Console]::OutputEncoding` 钉成 UTF-8 再跑脚本。
+4. 判断"驱动已装"必须按 HardwareID `virtualdisplaydriver`，不能按显示名——
+   UU 的 `GameViewer Virtual Display Adapter` 名字里也有 "Virtual Display"，会被误认成自己。
+
+## 出问题看哪里
 - 平台层告警走 `snug_win::set_warn_sink` → 应用日志的 `[Warn]`，不再只进 stderr。
 - 建屏/撤屏失败会按 `5 / 15 / 30` 秒重试三次（C# 同）；日志里能看到每次尝试。
 - 手机屏最短存活 2.5 秒、断开防抖 1.5 秒 + 静默期 5 秒、重连窗口 15 秒——这些是照抄 C# 的时序，

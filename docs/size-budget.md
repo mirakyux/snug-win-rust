@@ -7,17 +7,18 @@
 
 | 项 | 大小 | 时间 |
 | --- | --- | --- |
-| `target/release-check/release/snug.exe`（1.3.0） | 6,963,200 B（6.64 MiB） | 2026-11-19 |
-| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 6,493,084 B（6.19 MiB） | 2026-11-19 |
+| `target/release-check/release/snug.exe`（1.3.0） | 6,999,040 B（6.67 MiB） | 2026-11-19 |
+| `dist/Snug-v1.3.0-win-x64-selfcontained.zip` | 6,510,385 B（6.21 MiB） | 2026-11-19 |
 
 > zip 里现在带 `driver\`（官方驱动安装包 3.27 MB + 两个安装脚本），所以整包从 3.08 MiB
-> 涨到 6.19 MiB。这是必须的：用户解压就要能装驱动，不该先去别处找。
+> 涨到 6.21 MiB。这是必须的：用户解压就要能装驱动，不该先去别处找。
 > `snug.exe` 本身的体积预算不受影响，仍是 8 MiB。
 
 历史：5.09 MiB → 6.13 MiB（加托盘、截图、UU 探测、App 资源库）
 → 6.26 MiB（修 bug）→ 6.56 MiB（多屏 `DeskSet`、主题、控制中心设置页、重入胶囊）
 → 6.59 MiB（退出手机屏确认条）→ 6.59 MiB（1.3.0 收尾：自定义分辨率与自定屏名）
-→ 6.64 MiB（真机修复：会话判定、退出上限、窗口枚举提速、连点去重、搜索过滤）。
+→ 6.64 MiB（真机修复：会话判定、退出上限、窗口枚举提速、连点去重、搜索过滤）
+→ 6.67 MiB（开机自启 `--minimized`、管道探测兜底、驱动自动安装的三处真机修复）。
 
 > 注意：`target/release/snug.exe` 正在运行时无法被覆盖，release 构建会报
 > `failed to remove file`。要么先退出程序，要么用独立目录验证：

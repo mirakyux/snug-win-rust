@@ -10,10 +10,10 @@ SnugWin 的 Rust 重写。原项目是 [zephyr4123/snug](https://github.com/zeph
 ## 下载
 
 到 [Releases](../../releases) 下最新的 `Snug-v1.3.0-win-x64-selfcontained.zip`
-（6.19 MiB），解压得到：
+（6.21 MiB），解压得到：
 
 ```text
-snug.exe                                    # 6.64 MiB 单文件，不需要 .NET / VC++ 运行库
+snug.exe                                    # 6.67 MiB 单文件，不需要 .NET / VC++ 运行库
 driver\Install-SnugDriver.ps1               # 一键安装/修复虚拟屏驱动
 driver\install-driver.cmd                   # 上面的批处理入口（双击即可）
 driver\virtual-desktop-driver-installer-x64.zip   # 官方驱动安装包（SHA-256 已核对）
@@ -27,7 +27,7 @@ driver\virtual-desktop-driver-installer-x64.zip   # 官方驱动安装包（SHA-
 ## 为什么重写
 
 - `.NET` 桌面 UI（WPF）不支持 NativeAOT，自包含发布要 180 MB 磁盘；Rust 版目标是 10 MB 级别。
-  实际产物：**6.64 MiB 单 exe**（发布 zip 3.08 MiB）。
+  实际产物：**6.67 MiB 单 exe**（发布 zip 6.21 MiB，含驱动安装包）。
 - 原版最值钱的是行为细节（窗口归位、字号记忆、手势判定的各种边界），
   这些都在 `SnugWin.Core` 里，可以逐文件对照移植，并有单测兜底。
 - 平台层用 `windows` crate 直接调 Win32 / COM，省掉一层托管封装。
@@ -66,8 +66,13 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
 | 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
 
-全仓 **490 条单测**（core 221 / win 217 / app 48 / 几何对拍 3 / SHA-256 对拍 1），
+全仓 **497 条单测**（core 221 / win 218 / app 54 / 几何对拍 3 / SHA-256 对拍 1），
 `rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
+
+**开机自启**在设置里开（「开机静默自启动」）。它注册一条计划任务
+（`SnugWinAutoStart`，登录触发、最高权限、参数 `--minimized`）：开机后后台常驻托盘，
+**不弹窗、不抢焦点**，手机屏就绪了才把界面摆上虚拟屏。换 exe 目录后会自动把任务里的
+路径改过去。
 
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
 多屏形态（单窗口 + 顶部切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；

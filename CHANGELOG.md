@@ -78,12 +78,42 @@ exe 资源版本、更新器比较用的版本都从这里来。
 - 「找关闭按钮」（UIA，真机 0.6–1.5 秒）挪到铺好之后再做，不再挡住"窗口已铺好"的状态发布。
 - 连点同一个 App 只认第一次：一次铺开要 1–5 秒，原先等待期间再点几下会排成好几条。
 
+### 开机自启与驱动自动安装（真机走通）
+
+- **开机自启本身就没坏过**：设置里的开关注册的是计划任务 `SnugWinAutoStart`
+  （登录触发、`HighestAvailable`、参数 `--minimized`、工作目录=exe 目录）。
+  真机复验：用产品自己的 `StartupService` 注册 → `schtasks /Query /XML` 字段全对 →
+  `schtasks /Run` 拉起后进程正常常驻、写日志。之前那句「从任务启动会秒退、连日志都不写」
+  是误判，已在文档里改成实测结论。
+- `--minimized` 以前**没人解析**：自启和手动启动长得一模一样，窗口会先在主屏闪一下
+  （实测创建在 `76,76`）。现在它真的管用——带这个参数启动时窗口先建在屏幕外
+  （实测 `-32768,-32768`，不闪、不抢焦点），手机屏就绪后再由 `sync_window` 摆上去；
+  升级重启（`launch_apply_script`）也沿用这个形态，不会因为一次升级变成弹窗。
+- **管道探测会误判**：`Path::exists()` 在计划任务上下文里把"实例被占满"的管道答成不存在
+  （同一台机器：任务里报"未检测到"，手动启动报"就绪"），后果是白跑一遍 msiexec 安装。
+  现在用 `WaitNamedPipe(0)` 兜底：只有 `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`
+  才算不存在，`ERROR_SEM_TIMEOUT`（实例全忙）和拒绝访问都算在。
+- **自动安装端到端跑通**：卸掉 0.3.1 后冷启动 → 2.6 秒装完、6 秒内手机屏就绪。
+  这一趟真机把只有"真装一次"才会暴露的问题挖了出来：
+  1. 安装脚本是 UTF-8 **无 BOM**，而程序用 `powershell.exe`（5.1）拉它——5.1 按系统 ANSI
+     读文件，中文注释直接把语法读崩（`ParserError: switch 语句缺少代码块`）。
+     现在脚本带 BOM，并且 `build-release` / `preflight` 都会检查，缺了就报错不放行。
+  2. 脚本用 `Get-FileHash` / `Expand-Archive`。从 PS7 父进程启动时子进程继承 PS7 的
+     `PSModulePath`，5.1 会先去 PS7 的模块目录找 `Microsoft.PowerShell.Utility`（PS7 专用、
+     加载不了），这些 cmdlet 全"不存在"。程序侧不再传 `PSModulePath`；脚本自己用 .NET
+     算 SHA-256、用 `ZipFile` 解压，有 cmdlet 才退回 cmdlet。
+  3. 脚本输出按控制台代码页（936）编码，收进日志全成替换符（`驱动：����λ��…`）。
+     现在用 `-Command` 把子进程输出编码钉成 UTF-8，另加 ANSI/OEM 兜底解码。
+  4. 脚本判定"驱动已装"是按显示名匹配 `*Virtual Display*`，把 UU 的
+     `GameViewer Virtual Display Adapter` 也算成了自己。改成按 HardwareID
+     `virtualdisplaydriver` 认。
+
 ### 体积与发布包
 
-`snug.exe` **6.64 MiB**（6,963,200 B），上限 8 MiB。明细见
+`snug.exe` **6.67 MiB**（6,999,040 B），上限 8 MiB。明细见
 [`docs/size-budget.md`](docs/size-budget.md)。
 
-发布 zip **6.19 MiB**，里面是 `snug.exe` + `driver\`（官方虚拟显示器驱动安装包 3.27 MB
+发布 zip **6.21 MiB**，里面是 `snug.exe` + `driver\`（官方虚拟显示器驱动安装包 3.27 MB
 与安装脚本）。驱动跟着包走、而且**自动装**：启动时探不到
 `\\.\pipe\virtualdisplaydriver` 就在后台跑安装脚本（核对安装包与证书 SHA-256），
 装完直接建屏；已经装过同款驱动则原样保留。设置页的「安装驱动」按钮留作修复用。
