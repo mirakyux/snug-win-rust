@@ -1,0 +1,148 @@
+name: Release
+
+# **手动触发**：Actions → Release → Run workflow。
+# 参考项目（nicocart/snug-win）是「推 tag 自动发 + 手动兜底」两路，这里只留手动那一路：
+# 发版前要跑真机验收（docs/acceptance.md），验收没过就不该让一次 push 直接把包发出去。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（留空则用根 Cargo.toml 的版本，如 v1.3.0）'
+        required: false
+      draft:
+        description: '创建为草稿（不公开）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-manual
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build & publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag and version
+        id: meta
+        shell: pwsh
+        run: |
+          # 版本号只有一个来源：根 Cargo.toml 的 [workspace.package] version。
+          $toml = Get-Content 'Cargo.toml' -Raw
+          $m = [regex]::Match($toml, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { throw "根 Cargo.toml 里找不到 [workspace.package] version" }
+          $version = $m.Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "版本号格式不对：$version" }
+
+          $tag = '${{ inputs.tag }}'.Trim()
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v$version" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "tag 必须形如 v1.2.3，收到：$tag" }
+          if ($tag -ne "v$version") {
+            throw "tag '$tag' 与 Cargo.toml 的版本 '$version' 不一致。资产名按 exe 版本生成，发出去会对不上。"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag"         >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version tag=$tag"
+
+      - name: Configure update source (optional)
+        # 编译期 SNUG_RELEASES_REPO 决定"检查更新"用哪个仓库。仓库变量没配就**不设**，
+        # 否则 option_env! 会拿到空串，更新器会当成"配了一个空仓库"。
+        shell: pwsh
+        run: |
+          $repo = '${{ vars.SNUG_RELEASES_REPO }}'.Trim()
+          if ([string]::IsNullOrWhiteSpace($repo)) {
+            Write-Host "未配置仓库变量 SNUG_RELEASES_REPO：本次构建的「检查更新」不可用"
+          } else {
+            "SNUG_RELEASES_REPO=$repo" >> $env:GITHUB_ENV
+            Write-Host "更新源 = $repo"
+          }
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        # 全仓单测是发版门禁的一部分：真机行为另照 docs/acceptance.md 手验。
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p snug-app
+
+      - name: Preflight (version / size / manifest / deps)
+        shell: pwsh
+        run: |
+          $exe = 'target\release\snug.exe'
+          $cliArgs = @('-File', 'scripts\preflight.ps1', '-Exe', $exe)
+          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
+          pwsh @cliArgs
+          if ($LASTEXITCODE -ne 0) { throw "preflight 未通过 ($LASTEXITCODE)" }
+
+      - name: Package assets
+        shell: pwsh
+        run: |
+          $cliArgs = @('-File', 'scripts\build-release.ps1', '-Exe', 'target\release\snug.exe')
+          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
+          pwsh @cliArgs
+          if ($LASTEXITCODE -ne 0) { throw "打包失败 ($LASTEXITCODE)" }
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          $version = '${{ steps.meta.outputs.version }}'
+          $tag = '${{ steps.meta.outputs.tag }}'
+
+          # 自上一个 tag 以来的提交，作为「本版变化」的原始素材。
+          $prev = git describe --tags --abbrev=0 --exclude "$tag" "$tag^" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $prev) {
+            $commits = @(git log --pretty=format:'- %s (`%h`)' "$prev..HEAD")
+            $header = "自 ``$prev`` 以来的提交："
+            $compare = "https://github.com/${{ github.repository }}/compare/$prev...$tag"
+          } else {
+            $prev = ''
+            $commits = @(git log --pretty=format:'- %s (`%h`)' -20 HEAD)
+            $header = "最近 20 条提交："
+            $compare = "https://github.com/${{ github.repository }}/commits/$tag"
+          }
+
+          $pkgs = Get-ChildItem 'dist' -File | Where-Object { $_.Extension -in '.zip', '.exe' } | Sort-Object Name
+          $lines = @(foreach ($f in $pkgs) { '{0}  {1}' -f (Get-FileHash $f.FullName -Algorithm SHA256).Hash, $f.Name })
+          $lines | Set-Content 'dist\checksums.txt' -Encoding utf8
+
+          $fence = '```'
+          $tail = @('', '### 校验和', '', ($fence + 'text')) + $lines + @($fence, '')
+          $body = (Get-Content '.github\release-notes-template.md' -Raw -Encoding utf8)
+          $body = $body.Replace('{{VERSION}}', $version)
+          $body = $body.Replace('{{TAG}}', $tag)
+          $body = $body.Replace('{{PREVIOUS}}', $prev)
+          $body = $body.Replace('{{COMPARE}}', $compare)
+          $body = $body.Replace('{{COMMITS}}', ((@($header, '') + $commits) -join "`r`n"))
+          $body = $body + ($tail -join "`r`n")
+          Set-Content 'dist\release-notes.md' -Value $body -Encoding utf8
+          Write-Host "release notes: $((Get-Item 'dist\release-notes.md').Length) bytes"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Snug v${{ steps.meta.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: dist/release-notes.md
+          draft: ${{ inputs.draft }}
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/Snug-v${{ steps.meta.outputs.version }}-win-x64-selfcontained.zip
+            dist/checksums.txt

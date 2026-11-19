@@ -7,10 +7,18 @@ SnugWin 的 Rust 重写。原项目是 [zephyr4123/snug](https://github.com/zeph
 
 当前版本 **1.3.0**，对齐 C# 原版 v1.3.0 的功能面。改动明细见 [CHANGELOG.md](CHANGELOG.md)。
 
+## 下载
+
+到 [Releases](../../releases) 下最新的 `Snug-v1.3.0-win-x64-selfcontained.zip`，
+解压就是一个 `snug.exe`（**6.64 MiB**，不需要 .NET / VC++ 运行库），双击运行、允许 UAC 即可。
+
+需要先装一次虚拟显示器驱动 [virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 0.3.x
+（本项目不打包驱动）；装好后 `\\.\pipe\virtualdisplaydriver` 存在，才会建出手机屏。
+
 ## 为什么重写
 
 - `.NET` 桌面 UI（WPF）不支持 NativeAOT，自包含发布要 180 MB 磁盘；Rust 版目标是 10 MB 级别。
-  实际产物：**6.59 MiB 单 exe**。
+  实际产物：**6.64 MiB 单 exe**（发布 zip 3.08 MiB）。
 - 原版最值钱的是行为细节（窗口归位、字号记忆、手势判定的各种边界），
   这些都在 `SnugWin.Core` 里，可以逐文件对照移植，并有单测兜底。
 - 平台层用 `windows` crate 直接调 Win32 / COM，省掉一层托管封装。
@@ -49,13 +57,16 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
 | 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
 
+全仓 **490 条单测**（core 221 / win 217 / app 48 / 几何对拍 3 / SHA-256 对拍 1），
+`rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
+
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
 多屏形态（单窗口 + 顶部切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
 线程与锁纪律见 [`docs/desk-threading.md`](docs/desk-threading.md)。
 
 ## 构建
 
-需要 Rust（stable，edition 2024）+ MSVC 工具链 + Windows SDK。
+需要 Rust（stable 1.89+，edition 2024）+ MSVC 工具链 + Windows SDK。
 
 ```powershell
 cargo test --workspace
@@ -68,6 +79,15 @@ pwsh -File scripts/build-release.ps1    # 打 dist/ 里的 zip + checksums.txt
 ```powershell
 cargo build --release -p snug-app --offline --target-dir target\release-check
 ```
+
+## 发版
+
+**手动触发**：GitHub → Actions → `Release` → Run workflow。
+工作流会用根 `Cargo.toml` 的版本推导 tag（也可手填），依次跑全仓单测、
+release 构建、`scripts/preflight.ps1` 静态门禁、`scripts/build-release.ps1` 打包，
+然后建 GitHub Release 并上传 zip 与 `checksums.txt`。
+
+本地等价流程与资产命名规则见 [docs/release.md](docs/release.md)。
 
 ## 文档
 
