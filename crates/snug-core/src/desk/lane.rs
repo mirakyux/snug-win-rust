@@ -26,6 +26,8 @@ enum LaneJob<T> {
         done: Option<Sender<()>>,
         /// 入队时刻：执行时算"排了多久"，真机调试队列积压用。
         queued_at: std::time::Instant,
+        /// 入队处的源码位置：慢动作日志靠它指名道姓。
+        site: &'static std::panic::Location<'static>,
     },
     /// 关闭工作线程。桌面状态自己攥着发送端，靠这条消息才能停下来。
     Stop,
@@ -33,6 +35,13 @@ enum LaneJob<T> {
 
 pub(crate) struct SerialLane<T: Send + 'static> {
     tx: Sender<LaneJob<T>>,
+}
+
+/// 把源码位置缩成 `engine.rs:1248` 这种短形式（完整路径太长，stderr 里看不清）。
+fn where_of(site: &'static std::panic::Location<'static>) -> String {
+    let file = site.file();
+    let short = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    format!("{short}:{}", site.line())
 }
 
 impl<T: Send + 'static> Clone for SerialLane<T> {
@@ -55,18 +64,20 @@ impl<T: Send + 'static> SerialLane<T> {
                 let mut state = state;
                 while let Ok(job) = rx.recv() {
                     match job {
-                        LaneJob::Run { run, done, queued_at } => {
+                        LaneJob::Run { run, done, queued_at, site } => {
                             // 队列积压/动作过慢是"界面点了没反应"的头号嫌疑，超过阈值
                             // 就写一行 stderr（真机联调时把 stderr 重定向到文件看）。
+                            // 带上入队处的源码位置，否则只知道"有个动作慢了 3 秒"，
+                            // 还得靠时间戳猜是哪一个。
                             let waited = queued_at.elapsed().as_secs_f64();
                             if waited > SLOW_THRESHOLD {
-                                eprintln!("[lane] 动作排队 {waited:.1}s 才轮到");
+                                eprintln!("[lane] 动作排队 {waited:.1}s 才轮到（{}）", where_of(site));
                             }
                             let started = std::time::Instant::now();
                             run(&mut state);
                             let took = started.elapsed().as_secs_f64();
                             if took > SLOW_THRESHOLD {
-                                eprintln!("[lane] 单个动作执行了 {took:.1}s");
+                                eprintln!("[lane] 单个动作执行了 {took:.1}s（{}）", where_of(site));
                             }
                             if let Some(done) = done {
                                 let _ = done.send(());
@@ -87,16 +98,54 @@ impl<T: Send + 'static> SerialLane<T> {
     }
 
     /// 入队一个动作，不等它执行（对应 C# `_lane.Run`）。
+    #[track_caller]
     pub(crate) fn run(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
-        let _ = self.tx.send(LaneJob::Run { run: Box::new(operation), done: None, queued_at: std::time::Instant::now() });
+        self.run_at(std::panic::Location::caller(), operation);
+    }
+
+    /// 同 [`Self::run`]，但入队位置由调用方给（需要把位置继续往下传时用）。
+    pub(crate) fn run_at(
+        &self,
+        site: &'static std::panic::Location<'static>,
+        operation: impl FnOnce(&mut T) + Send + 'static,
+    ) {
+        let _ = self.tx.send(LaneJob::Run {
+            run: Box::new(operation),
+            done: None,
+            queued_at: std::time::Instant::now(),
+            site,
+        });
     }
 
     /// 入队并等它执行完；供 watch 线程等一次桌面动作返回。
     ///
     /// 不要在队列里的动作内部调用，否则工作线程会等自己（死锁）。
+    ///
+    /// 生产路径一律走 [`Self::call_at`]（`DeskSlot` 会把源码位置继续传下来），
+    /// 这里只留给测试。
+    #[cfg(test)]
+    #[track_caller]
     pub(crate) fn call(&self, operation: impl FnOnce(&mut T) + Send + 'static) {
+        self.call_at(std::panic::Location::caller(), operation);
+    }
+
+    /// 同 [`Self::call`]，但入队位置由调用方给。
+    pub(crate) fn call_at(
+        &self,
+        site: &'static std::panic::Location<'static>,
+        operation: impl FnOnce(&mut T) + Send + 'static,
+    ) {
         let (done, wait) = channel();
-        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done), queued_at: std::time::Instant::now() }).is_err() {
+        if self
+            .tx
+            .send(LaneJob::Run {
+                run: Box::new(operation),
+                done: Some(done),
+                queued_at: std::time::Instant::now(),
+                site,
+            })
+            .is_err()
+        {
             // 工作线程已经退出，不再等待。
             return;
         }
@@ -108,13 +157,25 @@ impl<T: Send + 'static> SerialLane<T> {
     /// 给**收尾**用：退出时不能无限等在飞的长动作（一次建屏 = 8 秒 × 候选数，
     /// 后面还可能跟着最短存活 2.5 秒与拓扑沉降 1 秒）。超时说明这条动作没跑完，
     /// 调用方要把"没撤干净"记进日志；虚拟屏由归属记录在下次启动时兜底清理。
-    pub(crate) fn call_timeout(
+    ///
+    /// 位置由调用方给（`DeskSlot` 会把源码位置传下来），所以没有 `#[track_caller]` 版本。
+    pub(crate) fn call_timeout_at(
         &self,
+        site: &'static std::panic::Location<'static>,
         timeout: std::time::Duration,
         operation: impl FnOnce(&mut T) + Send + 'static,
     ) -> bool {
         let (done, wait) = channel();
-        if self.tx.send(LaneJob::Run { run: Box::new(operation), done: Some(done), queued_at: std::time::Instant::now() }).is_err() {
+        if self
+            .tx
+            .send(LaneJob::Run {
+                run: Box::new(operation),
+                done: Some(done),
+                queued_at: std::time::Instant::now(),
+                site,
+            })
+            .is_err()
+        {
             return false;
         }
         wait.recv_timeout(timeout).is_ok()

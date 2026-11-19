@@ -87,6 +87,14 @@ impl Paths {
         self.data_dir.join("owned-displays.json")
     }
 
+    /// 每个 App 上次铺满用的屏宽（Rust 版自己加的，C# 没有这个文件）。
+    ///
+    /// 存它是为了跨进程省掉换档阶梯：C# 每次铺开都从基础宽（540）一档档试，
+    /// 真机上 QQ 要试到 850，每档一次显示模式变更，合计约 5 秒。
+    pub fn learned_widths_file(&self) -> PathBuf {
+        self.data_dir.join("learned-widths.json")
+    }
+
     pub fn log_directory(&self) -> PathBuf {
         self.data_dir.join("logs")
     }

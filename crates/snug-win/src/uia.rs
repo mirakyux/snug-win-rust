@@ -392,13 +392,33 @@ impl Uia {
     }
 }
 
-/// 给 `window` 模块用的关闭按钮查找器（每次现建 UIA 会话，避开跨线程 COM）。
+/// 给 `window` 模块用的关闭按钮查找器。
+///
+/// **每个线程复用一个 UIA 会话**：`Uia::new()` 要 `CoCreateInstance(CUIAutomation)`，
+/// 真机实测单次 500–1500ms；而一次铺满会连查好几轮（换档阶梯每档一轮），
+/// 原先每轮都新建，光这一步就要 1–3 秒，全算在"点了 App 多久才有反应"上。
+/// 复用之后同一窗口的查找是 50–170ms。
+///
+/// 用 thread_local 而不是全局缓存：COM 接口是套间绑定的，跨线程共享会出错；
+/// 桌面动作都跑在同一条 lane 线程上，正好每线程一个。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UiaCloseButtons;
 
+thread_local! {
+    /// 本线程的 UIA 会话（第一次用时建，之后复用）。
+    static UIA_CACHE: std::cell::RefCell<Option<Uia>> = const { std::cell::RefCell::new(None) };
+}
+
 impl crate::window::CloseButtonFinder for UiaCloseButtons {
     fn find_close_button(&self, handle: u64) -> Option<Rect> {
-        Uia::new().ok()?.find_close_button(handle)
+        UIA_CACHE.with(|cache| {
+            let mut slot = cache.borrow_mut();
+            if slot.is_none() {
+                // 建不出来就别缓存失败（下次重试，例如 COM 一时忙）。
+                *slot = Uia::new().ok();
+            }
+            slot.as_ref()?.find_close_button(handle)
+        })
     }
 }
 

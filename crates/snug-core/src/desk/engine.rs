@@ -182,6 +182,13 @@ pub(crate) struct SharedDeskBooks {
     pub(crate) zoom_file: Arc<JsonFileStore<ZoomBook>>,
     pub(crate) left_behind: Arc<Mutex<LeftBehindBook>>,
     pub(crate) left_behind_file: Arc<JsonFileStore<LeftBehindBook>>,
+    /// 每个 App 上次铺满用的屏宽，键是 `"<比例>|<app_id>"`。
+    ///
+    /// 存盘是为了**跨进程**也省掉换档阶梯：真机上 QQ 第一次要从 540 一档档试到 850，
+    /// 每档一次显示模式变更，合计 4.8 秒；记下来以后直接从 850 起步。
+    /// 键里带比例，换机型/换方向后旧记录自然失效。
+    pub(crate) learned_widths: Arc<Mutex<HashMap<String, i32>>>,
+    pub(crate) learned_widths_file: Arc<JsonFileStore<HashMap<String, i32>>>,
 }
 
 impl SharedDeskBooks {
@@ -193,7 +200,18 @@ impl SharedDeskBooks {
             Arc::new(JsonFileStore::<LeftBehindBook>::new(paths.left_behind_file()));
         let left_behind =
             Arc::new(Mutex::new(left_behind_file.load_or_quarantine().unwrap_or_default()));
-        Self { zoom_book, zoom_file, left_behind, left_behind_file }
+        let learned_widths_file =
+            Arc::new(JsonFileStore::<HashMap<String, i32>>::new(paths.learned_widths_file()));
+        let learned_widths =
+            Arc::new(Mutex::new(learned_widths_file.load_or_quarantine().unwrap_or_default()));
+        Self {
+            zoom_book,
+            zoom_file,
+            left_behind,
+            left_behind_file,
+            learned_widths,
+            learned_widths_file,
+        }
     }
 }
 
@@ -287,18 +305,24 @@ impl DeskSlot {
         Self { lane, id: id.into() }
     }
 
+    /// 这三个方法都带 `#[track_caller]` 并把位置继续传给 lane：
+    /// lane 的慢动作日志要指出"是哪一行入队的动作慢"，否则只能靠时间戳猜。
+    #[track_caller]
     fn run(&self, operation: impl FnOnce(&mut DeskCore) + Send + 'static) {
+        let site = std::panic::Location::caller();
         let id = self.id.clone();
-        self.lane.run(move |hub: &mut DeskHub| {
+        self.lane.run_at(site, move |hub: &mut DeskHub| {
             if let Some(core) = hub.core_mut(&id) {
                 operation(core);
             }
         });
     }
 
+    #[track_caller]
     fn call(&self, operation: impl FnOnce(&mut DeskCore) + Send + 'static) {
+        let site = std::panic::Location::caller();
         let id = self.id.clone();
-        self.lane.call(move |hub: &mut DeskHub| {
+        self.lane.call_at(site, move |hub: &mut DeskHub| {
             if let Some(core) = hub.core_mut(&id) {
                 operation(core);
             }
@@ -306,13 +330,15 @@ impl DeskSlot {
     }
 
     /// 同 [`Self::call`]，但最多等 `timeout`（收尾用）。
+    #[track_caller]
     fn call_timeout(
         &self,
         timeout: std::time::Duration,
         operation: impl FnOnce(&mut DeskCore) + Send + 'static,
     ) -> bool {
+        let site = std::panic::Location::caller();
         let id = self.id.clone();
-        self.lane.call_timeout(timeout, move |hub: &mut DeskHub| {
+        self.lane.call_timeout_at(site, timeout, move |hub: &mut DeskHub| {
             if let Some(core) = hub.core_mut(&id) {
                 operation(core);
             }
@@ -344,6 +370,12 @@ struct DeskHandle {
     shared: Arc<DeskShared>,
     /// 已经排了一个 `check_returns` 在队列里（去重，防止每拍入队把队列堵死）。
     check_pending: Arc<AtomicBool>,
+    /// 已经为哪个窗口排了"铺开"（去重：用户连点时只认第一次）。
+    ///
+    /// 一次铺开在真机上要 1–5 秒（换屏宽、挪窗口、找关闭按钮都在里面）。
+    /// 用户在等待期间再点几次，原先会排成好几条同样的动作，一条比一条更晚，
+    /// 表现就是"点了半天没反应，然后突然连着动几下"。
+    pull_pending: Arc<Mutex<Option<WindowKey>>>,
     /// 共享队列的拥有者；字段本身不读，靠它的 `Drop` 在工作线程用完时退出。
     _owner: Option<Arc<HubOwner>>,
 }
@@ -485,6 +517,7 @@ impl Desk {
                 slot,
                 shared,
                 check_pending: Arc::new(AtomicBool::new(false)),
+                pull_pending: Arc::new(Mutex::new(None)),
                 _owner: owner,
             }),
         }
@@ -861,6 +894,24 @@ impl Desk {
             core.check_returns();
             pending.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// 连点去重：这个窗口已经在排队的路上就返回 `false`（调用方直接放弃这次点击）。
+    ///
+    /// 一次铺开 1–5 秒，用户在等待期间通常会再点两下。若每次都入队，第二条、第三条
+    /// 就排在自己后面，看起来像"点了半天没反应，然后连着动几下"。
+    pub(crate) fn claim_pull(&self, window: WindowKey) -> bool {
+        let mut slot = self.inner.pull_pending.lock().unwrap_or_else(|e| e.into_inner());
+        if *slot == Some(window) {
+            return false;
+        }
+        *slot = Some(window);
+        true
+    }
+
+    /// 给入队闭包用的把手：动作跑完后清掉"正在铺开"的标记。
+    pub(crate) fn pull_guard(&self) -> Arc<Mutex<Option<WindowKey>>> {
+        Arc::clone(&self.inner.pull_pending)
     }
 
     /// 对应 C# `ShutdownAsync`：退出前把手机屏撤干净（阻塞到做完）。
@@ -1339,17 +1390,46 @@ impl DeskCore {
 
     /// 对应 C# `FillAsync`：把窗口挪进手机屏（必要时换更宽的档位）。
     fn fill(&mut self, placement: &mut Placement, id: u32) -> Option<Rect> {
+        // 每一步都量一下：真机上"点 App 要等 5 秒"，光看日志看不出是换屏宽、
+        // 挪窗口还是 UIA 找关闭按钮吃掉的。单步超过 300ms 就记一行。
+        let mut started = std::time::Instant::now();
+
         self.switch_width(id, placement.width);
+        let ms_switch = started.elapsed().as_secs_f64() * 1000.0;
+
+        started = std::time::Instant::now();
         let area = self.shared.displays.window_area_of(id)?;
         let got = self.shared.windows.move_window(placement.window.key, area)?;
+        let ms_move = started.elapsed().as_secs_f64() * 1000.0;
 
         placement.settled = Some(got);
         placement.record.filled = Some(got);
         self.write_record(&placement.record);
 
+        // 先算"要不要换更宽的档"：要换的话这一轮就白铺了，关闭按钮的位置也立刻作废，
+        // 不必去查（真机单轮 500–1500ms）。阶梯换成最终档后才查一次。
+        let placed_at_origin = (got.min_x() - area.min_x()).abs() < 2.0
+            && (got.min_y() - area.min_y()).abs() < 2.0;
+        let next_width = self
+            .shared
+            .displays
+            .width_of(id)
+            .filter(|_| placed_at_origin)
+            .map(|current| {
+                self.current_screen_fit()
+                    .width_to_fit(got.size(), area.size(), current)
+            })
+            .filter(|next| {
+                self.shared.displays.width_of(id).is_some_and(|current| {
+                    *next > current && *next != placement.width
+                })
+            });
+
+        let mut ms_close = 0.0;
         if placement.asking {
             self.set_state(self.state().with_close_button(None));
-        } else {
+        } else if next_width.is_none() {
+            started = std::time::Instant::now();
             let close_button = self.shared.windows.close_button(placement.window.key).map(|rect| {
                 CloseButton {
                     frame: rect,
@@ -1358,29 +1438,76 @@ impl DeskCore {
                 }
             });
             self.set_state(self.state().with_close_button(close_button));
+            ms_close = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        for (what, ms) in [("换屏宽", ms_switch), ("挪窗口", ms_move), ("找关闭按钮", ms_close)] {
+            if ms >= 300.0 {
+                self.log(format!("[耗时] 铺开·{what} {ms:.0}ms"));
+            }
         }
 
-        let placed_at_origin = (got.min_x() - area.min_x()).abs() < 2.0
-            && (got.min_y() - area.min_y()).abs() < 2.0;
-        if !placed_at_origin {
-            return Some(got);
-        }
-        let Some(current) = self.shared.displays.width_of(id) else {
+        let Some(next_width) = next_width else {
+            // 这一档就是最终档：记下它，下次铺同一个 App 直接从这档起步。
+            self.learn_width(&placement.window, placement.width);
             return Some(got);
         };
-        let next_width = self.current_screen_fit().width_to_fit(got.size(), area.size(), current);
-        if next_width <= current || next_width == placement.width {
-            return Some(got);
-        }
         self.log(format!(
-            "{} 在 {} 宽铺不满（实际 {}），换到 {} 宽",
+            "{} 在 {} 宽铺不满（可放区域 {}，实际 {}），换到 {} 宽",
             placement.window.label(),
-            current,
+            self.shared.displays.width_of(id).unwrap_or_default(),
+            area.short(),
             got.short(),
             next_width
         ));
         placement.width = next_width;
         self.fill(placement, id)
+    }
+
+    /// 记住"这个 App 上次铺满用的是哪一档屏宽"（存在共享盘上，跨进程有效）。
+    ///
+    /// C# 每次都从基础宽（540）起步，靠 `FillAsync` 递归一档档试——真机上 QQ
+    /// 要 540 → 720 → 820 → 850，每换一档就是一次显示模式变更（400–700ms）
+    /// 加一次挪窗口加一次找关闭按钮，合计 4.9 秒，用户看到的就是"点了没反应"。
+    /// 记住上一轮的档位，下次直接从它起步。
+    fn learn_width(&mut self, window: &WindowInfo, width: i32) {
+        let Some(key) = self.width_key(window) else {
+            return;
+        };
+        let books = Arc::clone(&self.shared.books);
+        let changed = {
+            let mut map = books.learned_widths.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(key, width) != Some(width)
+        };
+        if changed {
+            let map = books.learned_widths.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let _ = books.learned_widths_file.save(&map);
+        }
+    }
+
+    /// 铺某个窗口该从哪一档起步：学过的档位，否则基础宽。
+    fn start_width(&self, window: &WindowInfo) -> i32 {
+        let fit = self.current_screen_fit();
+        let base = fit.base_width();
+        let Some(learned) = self
+            .width_key(window)
+            .and_then(|key| {
+                self.shared
+                    .books
+                    .learned_widths
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .copied()
+            })
+        else {
+            return base;
+        };
+        if fit.widths().contains(&learned) { learned } else { base }
+    }
+
+    /// 学到的屏宽的键：比例 + App。比例换了（换机型/方向）旧记录自然失效。
+    fn width_key(&self, window: &WindowInfo) -> Option<String> {
+        Some(format!("{}|{}", self.current_screen_fit(), app_key(window)?))
     }
 
     /// 对应 C# `RevealAsync`：从 App 资源库回到已经摆好的窗口。
@@ -1439,6 +1566,7 @@ impl DeskCore {
         };
         placement.width = fit.base_width();
         placement.settled = None;
+        // 不用清学到的屏宽：键里带比例，换比例后自然查不到旧的。
         if !self.state().list_visible {
             self.log(format!("换了比例，{} 按新比例重新铺满", placement.window.label()));
             self.fill(&mut placement, id);
@@ -1597,7 +1725,7 @@ impl DeskCore {
         let mut next = Placement {
             window: window.clone(),
             record,
-            width: self.current_screen_fit().base_width(),
+            width: self.start_width(&window),
             settled: None,
             known,
             asking: !zoom,
@@ -2587,6 +2715,17 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 记"这个窗口属于哪个 App"用的键：优先可执行文件名，读不到就退回显示名。
+///
+/// 只用于"上次这 App 要多大屏宽"的记忆，所以不要求全局唯一，只要同一 App 稳定。
+fn app_key(window: &WindowInfo) -> Option<String> {
+    window
+        .app_id
+        .as_deref()
+        .map(|id| id.to_lowercase())
+        .or_else(|| (!window.app_name.is_empty()).then(|| window.app_name.to_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2789,6 +2928,70 @@ mod tests {
         assert_eq!(harness.windows.zoom_delta_total(), 0, "字号应缩回");
         assert_eq!(harness.windows.frame_of(key), Some(original), "窗口应回原位");
         assert!(!harness.paths.phone_record_file().exists(), "还原记录应被清掉");
+    }
+
+    /// 第二次铺同一个 App 不该重走换档阶梯（真机上一次铺垫 4.9 秒，几乎全是换档）。
+    #[test]
+    fn placing_the_same_app_again_starts_at_the_learned_width() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
+        harness.windows.set_min_logical_width(700.0);
+        ready_screen(&harness);
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_of(1001), Some(700), "先走一遍阶梯");
+
+        // 回列表：屏宽回到基础宽，但"这个 App 要 700"应该记住。
+        harness.desk.put_back();
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_of(1001), Some(540));
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_of(1001), Some(700), "第二次直接到 700");
+    }
+
+    /// 连点同一个 App：排队期间再点不该排第二条（真机上会变成"点三下等十五秒"）。
+    #[test]
+    fn repeated_pulls_while_one_is_queued_are_dropped() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        ready_screen(&harness);
+
+        assert!(harness.desk.claim_pull(key), "第一次要接");
+        assert!(!harness.desk.claim_pull(key), "还没跑完时的第二次点击要丢掉");
+        // 换个窗口不受影响（去重是按窗口的）。
+        assert!(harness.desk.claim_pull(WindowKey::new(43, 0x101)));
+    }
+
+    /// 换了比例以后，旧比例学到的屏宽不该被套用（键里带比例）。
+    #[test]
+    fn learned_widths_are_per_screen_ratio() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
+        harness.windows.set_min_logical_width(700.0);
+        ready_screen(&harness);
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_of(1001), Some(700));
+
+        harness.desk.put_back();
+        harness.desk.idle();
+        // 换个比例：档位表跟着变，学到的 700 必须作废。
+        harness.desk.set_fit(ScreenFit::new(0.75));
+        harness.desk.idle();
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+        let width = harness.displays.width_of(1001).expect("屏还在");
+        assert!(
+            harness.desk.fit().widths().contains(&width),
+            "换比例后铺出的宽度必须是新档位表里的档（{width}）"
+        );
     }
 
     /// 转写自 C# `PhoneDeskTests.Recover_RestoresLeftoverRecordAfterSimulatedCrash`。

@@ -394,6 +394,12 @@ impl DeskSet {
 
         let target_key = DeskHub::key(&target.screen_id());
         let window_key = window.key;
+        // 连点去重：同一个窗口已经在入队/执行的路上，这次点击直接丢掉。
+        if !target.claim_pull(window_key) {
+            self.log(format!("放 {}：上一次点击还在执行，这次点击忽略", window.label()));
+            return;
+        }
+        let guard = target.pull_guard();
         let ready = target.state().screen_phase == PhoneScreenPhase::Ready;
         let lane = self.lane.clone();
         let log = self.events.log.clone();
@@ -416,6 +422,8 @@ impl DeskSet {
                     }
                 }
             }
+            // 动作结束（或失败）都要清标记，否则这个窗口再也点不动。
+            *guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
     }
 

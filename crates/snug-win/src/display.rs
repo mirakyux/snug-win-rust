@@ -795,11 +795,18 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             None => true,
         };
         if needs_resolution {
+            let started = std::time::Instant::now();
             if !self
                 .api
                 .set_resolution(&device_name, pixel_width, pixel_height, 60.0)
             {
                 return;
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if ms >= 200.0 {
+                crate::info(&format!(
+                    "屏幕：换分辨率到 {pixel_width}x{pixel_height} 用了 {ms:.0}ms（{device_name}）"
+                ));
             }
             sleep_for(self.timings.resolution_settle);
         }
@@ -809,7 +816,12 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             // 电脑屏超过 3840×2400 的 2 倍阈值时是 100%，否则 200%。
             let target_dpi = fit.target_dpi_percent(width);
             if after.mode.dpi_scale_percent != target_dpi {
+                let started = std::time::Instant::now();
                 self.api.set_dpi_scale(after.adapter_id, after.source_id, target_dpi);
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                if ms >= 200.0 {
+                    crate::info(&format!("屏幕：换 DPI 到 {target_dpi}% 用了 {ms:.0}ms"));
+                }
             }
         }
     }
