@@ -174,30 +174,42 @@ fn load_config(paths: &Paths) -> AppConfig {
 }
 
 fn load_catalog() -> Option<PhoneCatalog> {
-    let candidates = [
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("assets").join("phone-models.json"))),
-        Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/phone-models.json")),
-    ];
-    for path in candidates.into_iter().flatten() {
-        if !path.exists() {
-            continue;
-        }
-        match PhoneCatalog::load_from_file(&path) {
+    let external = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("assets").join("phone-models.json")));
+    load_catalog_from(external.as_deref())
+}
+
+/// exe 旁的资源可覆盖内置机型库；单 exe 分发时不需要任何运行时源码路径。
+fn load_catalog_from(external: Option<&std::path::Path>) -> Option<PhoneCatalog> {
+    if let Some(path) = external.filter(|path| path.exists()) {
+        match PhoneCatalog::load_from_file(path) {
             Ok(catalog) => {
                 crate::info!(
-                    "机型库已加载：{} 个品牌 / {} 款机型",
+                    "外部机型库已加载：{} 个品牌 / {} 款机型",
                     catalog.brands.len(),
                     catalog.models().count()
                 );
                 return Some(catalog);
             }
-            Err(err) => crate::warn!("机型库读取失败 {}：{err}", path.display()),
+            Err(err) => crate::warn!("机型库读取失败 {}：{err}，改用内置库", path.display()),
         }
     }
-    crate::warn!("未找到机型库 phone-models.json");
-    None
+
+    match PhoneCatalog::from_json(include_str!("../../../assets/phone-models.json")) {
+        Ok(catalog) => {
+            crate::info!(
+                "内置机型库已加载：{} 个品牌 / {} 款机型",
+                catalog.brands.len(),
+                catalog.models().count()
+            );
+            Some(catalog)
+        }
+        Err(err) => {
+            crate::warn!("内置机型库读取失败：{err}");
+            None
+        }
+    }
 }
 
 /// 用 Win32 系统字体渲染中文：egui 自带字体没有 CJK。
@@ -252,7 +264,80 @@ fn has_minimized_flag(args: impl IntoIterator<Item = String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_minimized_flag;
+    use super::{has_minimized_flag, load_catalog_from};
+
+    struct CatalogDirectory(std::path::PathBuf);
+
+    impl CatalogDirectory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "snug-catalog-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            std::fs::create_dir(&path).expect("isolated catalog directory");
+            Self(path)
+        }
+
+        fn file(&self) -> std::path::PathBuf {
+            self.0.join("phone-models.json")
+        }
+    }
+
+    impl Drop for CatalogDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.file());
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn catalog_embedded_is_available_without_external_files() {
+        let directory = CatalogDirectory::new();
+        let missing = directory.file();
+        assert!(!missing.exists());
+        for catalog in [load_catalog_from(None), load_catalog_from(Some(&missing))] {
+            let catalog = catalog.expect("embedded catalog requires no runtime source path");
+            assert_eq!(catalog.models().count(), 853);
+            for kind in [
+                snug_core::phone_models::DeviceKind::Phone,
+                snug_core::phone_models::DeviceKind::Tablet,
+                snug_core::phone_models::DeviceKind::Computer,
+            ] {
+                assert!(catalog.models().any(|model| model.kind == kind));
+            }
+        }
+        assert!(std::fs::read_dir(&directory.0).expect("empty directory").next().is_none());
+    }
+
+    #[test]
+    fn catalog_external_file_overrides_the_embedded_catalog() {
+        let directory = CatalogDirectory::new();
+        let path = directory.file();
+        let json = r#"{"brands":[{"name":"Custom","models":[{"name":"Test phone","screen":[1080,1920]}]}]}"#;
+        std::fs::write(&path, json).expect("external override");
+
+        let catalog = load_catalog_from(Some(&path)).expect("external catalog");
+
+        assert_eq!(catalog.models().count(), 1);
+        assert!(catalog.find_model("Custom Test phone").is_some());
+        assert_eq!(std::fs::read_to_string(path).expect("unchanged override"), json);
+    }
+
+    #[test]
+    fn catalog_invalid_external_file_falls_back_to_embedded_catalog() {
+        let directory = CatalogDirectory::new();
+        let path = directory.file();
+        for invalid in ["not JSON", "{}"] {
+            std::fs::write(&path, invalid).expect("invalid external override");
+
+            let catalog = load_catalog_from(Some(&path)).expect("embedded fallback");
+
+            assert_eq!(catalog.models().count(), 853);
+            assert_eq!(std::fs::read_to_string(&path).expect("unchanged override"), invalid);
+        }
+    }
 
     #[test]
     fn minimized_flag_is_recognized_regardless_of_case() {

@@ -370,7 +370,7 @@ pub struct SettingsWindow {
     manual_override: bool,
     /// 诊断页的日志文本（app 层追加）。
     logs: String,
-    /// 机型库（可有可无：找不到 phone-models.json 时退化成只显示当前机型）。
+    /// 机型库：默认内置在 exe 中，允许 exe 旁的 assets/phone-models.json 覆盖。
     catalog: Option<PhoneCatalog>,
     /// 待执行动作队列。
     actions: Vec<SettingsAction>,

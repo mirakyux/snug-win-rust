@@ -14,22 +14,13 @@
 //! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 为 `None` 表示"读不到"，
 //! 与 `false`（确定没在推流）区分开——C# 读不到时给 `false`，这里按需求给 `None`。
 //!
-//! **在场判定就是推流日志增长（照 C# 1.3）**。这里踩过一次坑，别再改回去：
-//! 曾经加过"日志增长必须另有佐证（活动 TCP 对端 / 可见覆盖窗 / 控制端表非空）"
-//! （`2702cf1`），理由是这台机器空闲时 server 也按 ~3.05 秒刷日志、C# 的
-//! "两次增长间隔 ≤ 3.0 秒"会把它量化成命中。
+//! 推流 `.slog` 增长不是远程连接的充分证据：本地运行 GameViewer/游戏时日志也可能增长，
+//! 已经造成无远程时虚拟屏反复弹出（历史复现见 `docs/upstream-watch.md`）。因此现在分成两步：
+//! 新会话必须先看到可见覆盖层或读到非空控制端表；一旦会话建立，`.slog` 心跳可维持空闲会话，
+//! 且在 15 秒重连窗口内可恢复。单独的 TCP 对端和日志增长只作诊断/连续性，不能开启新会话。
 //!
-//! 但真机（2026-11-19）证明那个修改把主信号掐死了：手机连着、人没在操作时，
-//! 对端连接会断（UU 的传输走 UDP，TCP 只是信令）、覆盖窗不可见、控制端表又读不到
-//! （UU 客户端在托盘里），三项佐证恒为假 → 每 15 秒判一次断开 → 撤屏，
-//! 用户看到手机屏反复消失、App 点开也落空。日志里就是这样：
-//! `10:49:22 已断开 → 10:49:38 本次会话结束，撤掉手机屏`，
-//! 而同一时刻 `streamer_log_controlled_*.slog` 仍在稳定增长。
-//!
-//! 所以现在回到 C# 的语义：`IsPresent = overlay || 控制端非空 || CaptureActive == true`，
-//! 而 `CaptureActive` 就是日志增长本身；TCP 对端降回纯诊断（[`UuSignalSet::peer_active`]）。
-//! 若将来又看到"没连手机、屏自己弹出来"，先用真机日志确认**那时候 slog 是否真的在长**，
-//! 再决定动哪里——不要凭想象加佐证。
+//! 取舍：若 UU 在托盘隐藏且会话开始时既无覆盖窗又读不到控制端，自动开屏不会触发；
+//! 用户可用手动强制模式开启。不能通过把现有 TCP/日志阈值调得更短解决两类状态的歧义。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -66,8 +57,8 @@ pub struct UuSignalSet {
     pub controllers: ControllerTable,
     /// `None` = 读不到（进程不在、日志目录读不到），`Some(false)` = 确定没在推流。
     ///
-    /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。**这是在场判定的主信号**：
-    /// 真机上覆盖窗基本不可见、控制端表读不到（UU 客户端躲在托盘），只有它可用。
+    /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。只维持已经确认的会话，
+    /// 不再单独作为新会话的开始证据。
     pub capture_active: Option<bool>,
     /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。**只作诊断**，不参与判定。
     pub peer_active: bool,
@@ -390,13 +381,8 @@ impl UuSensor {
 
         let log_growth = self.log_signal(server_pid, log_files.as_deref(), now);
 
-        // 在场判定照 C# 1.3：`UUSignals.IsPresent = overlay || 控制端非空 || CaptureActive == true`，
-        // 而 `CaptureActive` 就是**推流日志增长**本身。TCP 对端在 C# 里只是诊断
-        // （`LastPeerTcpObserved`），不参与判定。
-        //
-        // 曾经加过"增长必须另有佐证（对端/覆盖窗/控制端）"（`2702cf1`），真机上证明是错的：
-        // 空闲时对端与覆盖窗都没有、控制端表又读不到（UU 客户端在托盘里），于是佐证恒为假
-        // → 每 15 秒判一次断开 → 撤屏，用户看着手机屏反复消失。见 `docs/upstream-watch.md`。
+        // SLOG 单独会在本地使用时增长；它不负责开始新会话，只作为已有会话的心跳。
+        // TCP 对端也只作诊断，因为真实远程会话可能仅走 UDP。
         let capture_active = log_growth;
 
         UuSignalSet {
@@ -934,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn log_growth_marks_presence_like_csharp() {
+    fn log_growth_is_diagnostic_and_not_new_session_evidence() {
         let bytes = std::sync::Arc::new(Mutex::new(100u64));
         let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
 
@@ -944,16 +930,22 @@ mod tests {
         *bytes.lock().unwrap() = 300;
         let signals = sensor.sample(2.0);
         assert_eq!(signals.log_growth, Some(true), "日志确实在持续增长");
-        // 照 C#：日志增长**就是**在场信号。真机上覆盖窗不可见、控制端表读不到，
-        // 推流日志是唯一稳定的证据（见模块顶部的踩坑记录）。
+        // 日志增长可维持已确认会话，但不能单独开启会话。
         assert_eq!(signals.capture_active, Some(true));
-        assert!(signals.to_signals().is_present());
+        assert!(
+            signals.to_signals().is_present(),
+            "增长可以维持已确认的会话"
+        );
+        assert!(
+            !signals.to_signals().has_remote_evidence(),
+            "本地 GameViewer/游戏产生的心跳不能单独开启手机屏"
+        );
         assert_eq!(
             sensor.sample(2.0).log_tail.as_deref(),
             Some("last line\n"),
             "日志尾部原样给上层"
         );
-        // 心跳间隔 2.1 秒仍在保持窗口内 → 继续在场。
+        // 心跳间隔 2.1 秒仍在保持窗口内 → 可维持既有会话。
         assert_eq!(sensor.sample(4.1).log_growth, Some(true));
         // 彻底停止增长 15 秒后才掉。
         assert_eq!(sensor.sample(20.0).log_growth, Some(false));
@@ -964,7 +956,7 @@ mod tests {
         let bytes = std::sync::Arc::new(Mutex::new(1000u64));
         let sensor = UuSensor::with_probe(Box::new(MutableProbe { bytes: bytes.clone() }));
 
-        // 3.05 秒一次的心跳（真机空闲节奏）必须一直保持在场。
+        // 3.05 秒一次的心跳（真机空闲节奏）可维持会话，但不能成为新会话证据。
         let mut t = 0.0;
         let mut advances = 0;
         for delta in [0u64, 148, 933, 500, 819] {
@@ -979,7 +971,11 @@ mod tests {
                     Some(true),
                     "t={t} 3.05 秒心跳仍在保持窗口内"
                 );
-                assert!(signals.to_signals().is_present(), "t={t} 判连入");
+                assert!(signals.to_signals().is_present(), "t={t} 心跳维持");
+                assert!(
+                    !signals.to_signals().has_remote_evidence(),
+                    "t={t} 不应凭心跳连入"
+                );
             }
             advances += 1;
             t += 3.05;

@@ -8,41 +8,42 @@ build.rs 把它写进 exe 的 `FILEVERSION` / 字符串表，`update::APP_VERSIO
 
 ```powershell
 # 1) 改 Cargo.toml 的 [workspace.package] version
-# 2) 构建（target\release\snug.exe 正在运行时占用文件，用独立目录）
-cargo build --release -p snug-app --offline --target-dir target\release-check
-
-# 3) 取官方驱动安装包（3 MB，核对 SHA-256；已存在且哈希正确就跳过）
+# 2) 编译前取官方驱动包（3 MB，核对 SHA-256；已存在且哈希正确就跳过）
 pwsh -File scripts\fetch-driver.ps1
 
-# 4) 打 dist\ 里的 zip + checksums.txt（脚本自己读 exe 的版本资源）
+# 3) 构建（target\release\snug.exe 正在运行时占用文件，用独立目录）
+cargo build --release -p snug-app --offline --target-dir target\release-check
+
+# 4) 生成 dist\snug.exe、更新 zip 与 checksums.txt（读 exe 的版本资源）
 pwsh -File scripts\build-release.ps1 -Exe target\release-check\release\snug.exe
 
 # 5) 静态门禁：版本/体积/清单/依赖/发行包，全 PASS 再往下
 pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe
 ```
 
-（3、4 步顺序不能反：门禁里有一项是核对 `dist` 里那个 zip 的结构与校验和。）
+驱动 ZIP 必须在编译前就绪，Rust 会把它和安装脚本原样嵌入 exe。
+打包必须在门禁前完成，门禁会核对 `dist` 里的文件和校验和。
 
 产物：
 
 ```text
-dist\Snug-v<版本>-win-x64-selfcontained.zip   根目录 snug.exe + driver\
-dist\checksums.txt                            <sha256>  <zip 文件名>（ASCII + LF + 无 BOM）
+dist\snug.exe                                用户直接运行的单文件，内含驱动
+dist\Snug-v<版本>-win-x64-selfcontained.zip    自动更新资产，根目录仅 snug.exe
+dist\checksums.txt                           exe 与 zip 的 SHA-256（ASCII + LF + 无 BOM）
 ```
 
-包内结构（固定四个条目，多一个也不行——更新器只认根部的 `snug.exe`）：
+自动更新 zip 内仅保留一个条目，兼容更新器原有的资产名和根目录约定：
 
 ```text
 snug.exe
-driver\Install-SnugDriver.ps1
-driver\install-driver.cmd
-driver\virtual-desktop-driver-installer-x64.zip
 ```
 
-驱动**必须**跟着包发：用户解压就能装，不该先去别处找驱动。
+日常交付只需 `snug.exe`。驱动包和带 BOM 的安装脚本已嵌入程序，缺少驱动时在后台
+释放到独占临时目录并调用原安装脚本；正常结束后清理临时目录。
+设置页的安装/修复也使用同一内嵌包。机型库同时内嵌，无需带 `assets\`。
 安装包来自 [virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 0.3.1，
 版本与三个哈希写死在 `scripts/fetch-driver.ps1` 和 `driver/Install-SnugDriver.ps1` 两处，
-升级驱动要同时改这两处并重跑真机验收。
+升级驱动要同时改这两处，更新 `driver.rs` 的固定哈希回归断言，并重跑真机验收。
 
 `build-release.ps1` 会用 Rust 侧的 `sha256_hex` 再算一遍 exe 与 zip，和 `Get-FileHash`
 比对——两套独立实现，发布链最容易在这里悄悄分叉。
@@ -60,13 +61,13 @@ GitHub → **Actions → Release → Run workflow**，参数：
 
 工作流（`.github/workflows/release.yml`）按顺序做：
 
-1. 全仓 `cargo test --workspace`；
-2. `cargo build --release -p snug-app`；
-3. `scripts/fetch-driver.ps1`（下载官方驱动安装包，核对 SHA-256）；
-4. `scripts/build-release.ps1`（`dist/` 里的 zip + `checksums.txt`，zip 含 `driver\`）；
+1. `scripts/fetch-driver.ps1`（编译前下载官方驱动安装包，核对 SHA-256）；
+2. 全仓 `cargo test --workspace`；
+3. `cargo build --release -p snug-app`；
+4. `scripts/build-release.ps1`（`dist/` 里的单 exe、更新 zip 与 `checksums.txt`）；
 5. `scripts/preflight.ps1`（版本 / 体积 / 清单 / 依赖 / 发行包结构与校验和）；
 6. 用 `.github/release-notes-template.md` 生成说明（含自上一个 tag 以来的提交、校验和）；
-7. 建 Release 并上传 `Snug-v<版本>-win-x64-selfcontained.zip` 与 `checksums.txt`。
+7. 建 Release 并上传 `snug.exe`、`Snug-v<版本>-win-x64-selfcontained.zip` 与 `checksums.txt`。
 
 **只保留手动触发**：参考项目还支持推 tag 自动发，但本项目的发版前提是真机验收
 （`docs/acceptance.md`）走完，一次 push 不该直接把包发出去。
@@ -76,12 +77,13 @@ GitHub → **Actions → Release → Run workflow**，参数：
 
 ### 2b. 本地打包（不发 release）
 
-见第 1 节；产物在 `dist/`，手工上传时同样要传 zip 与 `checksums.txt` 两个资产。
+见第 1 节。直接交付用户只需 `dist/snug.exe`；手工发布到 GitHub 时同时上传
+exe、自动更新 zip 与 `checksums.txt`。
 
 ### 2c. 命名规则
 
 - tag：`v<版本>`（`v1.3.0`）。更新器解析 tag 时 `normalize()` 会去掉 `v` 前缀与后缀。
-- 两个资产都要传：zip 与 `checksums.txt`。
+- 单 exe 供直接下载，zip 与 `checksums.txt` 供自动更新，发布时三者都上传。
 - **资产名不能改**。更新器按 `update::release_asset_name(tag, kind)` 精确匹配
   （`Snug-v1.3.0-win-x64-selfcontained.zip`），名字对不上就当"这个 tag 没有我们的包"。
 

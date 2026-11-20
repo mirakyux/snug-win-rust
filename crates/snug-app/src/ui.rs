@@ -852,18 +852,9 @@ impl PhoneHomeApp {
             SettingsAction::CheckUpdate => self.start_update_check(),
             SettingsAction::InstallUpdate => self.start_install_update(),
             SettingsAction::InstallDriver => {
-                // C# `LocateBundledDriverScript`：从程序目录往上找 5 层 `driver/Install-SnugDriver.ps1`。
-                match locate_driver_script() {
-                    Some(script) => {
-                        crate::info!("设置：安装/修复虚拟屏驱动，脚本 {}", script.display());
-                        match run_elevated_powershell(&script) {
-                            Ok(()) => crate::info!("设置：驱动脚本已拉起（会弹 UAC）"),
-                            Err(err) => crate::warn!("设置：拉起驱动脚本失败 {err}"),
-                        }
-                    }
-                    None => crate::warn!(
-                        "设置：没找到 driver/Install-SnugDriver.ps1（程序目录及其上 5 层），无法安装驱动"
-                    ),
+                match crate::driver::spawn_install() {
+                    Ok(()) => crate::info!("设置：已请求使用内嵌包安装/修复虚拟屏驱动"),
+                    Err(err) => crate::warn!("设置：启动驱动安装任务失败 {err}"),
                 }
             }
             SettingsAction::ApplyGestureSettings => {
@@ -1576,7 +1567,6 @@ impl eframe::App for PhoneHomeApp {
     }
 }
 
-    /// 从程序目录往上找 `driver/Install-SnugDriver.ps1`（C# `LocateBundledDriverScript`：最多 5 层）。
 /// 资源库图标网格的列数：横屏 6 列、竖屏 4 列（C# `UpdateResponsiveLayout` 同）。
 fn grid_columns(landscape: bool) -> usize {
     if landscape { 6 } else { 4 }
@@ -1607,25 +1597,6 @@ fn tab_button(
             .stroke(egui::Stroke::new(1.0_f32, palette.card_hover)),
     )
     .clicked()
-}
-
-fn locate_driver_script() -> Option<std::path::PathBuf> {
-    crate::driver::locate_script()
-}
-
-/// 用 PowerShell 跑驱动脚本。本进程已经是管理员（清单 requireAdministrator），
-/// 所以直接起子进程；不是管理员时 Windows 会由脚本自己报错，我们不假装成功。
-fn run_elevated_powershell(script: &std::path::Path) -> std::io::Result<()> {
-    std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script.to_string_lossy(),
-        ])
-        .spawn()
-        .map(|_| ())
 }
 
 /// 资源库里的一行 App：图标 + 名字（+ 窗口数），右侧「+」「×」。

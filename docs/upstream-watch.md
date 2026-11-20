@@ -82,7 +82,7 @@ GitHub API（`api.github.com`）直连可用，查提交列表用它最快。
 | `GetWindowTextW` 对同进程窗口同步发 `WM_GETTEXT` | 退出时 UI 线程等 desk 线程撤屏、desk 线程等 UI 线程回消息 → 互等，进程退不出去、虚拟屏残留 | 改 `SendMessageTimeoutW(WM_GETTEXT, 150ms)`，且跳过自己进程的窗口 | `dee0c10` |
 | `SetWanted` 只在启动时设一次 | 退出远控后虚拟屏一直挂着，只有杀进程才消失 | 每拍按 `会话 InEpisode && 控制端` 重算，照 C# `OnTick` | `8d6197c` |
 | 虚拟屏管道句柄缓存到进程结束 | `pnputil /restart-device` 之后写的是死管道，四个候选全失败且无日志 | 每次操作前 `PeekNamedPipe` 探测，写/读失败即丢弃重连 | `99770bb` |
-| UU 推流日志增长单独判在场 | 空闲时 logger 约 3.05s flush 一次，正好压在 C# 的 `<= 3.0s` 阈值上 → 每几十秒误判一次"在远程"，屏自己弹出来 | 增长只作诊断字段，判在场要有对端/覆盖窗/控制端佐证 | `2702cf1` |
+| UU 推流日志增长单独判新会话 | 本地 GameViewer/游戏时 SLOG 也会增长，造成手机屏重复弹出 | 新会话由覆盖层/控制端准入；已确认会话仍用 SLOG 维持空闲与重连 | 2026-11-20 |
 | `ViewportCommand::InnerSize` 与 `SetWindowPos` 抢尺寸 | 窗口 926×1629 比屏小一圈，右边留黑边 | 只用 `SetWindowPos`（物理像素），每帧用 `frame_of` 核对 | `115beb8` |
 | 设置窗画在 1080×56 的指示条里 | 设置窗被裁成一条灰边，什么都点不到 | 打开设置时窗口恢复整屏 | `82268b5` |
 | 判断"有没有铺窗口"只看 `placed.is_some()` | 点了「‹ 资源库」也永远停在指示条上，回不到列表 | 条件改成 `placed.is_some() && !list_visible` | `37ad208` |
@@ -114,25 +114,17 @@ GitHub API（`api.github.com`）直连可用，查提交列表用它最快。
 | `RecordFileForScreen(id)` | 每块屏一份 `screen-<id>.json` 还原记录 | 现在只有一份 `phone-record.json` |
 | `IScreenService.CreateAsync(fit, displayName)` | 建虚拟屏时带名字 | 多块屏在系统里能区分开（现在没有名字参数） |
 | `TouchHookService.SetRegions(...)` | 一份区域列表 + `_activeRegion` 按按下点选 | 多屏时钩子要同时管多块屏 |
-| `UUSensor` 判定哲学改了 | TCP 对端降级为**纯诊断**（`LastPeerTcpObserved`），在场只看 `StreamLogActivityTracker` | 见下 |
+| `UUSensor` 判定哲学改了 | TCP 对端降级为**纯诊断**；新会话用覆盖窗/控制端正向信号准入，已准入会话用 SLOG 心跳续期 | 见下 |
 
 ### 关于 UU 在场判定：我们和原版 1.3.0 不一样，是有意的
 
-原版 1.3.0 把"对端 TCP"从判定里拿掉，只留推流日志增长（`StreamLogActivityTracker`：
-两次增长间隔 ≤3s 且最近一次增长在 2s 内）。我们**照抄了这套结构，但把两个窗口都放宽到 15 秒**。
+历史问题：`.slog` 本地刷新曾直接作为新会话证据，2026-11-18 日志显示无覆盖窗、控制端不可读时，
+capture 心跳每几秒翻转，引发反复加屏/撤屏。2026-11-19 的只读采样也确认无手机连接时，
+本地 GameViewerServer 仍会周期性增长 streamer 日志。TCP 不能简单补作唯一证据，因为真远程传输
+可能走 UDP，空闲时 peer 会消失。
 
-两次真机教训，改这块之前先读完：
-
-1. **曾经加过"增长必须另有佐证"**（`2702cf1`）：要求 `peer_active || 覆盖窗 || 控制端非空`
-   之一。真机上（2026-11-19）这三项在空闲时恒为假——UU 的传输走 UDP、TCP 对端会断，
-   悬浮球没开、控制端表读不到（UU 客户端在托盘里）——于是每 15 秒判一次断开、撤屏，
-   用户看到手机屏反复消失、App 点开也落空。**已改回 C# 语义：`IsPresent = 覆盖窗 ||
-   控制端非空 || CaptureActive == true`，TCP 对端降回纯诊断。**
-2. **阈值不能照抄 3 秒 / 2 秒**：真机采样显示推流日志的增长间隔是**操作时 2–3 秒、
-   空闲时 8–10 秒**（心跳 flush）。3 秒判据在空闲时恒为 false，同样导致撤屏。
-   现在 `ADVANCE_PAIR_MAX_GAP = ACTIVE_HOLD_WINDOW = 15 秒`：覆盖空闲心跳，
-   又能在"真的断开、日志停止增长"后 15 秒内收敛。
-
-遗留观察点：如果哪天看到"**没连手机**时屏自己弹出来"，先用真机日志确认那段时间
-`slog` 是否真的在长——长就说明 UU 的心跳与连接状态无关，这条路走不通，得换信号；
-不要凭想象再加佐证。
+当前准入策略：开启**新会话**需看到可见覆盖窗或 UIA 可读的非空控制端表；SLOG 心跳只维持
+已经确认的会话及 15 秒重连窗口。这样本地心跳不会启动虚拟屏。代价是：如果会话刚开始时
+UU 在托盘隐藏且控制端表读不到，自动开屏无法确认；用户可用设置里的手动强制模式。
+`ADVANCE_PAIR_MAX_GAP = ACTIVE_HOLD_WINDOW = 15 秒` 只解决已确认会话的空闲续期，不能充当
+开始会话的证据。

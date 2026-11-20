@@ -3,13 +3,25 @@
 ## 硬门禁：`rustc` 零警告
 
 ```powershell
-cargo test --workspace --offline     # 486 绿、0 warning
+pwsh -File scripts\fetch-driver.ps1  # 内嵌驱动必须在编译前就绪
+cargo test --workspace --offline     # 514 绿、0 warning
+cargo test --workspace --release --offline  # 同样 514 绿、0 warning
 cargo build --release -p snug-app --offline
 ```
 
 编译器警告一条都不许留。历史上这里踩过：`#[allow(dead_code)]` 掩盖了生产路径误调
 测试辅助函数的隐患，最后是用 `#[cfg(test)]` 把 `idle()` / `drain()` 关进测试才根治
 （`8f9c169`）。所以**不用 `allow` 让警告消失**，改代码或改可见性。
+
+2026-11-19 在普通权限终端验证时，bin 单测仍带管理员清单，直接执行会报 Windows 错误 740。
+本轮只给单测子进程设置兼容层，514 条测试通过；未改变发布程序的管理员权限要求：
+
+```powershell
+cmd /c 'set "__COMPAT_LAYER=RunAsInvoker" && cargo test --workspace --offline'
+```
+
+本轮三个改动文件的 `rustfmt --check --edition 2024` 均有格式差异。
+对 `HEAD` 原文件做同样检查也在相同的首个位置报差异，因此保留现有排版，未做整文件格式化。
 
 ## 参考门禁：`clippy`
 

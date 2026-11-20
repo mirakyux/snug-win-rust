@@ -601,6 +601,10 @@ pub enum Hive {
 pub trait AppSystem: Send + Sync {
     /// `Process.GetProcessesByName`（按不带扩展名的进程名匹配）。
     fn processes_named(&self, stem: &str) -> Vec<ProcessEntry>;
+    /// 只取同名进程的 PID，保持进程快照顺序，不需要探测主窗口。
+    fn process_ids_named(&self, stem: &str) -> Vec<i32> {
+        self.processes_named(stem).into_iter().map(|entry| entry.pid).collect()
+    }
     /// `Process.GetProcessById(pid)` 之后 `!HasExited`。
     fn process_alive(&self, pid: i32) -> bool;
     /// `Win32.GetProcessImagePath`。
@@ -813,11 +817,7 @@ impl<S: AppSystem> AppControl for Apps<S> {
 
     /// C# `PidsAsync`。
     fn pids(&self, app_id: &str) -> Vec<i32> {
-        self.system
-            .processes_named(exe_stem(app_id))
-            .into_iter()
-            .map(|entry| entry.pid)
-            .collect()
+        self.system.process_ids_named(exe_stem(app_id))
     }
 
     /// C# `OpenAsync`。
@@ -1248,11 +1248,18 @@ impl Drop for ComApartment {
 
 impl AppSystem for WinSystem {
     fn processes_named(&self, stem: &str) -> Vec<ProcessEntry> {
+        self.process_ids_named(stem)
+            .into_iter()
+            .map(|pid| ProcessEntry { pid, has_main_window: has_main_window(pid) })
+            .collect()
+    }
+
+    fn process_ids_named(&self, stem: &str) -> Vec<i32> {
         let wanted = stem.to_lowercase();
         snapshot_processes()
             .into_iter()
             .filter(|(_, _, name)| exe_stem(name).to_lowercase() == wanted)
-            .map(|(pid, _, _)| ProcessEntry { pid, has_main_window: has_main_window(pid) })
+            .map(|(pid, _, _)| pid)
             .collect()
     }
 
@@ -1911,6 +1918,7 @@ mod tests {
     struct FakeSystem {
         /// `(进程名小写, 进程)`；进程名不带 .exe，与 `GetProcessesByName` 一致。
         processes: Vec<(String, ProcessEntry)>,
+        process_queries: std::sync::Mutex<Vec<String>>,
         alive: Vec<i32>,
         images: HashMap<i32, String>,
         windows: Vec<WindowInfo>,
@@ -1946,10 +1954,19 @@ mod tests {
 
     impl AppSystem for FakeSystem {
         fn processes_named(&self, stem: &str) -> Vec<ProcessEntry> {
+            self.process_queries.lock().unwrap().push(stem.to_string());
             self.processes
                 .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case(stem))
                 .map(|(_, entry)| *entry)
+                .collect()
+        }
+
+        fn process_ids_named(&self, stem: &str) -> Vec<i32> {
+            self.processes
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(stem))
+                .map(|(_, entry)| entry.pid)
                 .collect()
         }
 
@@ -2157,6 +2174,28 @@ mod tests {
         assert_eq!(running[0].app.app_id, "Zed.exe");
         assert_eq!(running[1].app.app_id, "Code.exe");
         assert_eq!(running[0].app.executable_path.as_deref(), Some(r"C:\Zed\zed.exe"));
+    }
+
+    #[test]
+    fn pids_preserves_process_order_without_querying_main_windows() {
+        let system = FakeSystem {
+            processes: vec![
+                ("code".into(), ProcessEntry { pid: 31, has_main_window: false }),
+                ("other".into(), ProcessEntry { pid: 99, has_main_window: true }),
+                ("code".into(), ProcessEntry { pid: 11, has_main_window: true }),
+                ("code".into(), ProcessEntry { pid: 21, has_main_window: false }),
+            ],
+            ..FakeSystem::default()
+        };
+        let apps = Apps::with_system(system);
+
+        assert_eq!(apps.pids("CODE.exe"), vec![31, 11, 21]);
+        assert!(
+            apps.system().process_queries.lock().unwrap().is_empty(),
+            "只取 PID 不应查询主窗口信息"
+        );
+        assert_eq!(apps.pid_of(&app("CODE.exe", "VS Code")), Some(11));
+        assert_eq!(*apps.system().process_queries.lock().unwrap(), vec!["CODE"]);
     }
 
     #[test]

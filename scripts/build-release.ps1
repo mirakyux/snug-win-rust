@@ -5,8 +5,9 @@
 
 .DESCRIPTION
     产物（默认写到 dist\）：
-      Snug-v<版本>-win-x64-selfcontained.zip   —— 根目录 snug.exe + driver\（安装脚本与官方驱动包）
-      checksums.txt                            —— `<64 位小写十六进制><两个空格><zip 文件名>`
+      snug.exe                                 —— 可直接交付的单文件，驱动已内嵌
+      Snug-v<版本>-win-x64-selfcontained.zip   —— 更新器兼容包，只有根目录 snug.exe
+      checksums.txt                            —— 裸 exe 与 zip 的 SHA-256
 
     版本号只认 exe 的版本资源（VersionInfo.FileVersion），不从 Cargo.toml 再解析一遍：
     发出去的是 exe，exe 里的那个数才是真版本。
@@ -15,8 +16,7 @@
     update::release_asset_name(tag, SelfContained)），TARGET_EXE = "snug.exe"。
 
     脚本会做两件完整性的事：
-      1. 打开生成的 zip 检查条目结构，确保根部只有 snug.exe、外加 driver\ 里的
-         安装脚本与官方驱动包；
+      1. 打开生成的 zip 检查条目结构，确保只有根目录 snug.exe；
       2. 用 Rust 侧的实现（sha256_hex）对同一个文件再算一遍 SHA-256，和
          Get-FileHash 的结果比对——两套实现各算各的，最容易在发布链上悄悄分叉。
          不想跑 cargo 可以加 -SkipRustCrossCheck。
@@ -113,14 +113,13 @@ if ($version -notmatch '^\d+\.\d+\.\d+$') {
 }
 
 $assetName = "Snug-v$version-win-x64-selfcontained.zip"
+$distExePath = Join-Path $outPath 'snug.exe'
 $zipPath = Join-Path $outPath $assetName
 $checksumsPath = Join-Path $outPath 'checksums.txt'
 
 # ---------------------------------------------------------------------------
-# 打包：stage 里放 snug.exe + driver\，再压成 zip
-#
-# 驱动必须一起发：用户拿到 zip 解压就能用，不该先去别处装一遍驱动。
-# driver\ 里只有官方安装包（含哈希校验）和安装脚本，安装由脚本或设置页按钮触发。
+# 单文件直接交付；zip 仅保留给旧资产名匹配的自动更新器。
+# 驱动安装包和脚本在编译时内嵌到 exe，不再分发外部 driver\ 目录。
 # ---------------------------------------------------------------------------
 
 $driverDir = Join-Path $repoRoot 'driver'
@@ -130,7 +129,7 @@ if (-not (Test-Path -LiteralPath $driverZip)) {
 }
 $driverScript = Join-Path $driverDir 'Install-SnugDriver.ps1'
 if (-not (Test-Path -LiteralPath $driverScript)) {
-    throw "缺少 driver\Install-SnugDriver.ps1（设置页的「安装驱动」按钮靠它）。"
+    throw "缺少 driver\Install-SnugDriver.ps1（编译时需要内嵌完整安装脚本）。"
 }
 # 必须是 **UTF-8 带 BOM**：脚本里有中文，而程序是用 `powershell.exe`（5.1）拉它的，
 # 5.1 对没有 BOM 的文件按系统 ANSI 代码页读，中文注释会把语法读崩——真机上第一次
@@ -141,21 +140,15 @@ if (-not $hasBom) {
     throw "driver\Install-SnugDriver.ps1 缺 UTF-8 BOM：powershell.exe 5.1 会按 ANSI 读，中文注释会让脚本解析失败。用编辑器存成「UTF-8 with BOM」再打包。"
 }
 
-$stage = Join-Path $outPath '.stage'
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-Copy-Item -LiteralPath $exePath -Destination (Join-Path $stage 'snug.exe') -Force
-New-Item -ItemType Directory -Force -Path (Join-Path $stage 'driver') | Out-Null
-Copy-Item -LiteralPath $driverScript -Destination (Join-Path $stage 'driver') -Force
-Copy-Item -LiteralPath (Join-Path $driverDir 'install-driver.cmd') -Destination (Join-Path $stage 'driver') -Force
-Copy-Item -LiteralPath $driverZip -Destination (Join-Path $stage 'driver') -Force
+if ($exePath -ne $distExePath) {
+    Copy-Item -LiteralPath $exePath -Destination $distExePath -Force
+}
 
 # 已有的同名 zip 必须先删：Compress-Archive 对已存在的包会往里追加，而不是替换。
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -CompressionLevel Optimal
-Remove-Item -LiteralPath $stage -Recurse -Force
+Compress-Archive -LiteralPath $distExePath -DestinationPath $zipPath -CompressionLevel Optimal
 
-# 结构自检：根目录只有 snug.exe，加上 driver\ 下的安装脚本与官方安装包。
+# 结构自检：只有根目录 snug.exe。
 # 多一个目录都不行——更新器只认根部的 snug.exe，其余杂项会让"解压后到底跑哪个"变模糊。
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
@@ -164,27 +157,22 @@ try {
 } finally {
     $archive.Dispose()
 }
-$expected = @(
-    'snug.exe',
-    'driver/Install-SnugDriver.ps1',
-    'driver/install-driver.cmd',
-    'driver/virtual-desktop-driver-installer-x64.zip'
-)
-$missing = @($expected | Where-Object { $entries -notcontains $_ })
-$extra = @($entries | Where-Object { $expected -notcontains $_ })
-if ($missing.Count -gt 0 -or $extra.Count -gt 0) {
-    throw ("zip 结构不对：缺少 [$($missing -join ', ')]，多出 [$($extra -join ', ')]")
+if ($entries.Count -ne 1 -or $entries[0] -cne 'snug.exe') {
+    throw ("zip 结构不对：必须只有根目录 snug.exe，实际为 [{0}]" -f ($entries -join ', '))
 }
 
 # ---------------------------------------------------------------------------
-# 校验和：zip 的 SHA-256，按 sha256sum 文本模式（小写 hex + 两个空格 + 文件名）
+# 校验和：exe 与 zip 的 SHA-256，按 sha256sum 文本模式
 # ---------------------------------------------------------------------------
 
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $exeHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ((Get-FileHash -LiteralPath $distExePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $exeHash) {
+    throw 'dist\snug.exe 与输入 exe 的 SHA-256 不一致'
+}
 
-# 更新器拿这份 checksums.txt 校验下载下来的 zip，所以哈希必须是 zip 的。
-$checksumsText = "$zipHash  $assetName`n"
+# 更新器按文件名查 zip 的哈希；另列裸 exe，供直接下载时校验。
+$checksumsText = "$zipHash  $assetName`n$exeHash  snug.exe`n"
 # ASCII + LF + 无 BOM：try_find_sha256 按行切、按第 65 个字符判断空白，BOM 会让首行对不上。
 [System.IO.File]::WriteAllText($checksumsPath, $checksumsText, [System.Text.Encoding]::ASCII)
 
@@ -231,7 +219,7 @@ $zipInfo = Get-Item -LiteralPath $zipPath
 
 Write-Host ''
 Write-Host '=== SnugWin 发布资产 ==='
-Write-Host ("exe          : {0}  ({1:N0} B)" -f $exePath, $exeInfo.Length)
+Write-Host ("exe          : {0}  ({1:N0} B)" -f $distExePath, $exeInfo.Length)
 Write-Host ("zip          : {0}  ({1:N0} B)" -f $zipInfo.FullName, $zipInfo.Length)
 Write-Host ("zip 条目     : {0}" -f ($entries -join ', '))
 Write-Host ("版本（资源） : {0}" -f $version)

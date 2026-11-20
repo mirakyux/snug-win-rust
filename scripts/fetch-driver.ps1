@@ -10,8 +10,8 @@
     版本与哈希写死在本脚本（和 driver\Install-SnugDriver.ps1 里的一致）。
     升级驱动 = 同时改这两处的版本号与三个哈希，并重新跑一遍真机验收。
 
-    打包脚本（build-release.ps1）要求这个 zip 存在，不存在就报错，不会悄悄
-    发出一个"没有驱动"的包。
+    必须在 cargo test/build 前运行：应用用 include_bytes! 把原版 zip 内嵌到单 exe。
+    发布时不用再附带 driver\ 目录，静态门禁会核对 exe 里完整内嵌的字节。
 
 .EXAMPLE
     pwsh -File scripts/fetch-driver.ps1

@@ -59,6 +59,7 @@ pub struct FakeDisplays {
     others: Mutex<Vec<OtherDisplay>>,
     fail_creates: AtomicUsize,
     create_calls: AtomicUsize,
+    create_names: Mutex<Vec<String>>,
     retire_calls: AtomicUsize,
     keep_online_after_retire: AtomicBool,
     mode_sets: Mutex<Vec<(u32, DisplayModeInfo, bool)>>,
@@ -74,6 +75,7 @@ impl Default for FakeDisplays {
             others: Mutex::new(Vec::new()),
             fail_creates: AtomicUsize::new(0),
             create_calls: AtomicUsize::new(0),
+            create_names: Mutex::new(Vec::new()),
             retire_calls: AtomicUsize::new(0),
             keep_online_after_retire: AtomicBool::new(false),
             mode_sets: Mutex::new(Vec::new()),
@@ -89,6 +91,10 @@ impl FakeDisplays {
 
     pub fn create_calls(&self) -> usize {
         self.create_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn create_names(&self) -> Vec<String> {
+        self.create_names.lock().expect("create names").clone()
     }
 
     pub fn retire_calls(&self) -> usize {
@@ -142,6 +148,11 @@ impl FakeDisplays {
 }
 
 impl PhoneDisplays for FakeDisplays {
+    fn create_named(&self, fit: ScreenFit, name: &str) -> Result<u32, PhoneScreenException> {
+        self.create_names.lock().expect("create names").push(name.to_string());
+        self.create(fit)
+    }
+
     fn create(&self, fit: ScreenFit) -> Result<u32, PhoneScreenException> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_creates.load(Ordering::SeqCst) > 0 {

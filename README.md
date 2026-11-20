@@ -9,25 +9,18 @@ SnugWin 的 Rust 重写。原项目是 [zephyr4123/snug](https://github.com/zeph
 
 ## 下载
 
-到 [Releases](../../releases) 下最新的 `Snug-v1.3.0-win-x64-selfcontained.zip`
-（6.21 MiB），解压得到：
-
-```text
-snug.exe                                    # 6.67 MiB 单文件，不需要 .NET / VC++ 运行库
-driver\Install-SnugDriver.ps1               # 一键安装/修复虚拟屏驱动
-driver\install-driver.cmd                   # 上面的批处理入口（双击即可）
-driver\virtual-desktop-driver-installer-x64.zip   # 官方驱动安装包（SHA-256 已核对）
-```
+到 [Releases](../../releases) 下载 `snug.exe`（8.74 MiB，9,164,800 B）。程序内含官方驱动安装包、安装脚本和完整机型库，
+只需这一个文件，不需要旁边再放 `driver\` 或 `assets\`。
 
 双击 `snug.exe`（允许 UAC）。**驱动不用你管**：程序启动时探到
 `\\.\pipe\virtualdisplaydriver` 不在，会自己在后台跑包里的安装脚本装好
 （脚本核对安装包与证书的 SHA-256，已装过同款驱动则原样保留），装完直接建屏。
-设置页的「安装驱动」按钮留着做修复用。
+设置页的「安装驱动」按钮也使用内嵌包。正常安装结束后清理临时释放的脚本与安装包。
 
 ## 为什么重写
 
 - `.NET` 桌面 UI（WPF）不支持 NativeAOT，自包含发布要 180 MB 磁盘；Rust 版目标是 10 MB 级别。
-  实际产物：**6.67 MiB 单 exe**（发布 zip 6.21 MiB，含驱动安装包）。
+  实际交付为**内含驱动的单 exe**，大小与取舍见 [体积预算](docs/size-budget.md)。
 - 原版最值钱的是行为细节（窗口归位、字号记忆、手势判定的各种边界），
   这些都在 `SnugWin.Core` 里，可以逐文件对照移植，并有单测兜底。
 - 平台层用 `windows` crate 直接调 Win32 / COM，省掉一层托管封装。
@@ -66,7 +59,7 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
 | 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
 
-全仓 **499 条单测**（core 221 / win 218 / app 56 / 几何对拍 3 / SHA-256 对拍 1），
+全仓 **514 条单测**（core 229 / win 219 / app 62 / 几何对拍 3 / SHA-256 对拍 1），
 `rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
 
 **开机自启**在设置里开（「开机静默自启动」）。它注册一条计划任务
@@ -77,15 +70,17 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
 多屏形态（单窗口 + 顶部切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
 线程与锁纪律见 [`docs/desk-threading.md`](docs/desk-threading.md)。
+本轮响应优化、编译体积对照与验证边界见 [`docs/optimization-20261119.md`](docs/optimization-20261119.md)。
 
 ## 构建
 
 需要 Rust（stable 1.89+，edition 2024）+ MSVC 工具链 + Windows SDK。
 
 ```powershell
+pwsh -File scripts/fetch-driver.ps1    # 编译前准备内嵌驱动，核对 SHA-256
 cargo test --workspace
 cargo build --release -p snug-app
-pwsh -File scripts/build-release.ps1    # 打 dist/ 里的 zip + checksums.txt
+pwsh -File scripts/build-release.ps1    # dist/snug.exe；另保留自动更新 zip 与校验和
 ```
 
 `target\release\snug.exe` 正在运行时无法被覆盖，验证构建可用独立目录：
@@ -97,9 +92,9 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 ## 发版
 
 **手动触发**：GitHub → Actions → `Release` → Run workflow。
-工作流会用根 `Cargo.toml` 的版本推导 tag（也可手填），依次跑全仓单测、
-release 构建、`scripts/preflight.ps1` 静态门禁、`scripts/build-release.ps1` 打包，
-然后建 GitHub Release 并上传 zip 与 `checksums.txt`。
+工作流会用根 `Cargo.toml` 的版本推导 tag（也可手填），依次准备驱动、跑全仓单测、
+release 构建、`scripts/build-release.ps1` 打包和 `scripts/preflight.ps1` 静态门禁，
+然后建 GitHub Release，上传单 exe、自动更新 zip 与 `checksums.txt`。
 
 本地等价流程与资产命名规则见 [docs/release.md](docs/release.md)。
 

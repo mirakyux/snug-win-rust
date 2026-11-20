@@ -73,17 +73,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Fetch virtual display driver
+        # include_bytes! 在编译/测试时就需要原版安装包；先校验 SHA-256 再构建。
+        shell: pwsh
+        run: pwsh -File scripts\fetch-driver.ps1
+
       - name: Test
         # 全仓单测是发版门禁的一部分：真机行为另照 docs/acceptance.md 手验。
         run: cargo test --workspace
 
       - name: Build release
         run: cargo build --release -p snug-app
-
-      - name: Fetch virtual display driver
-        # 驱动跟着包一起发：下载官方安装包并核对 SHA-256（脚本里写死版本与哈希）。
-        shell: pwsh
-        run: pwsh -File scripts\fetch-driver.ps1
 
       - name: Package assets
         shell: pwsh
@@ -123,9 +123,8 @@ jobs:
             $compare = "https://github.com/${{ github.repository }}/commits/$tag"
           }
 
-          $pkgs = Get-ChildItem 'dist' -File | Where-Object { $_.Extension -in '.zip', '.exe' } | Sort-Object Name
-          $lines = @(foreach ($f in $pkgs) { '{0}  {1}' -f (Get-FileHash $f.FullName -Algorithm SHA256).Hash, $f.Name })
-          $lines | Set-Content 'dist\checksums.txt' -Encoding utf8
+          # 使用打包后已通过门禁的校验和，不在验证之后重写资产。
+          $lines = @(Get-Content -LiteralPath 'dist\checksums.txt')
 
           $fence = '```'
           $tail = @('', '### 校验和', '', ($fence + 'text')) + $lines + @($fence, '')
@@ -150,5 +149,6 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           files: |
+            dist/snug.exe
             dist/Snug-v${{ steps.meta.outputs.version }}-win-x64-selfcontained.zip
             dist/checksums.txt

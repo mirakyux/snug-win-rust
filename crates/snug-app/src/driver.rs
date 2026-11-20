@@ -4,8 +4,9 @@
 //! 这种东西。程序本身清单就是 `requireAdministrator`，所以**能自己装**：
 //!
 //! 1. 启动时探一下命名管道（`snug_win::vdd::is_driver_pipe_available`）；
-//! 2. 没有，就在后台跑打包进来的 `driver\Install-SnugDriver.ps1 -Action Install`；
+//! 2. 没有，就在后台释放 exe 内嵌的驱动包，跑 `Install-SnugDriver.ps1 -Action Install`；
 //! 3. 脚本自己校验安装包与证书的 SHA-256，装完等管道起来，然后把手让给建屏流程。
+//! 4. 子进程结束后清理临时脚本、压缩包和解压目录，exe 旁无需 `driver\`。
 //!
 //! 全程在后台线程：装驱动要几十秒（msiexec），不能卡住界面。
 //! 失败了也不拦着程序启动——建屏的重试阶梯还在，设置页里也能手动再来一次。
@@ -16,19 +17,143 @@ use std::time::{Duration, Instant};
 /// 装完等管道就绪的上限。msiexec 装完到服务起管道通常几秒，给足余量。
 const PIPE_WAIT: Duration = Duration::from_secs(40);
 
-/// 从程序目录往上找 `driver\Install-SnugDriver.ps1`（C# `LocateBundledDriverScript`）。
-///
-/// 发布包把它放在 exe 同级的 `driver\`；开发时从 `target\release\` 出发也能找到仓库根的。
-pub fn locate_script() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?.parent().map(Path::to_path_buf)?;
-    for _ in 0..5 {
-        let candidate = dir.join("driver").join("Install-SnugDriver.ps1");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = dir.parent()?.to_path_buf();
+const DRIVER_ARCHIVE: &[u8] =
+    include_bytes!("../../../driver/virtual-desktop-driver-installer-x64.zip");
+const DRIVER_SCRIPT: &[u8] = include_bytes!("../../../driver/Install-SnugDriver.ps1");
+const DRIVER_ARCHIVE_NAME: &str = "virtual-desktop-driver-installer-x64.zip";
+const DRIVER_SCRIPT_NAME: &str = "Install-SnugDriver.ps1";
+const INSTALL_DIRECTORY_SDDL: &str =
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;RC;;;OW)";
+#[cfg(test)]
+const TEST_DIRECTORY_SDDL: &str =
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 独占的临时安装目录；只在安装期间存在，不依赖 exe 所在目录可写。
+struct BundledDriver {
+    directory: PathBuf,
+}
+
+impl BundledDriver {
+    fn prepare() -> std::io::Result<Self> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        // 不使用 TEMP/TMP、Windows\Temp 或 ProgramData：这些父目录可能允许普通用户
+        // 创建/删除子项。直接放在受系统 ACL 保护的 System32 下，避免父级 DELETE_CHILD 竞态。
+        let directory = secure_install_root()?.join(format!("snug-driver-{}-{nonce}", std::process::id()));
+        Self::extract_to(&directory)
     }
-    None
+
+    fn extract_to(directory: &Path) -> std::io::Result<Self> {
+        // Directory appears with its final DACL in one API call; never create an exposed staging path.
+        create_directory_with_sddl(directory, INSTALL_DIRECTORY_SDDL)?;
+        Self::write_contents(directory)
+    }
+
+    #[cfg(test)]
+    fn extract_to_with_sddl(directory: &Path, sddl: &str) -> std::io::Result<Self> {
+        create_directory_with_sddl(directory, sddl)?;
+        Self::write_contents(directory)
+    }
+
+    fn write_contents(directory: &Path) -> std::io::Result<Self> {
+        let bundle = Self { directory: directory.to_path_buf() };
+        std::fs::write(bundle.script(), DRIVER_SCRIPT)?;
+        std::fs::write(directory.join(DRIVER_ARCHIVE_NAME), DRIVER_ARCHIVE)?;
+        Ok(bundle)
+    }
+
+    fn script(&self) -> PathBuf {
+        self.directory.join(DRIVER_SCRIPT_NAME)
+    }
+}
+
+/// System32 父目录对普通 Users 只有读取/执行权限，不能创建、删除或替换子项。
+fn secure_install_root() -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut buffer = vec![0u16; 260];
+    loop {
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+}
+
+/// 目录由 Windows 一次性创建并附带完整安全描述符；不留出事后修 ACL 的竞态窗口。
+fn create_directory_with_sddl(path: &Path, sddl: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    let mut _descriptor_size = 0u32;
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            &mut _descriptor_size,
+        )
+    };
+    if converted == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        descriptor,
+        inherit_handle: 0,
+    };
+    let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) };
+    let error = (created == 0).then(std::io::Error::last_os_error);
+    unsafe {
+        LocalFree(descriptor);
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    descriptor: *mut std::ffi::c_void,
+    inherit_handle: i32,
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl: *const u16,
+        revision: u32,
+        descriptor: *mut *mut std::ffi::c_void,
+        descriptor_size: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
+    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+impl Drop for BundledDriver {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+            crate::warn!("驱动：清理临时安装目录 {} 失败：{error}", self.directory.display());
+        }
+    }
 }
 
 /// 驱动管道在不在（也就是"驱动装好并且服务起着"）。
@@ -76,11 +201,28 @@ pub fn ensure_installed() -> bool {
         );
         return false;
     }
-    let Some(script) = locate_script() else {
-        crate::warn!("驱动：没有命名管道，也没找到 driver\\Install-SnugDriver.ps1（程序目录及其上 5 层）");
-        return false;
+    install_bundled()
+}
+
+/// 自动安装与设置页的显式安装共用内嵌包；等待子进程退出后才释放临时目录。
+fn install_bundled() -> bool {
+    let _install_guard = match INSTALL_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            crate::info!("驱动：安装任务已在进行，跳过重复请求");
+            return false;
+        }
     };
-    crate::info!("驱动：检测到虚拟显示器驱动未就绪，自动安装（{}）", script.display());
+    let bundle = match BundledDriver::prepare() {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            crate::warn!("驱动：释放内嵌安装包失败：{error}");
+            return false;
+        }
+    };
+    let script = bundle.script();
+    crate::info!("驱动：使用内嵌驱动安装包（{}）", script.display());
     let started = Instant::now();
     // 用 `-Command` 包一层，而不是 `-File`：顺手把子进程的控制台输出编码钉成 UTF-8。
     //
@@ -222,6 +364,16 @@ pub fn spawn_ensure_installed() {
         .ok();
 }
 
+/// 设置页显式请求安装/修复，不套用启动时“已安装就只等管道”的快速路径。
+pub fn spawn_install() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("snug-driver-install".to_string())
+        .spawn(|| {
+            let _ = install_bundled();
+        })
+        .map(|_| ())
+}
+
 /// `CREATE_NO_WINDOW`：别给用户闪一个蓝框 PowerShell 出来。
 trait HiddenWindow {
     fn creation_flags_hidden(&mut self) -> &mut Self;
@@ -239,13 +391,94 @@ impl HiddenWindow for std::process::Command {
 mod tests {
     use super::*;
 
+    fn isolated_driver_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("snug-driver-test-{label}-{}-{nonce}", std::process::id()))
+    }
+
     #[test]
-    fn locate_script_walks_up_to_five_levels() {
-        // 只在仓库里跑得通：测试二进制在 target\debug\deps 下，往上能找到仓库根的 driver\。
-        let found = locate_script();
-        if let Some(path) = found {
-            assert!(path.ends_with("Install-SnugDriver.ps1"));
-            assert!(path.is_file());
+    fn embedded_driver_matches_the_pinned_official_archive() {
+        assert_eq!(
+            snug_win::update::sha256_hex(DRIVER_ARCHIVE),
+            "B3E3A5AB9B49BD56A7E753120CDDB1D913479BC5C0DFA781C3D43392DDE2FB75"
+        );
+        assert!(DRIVER_SCRIPT.starts_with(b"\xef\xbb\xbf"));
+        let script = std::str::from_utf8(DRIVER_SCRIPT).unwrap();
+        assert!(script.contains(DRIVER_ARCHIVE_NAME));
+        assert!(script.contains("B3E3A5AB9B49BD56A7E753120CDDB1D913479BC5C0DFA781C3D43392DDE2FB75"));
+    }
+
+    #[test]
+    fn standalone_driver_extracts_without_sidecar_files_and_cleans_up() {
+        let directory = isolated_driver_dir("standalone");
+        {
+            // 测试进程是普通完整性级别，只创建同级标签；生产路径固定使用 High。
+            let bundle = BundledDriver::extract_to_with_sddl(&directory, TEST_DIRECTORY_SDDL).unwrap();
+            assert_eq!(bundle.script(), directory.join(DRIVER_SCRIPT_NAME));
+            assert_eq!(std::fs::read(bundle.script()).unwrap(), DRIVER_SCRIPT);
+            assert_eq!(std::fs::read(directory.join(DRIVER_ARCHIVE_NAME)).unwrap(), DRIVER_ARCHIVE);
+            // 模拟安装脚本解压的 MSI；安装进程结束后一起清理。
+            let installer = directory.join("installer");
+            std::fs::create_dir(&installer).unwrap();
+            std::fs::write(installer.join("test.msi"), b"temporary installer").unwrap();
+        }
+        assert!(!directory.exists(), "安装完成后不应保留驱动临时副本");
+    }
+
+    #[test]
+    fn extraction_refuses_to_reuse_an_existing_directory() {
+        let directory = isolated_driver_dir("existing");
+        std::fs::create_dir(&directory).unwrap();
+        let sentinel = directory.join(DRIVER_SCRIPT_NAME);
+        std::fs::write(&sentinel, b"existing file").unwrap();
+        let error = BundledDriver::extract_to_with_sddl(&directory, TEST_DIRECTORY_SDDL).err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"existing file");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn installer_directory_descriptor_has_protected_owner_acl() {
+        assert!(INSTALL_DIRECTORY_SDDL.starts_with("D:P"), "DACL inheritance must be protected");
+        assert!(INSTALL_DIRECTORY_SDDL.contains(";;;SY)"), "SYSTEM must retain full access");
+        assert!(INSTALL_DIRECTORY_SDDL.contains(";;;BA)"), "elevated Administrators must retain full access");
+        assert!(
+            INSTALL_DIRECTORY_SDDL.contains("(A;OICI;RC;;;OW)"),
+            "the medium-integrity owner gets read-control only, with inherited protection"
+        );
+        assert!(
+            INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;BA)"),
+            "the elevated application must retain inherited full access"
+        );
+        assert!(
+            secure_install_root()
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with("\\system32")
+        );
+        let sddl: Vec<u16> = INSTALL_DIRECTORY_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        let mut descriptor_size = 0u32;
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                &mut descriptor_size,
+            )
+        };
+        assert_ne!(converted, 0, "Windows must accept the production ACL descriptor");
+        assert!(!descriptor.is_null());
+        assert!(INSTALL_DIRECTORY_SDDL.starts_with("D:P"));
+        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;SY)"));
+        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;BA)"));
+        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;RC;;;OW)"));
+        unsafe {
+            LocalFree(descriptor);
         }
     }
 

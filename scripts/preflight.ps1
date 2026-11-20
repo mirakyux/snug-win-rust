@@ -9,13 +9,15 @@
 
       1. 版本：exe 资源里的 FileVersion/ProductVersion 与根 Cargo.toml 的
          [workspace.package] version 一致，且是三段数字（更新器按它跟 tag 比）；
-      2. 体积：在 docs/size-budget.md 的 8 MiB 预算内；
+      2. 体积：应用 8 MiB + 内嵌驱动 4 MiB，总预算 12 MiB；
       3. 清单：requestedExecutionLevel = requireAdministrator（建虚拟屏、改显示配置要提权）；
          顺带核对 PerMonitorV2 / longPathAware / activeCodePage=UTF-8；
       4. 依赖：dumpbin /dependents 里只有系统 DLL（零运行时依赖的实证，
          不应出现 VCRUNTIME140 / MSVCP140 之类的可再发行组件）；
-      5. 发行包：dist 里当前版本的 zip 结构与 checksums.txt 的 SHA-256 对得上；
-      6. 更新源（给了 -ReleasesRepo 才查）：exe 里确实固化了那个仓库坐标。
+      5. 单文件：完整官方驱动 zip 与带 BOM 的安装脚本逐字节内嵌在 exe；
+      6. 发行包：dist/snug.exe、仅含 snug.exe 的更新 zip 与输入 exe 哈希一致，
+         checksums.txt 同时记录裸 exe 与 zip；
+      7. 更新源（给了 -ReleasesRepo 才查）：exe 里确实固化了那个仓库坐标。
 
     第 3、4 项需要 MSVC 的 dumpbin.exe 与 SDK 的 mt.exe；找不到就记 SKIP 并说明，
     不伪装成通过。
@@ -28,8 +30,8 @@
 param(
     # 要检查的 exe（默认 dist 用的那个 target\release\snug.exe）。
     [string]$Exe,
-    # 允许的体积上限（字节）。默认 8 MiB。
-    [long]$MaxBytes = 8388608,
+    # 允许的体积上限（字节）：应用 8 MiB + 内嵌驱动 4 MiB。
+    [long]$MaxBytes = 12582912,
     # 发行包目录。
     [string]$DistDir,
     # 期望固化在 exe 里的更新源（`owner/name`）；给了才检查这一项。
@@ -51,6 +53,15 @@ function Pass([string]$text) { Write-Host "  PASS  $text" -ForegroundColor Green
 function Fail([string]$text) { Write-Host "  FAIL  $text" -ForegroundColor Red; $failures.Add($text) }
 function Skip([string]$text) { Write-Host "  SKIP  $text" -ForegroundColor Yellow; $skips.Add($text) }
 function Head([string]$text) { Write-Host ''; Write-Host $text -ForegroundColor Cyan }
+
+function Get-StreamSha256([System.IO.Stream]$stream) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+}
 
 # ---------------------------------------------------------------------------
 # 工具定位：dumpbin 来自 VS，mt 来自 Windows SDK
@@ -102,6 +113,8 @@ if (-not (Test-Path -LiteralPath $Exe)) {
 }
 $exePath = (Resolve-Path -LiteralPath $Exe).Path
 $exeInfo = Get-Item -LiteralPath $exePath
+$exeHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$exeContent = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($exePath))
 Write-Host ("  exe   : {0}" -f $exePath)
 Write-Host ("  大小  : {0:N0} B（{1:N2} MiB）" -f $exeInfo.Length, ($exeInfo.Length / 1MB))
 
@@ -155,6 +168,42 @@ if ($exeInfo.Length -gt $MaxBytes) {
 } else {
     $percent = [math]::Round($exeInfo.Length * 100.0 / $MaxBytes, 1)
     Pass ("{0:N0} B，占预算 {1}%" -f $exeInfo.Length, $percent)
+}
+
+# ---------------------------------------------------------------------------
+# 2b. 驱动完整内嵌（只读字节，不运行 exe、不释放或安装驱动）
+# ---------------------------------------------------------------------------
+
+Head '== 内嵌驱动 =='
+$driverDir = Join-Path $repoRoot 'driver'
+$driverZipName = 'virtual-desktop-driver-installer-x64.zip'
+$fetchScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fetch-driver.ps1') -Raw
+$driverHashMatch = [regex]::Match($fetchScript, '(?m)^\$ExpectedSha256\s*=\s*''([0-9A-Fa-f]{64})''')
+foreach ($name in @($driverZipName, 'Install-SnugDriver.ps1')) {
+    $source = Join-Path $driverDir $name
+    if (-not (Test-Path -LiteralPath $source)) {
+        Fail "缺少内嵌内容的比对源 driver\$name（先运行 scripts/fetch-driver.ps1）"
+        continue
+    }
+    $sourceBytes = [System.IO.File]::ReadAllBytes($source)
+    if ($name -eq $driverZipName) {
+        $driverHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+        if ($driverHashMatch.Success -and $driverHash -eq $driverHashMatch.Groups[1].Value) {
+            Pass '驱动安装包 SHA-256 与 fetch-driver.ps1 固定的官方哈希一致'
+        } else {
+            Fail '驱动安装包与 fetch-driver.ps1 的官方 SHA-256 不符，或固定哈希无法读取'
+        }
+    } elseif ($sourceBytes.Length -ge 3 -and $sourceBytes[0] -eq 0xEF -and $sourceBytes[1] -eq 0xBB -and $sourceBytes[2] -eq 0xBF) {
+        Pass '内嵌安装脚本的比对源是 UTF-8 with BOM'
+    } else {
+        Fail 'driver/Install-SnugDriver.ps1 缺 UTF-8 BOM，powershell.exe 5.1 会按 ANSI 解析'
+    }
+    # Latin1 一字节对应一个字符；Ordinal 查找完整内容，不能只匹配文件名或魔数。
+    if ($sourceBytes.Length -gt 0 -and $exeContent.Contains([System.Text.Encoding]::Latin1.GetString($sourceBytes), [System.StringComparison]::Ordinal)) {
+        Pass ("exe 完整内嵌 {0}（{1:N0} B，逐字节相同）" -f $name, $sourceBytes.Length)
+    } else {
+        Fail "exe 未完整内嵌 driver/$name（不是含驱动的单文件产物，或源文件已改变）"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -239,21 +288,28 @@ Head '== 发行包 =='
 $assetName = "Snug-v$($workspaceVersion)-win-x64-selfcontained.zip"
 $zipPath = Join-Path $DistDir $assetName
 $checksumsPath = Join-Path $DistDir 'checksums.txt'
+$distExePath = Join-Path $DistDir 'snug.exe'
+if (-not (Test-Path -LiteralPath $distExePath)) {
+    Fail 'dist 里没有可直接交付的 snug.exe'
+} elseif ((Get-FileHash -LiteralPath $distExePath -Algorithm SHA256).Hash.ToLowerInvariant() -eq $exeHash) {
+    Pass 'dist/snug.exe 与输入 exe 的 SHA-256 一致'
+} else {
+    Fail 'dist/snug.exe 与输入 exe 的 SHA-256 不一致（打包产物过期？）'
+}
+
 if (-not (Test-Path -LiteralPath $zipPath)) {
-    Skip "dist 里没有 $assetName（还没打包，或打的是旧版本）"
+    Fail "dist 里没有 $assetName（先运行 scripts/build-release.ps1）"
 } else {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         $entries = @($archive.Entries | ForEach-Object { $_.FullName })
-        # 顺手读一下安装脚本的头三个字节（archive 关掉之后就读不到了）。
-        $scriptHead = $null
-        $driverEntry = $archive.GetEntry('driver/Install-SnugDriver.ps1')
-        if ($null -ne $driverEntry) {
-            $stream = $driverEntry.Open()
+        $packedExeHash = $null
+        $exeEntry = $archive.GetEntry('snug.exe')
+        if ($null -ne $exeEntry) {
+            $stream = $exeEntry.Open()
             try {
-                $scriptHead = New-Object byte[] 3
-                $scriptRead = $stream.Read($scriptHead, 0, 3)
+                $packedExeHash = Get-StreamSha256 $stream
             } finally {
                 $stream.Dispose()
             }
@@ -261,30 +317,15 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
     } finally {
         $archive.Dispose()
     }
-    # 发行包结构：根目录 snug.exe + driver\ 里的安装脚本与官方驱动安装包。
-    # 驱动必须跟着发——用户解压就能装，不该先去别处找驱动。
-    $expected = @(
-        'snug.exe',
-        'driver/Install-SnugDriver.ps1',
-        'driver/install-driver.cmd',
-        'driver/virtual-desktop-driver-installer-x64.zip'
-    )
-    $missing = @($expected | Where-Object { $entries -notcontains $_ })
-    $extra = @($entries | Where-Object { $expected -notcontains $_ })
-    if ($missing.Count -gt 0 -or $extra.Count -gt 0) {
-        Fail ("zip 结构不对：缺少 [{0}]，多出 [{1}]" -f ($missing -join ', '), ($extra -join ', '))
+    if ($entries.Count -ne 1 -or $entries[0] -cne 'snug.exe') {
+        Fail ("更新 zip 必须只有根目录 snug.exe，实际为 [{0}]" -f ($entries -join ', '))
     } else {
-        Pass 'zip 里是 snug.exe + driver\（安装脚本与官方驱动包）'
+        Pass '更新 zip 只有根目录 snug.exe（驱动已内嵌）'
     }
-
-    # 包里的安装脚本必须是 UTF-8 带 BOM：程序用 `powershell.exe` 5.1 拉它，
-    # 没 BOM 就按 ANSI 读，中文注释会让脚本解析失败（真机上第一次自动安装就是这么挂的）。
-    if ($null -eq $scriptHead) {
-        Fail 'zip 里没有 driver/Install-SnugDriver.ps1，无法检查 BOM'
-    } elseif ($scriptRead -eq 3 -and $scriptHead[0] -eq 0xEF -and $scriptHead[1] -eq 0xBB -and $scriptHead[2] -eq 0xBF) {
-        Pass '安装脚本是 UTF-8 with BOM（powershell.exe 5.1 能正确读中文）'
+    if ($packedExeHash -eq $exeHash) {
+        Pass '更新 zip 内 snug.exe 与输入 exe 的 SHA-256 一致'
     } else {
-        Fail '安装脚本缺 UTF-8 BOM：powershell.exe 5.1 会按 ANSI 解析，中文注释让脚本报错'
+        Fail '更新 zip 内 snug.exe 与输入 exe 的 SHA-256 不一致或条目缺失'
     }
 
     if (-not (Test-Path -LiteralPath $checksumsPath)) {
@@ -293,10 +334,15 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
         $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $text = Get-Content -LiteralPath $checksumsPath -Raw
         # 格式：<64 位小写 hex><两个空格><文件名>，与 sha256sum 文本模式一致。
-        if ($text -match ([regex]::Escape($zipHash) + '\s{2}' + [regex]::Escape($assetName))) {
+        if ($text -match ('(?m)^' + [regex]::Escape($zipHash) + '  ' + [regex]::Escape($assetName) + '\r?$')) {
             Pass 'checksums.txt 里的 SHA-256 与 zip 一致'
         } else {
             Fail "checksums.txt 与 $assetName 的 SHA-256 对不上（zip 重打过但没更新校验和？）"
+        }
+        if ($text -match ('(?m)^' + [regex]::Escape($exeHash) + '  snug\.exe\r?$')) {
+            Pass 'checksums.txt 里的 SHA-256 与裸 snug.exe 一致'
+        } else {
+            Fail 'checksums.txt 里裸 snug.exe 的 SHA-256 缺失或不一致'
         }
     }
     if ($zipPath) { Write-Host ("  zip  : {0:N0} B" -f (Get-Item -LiteralPath $zipPath).Length) }
@@ -312,9 +358,7 @@ if (-not $ReleasesRepo) {
 } else {
     # 仓库坐标是编译期 option_env!("SNUG_RELEASES_REPO") 固化的普通字符串，
     # 在二进制里就是一段 ASCII，直接按字节找即可（不用解析 PE 数据段）。
-    $bytes = [System.IO.File]::ReadAllBytes($exePath)
-    $haystack = [System.Text.Encoding]::Latin1.GetString($bytes)
-    if ($haystack.Contains($ReleasesRepo)) {
+    if ($exeContent.Contains($ReleasesRepo, [System.StringComparison]::Ordinal)) {
         Pass "exe 里固化了更新源 $ReleasesRepo"
     } else {
         Fail "exe 里找不到更新源 '$ReleasesRepo'——构建时没设 SNUG_RELEASES_REPO？"

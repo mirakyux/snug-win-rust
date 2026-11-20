@@ -1124,7 +1124,8 @@ impl DeskCore {
         let before = self.capture_surroundings("加屏");
         self.topology_changing();
         let fit = self.fit();
-        match self.shared.displays.create(fit) {
+        let name = self.shared.screen_name.lock().expect("screen name").clone();
+        match self.shared.displays.create_named(fit, &name) {
             Ok(id) => {
                 self.display = Some(PendingDisplay { id, born_at: self.now() });
                 self.failures = 0;
@@ -2399,7 +2400,16 @@ impl DeskCore {
 
     /// 对应 C# `TakeBackReturnedAsync`。
     fn take_back_returned(&mut self) {
-        self.left_behind().prune(now_ms());
+        let pruned = {
+            let mut book = self.left_behind();
+            let count = book.entries.len();
+            book.prune(now_ms());
+            book.entries.len() != count
+        };
+        // 原先只清内存，重启后过期项又会从磁盘加载；有效记录不重写。
+        if pruned {
+            self.save_left_behind();
+        }
         self.repay_app_wide_zoom();
 
         let mut skip: HashSet<WindowKey> = HashSet::new();
@@ -2796,11 +2806,26 @@ mod tests {
         assert!(state.list_visible);
         assert!(harness.displays.is_online(1001));
         assert_eq!(harness.displays.create_calls(), 1);
+        assert_eq!(harness.displays.create_names(), vec![harness.desk.screen_name()]);
         assert_eq!(
             harness.displays.width_of(1001),
             Some(harness.desk.fit().base_width()),
             "建屏用当前 fit 的基础宽度"
         );
+    }
+
+    #[test]
+    fn set_wanted_uses_the_current_configured_screen_name() {
+        let harness = Harness::new();
+        harness.desk.update_wish("书房平板", ScreenFit::standard(), harness.desk.behavior());
+        ready_screen(&harness);
+
+        harness.desk.set_wanted(false);
+        harness.desk.idle();
+        harness.desk.update_wish("客厅平板", ScreenFit::standard(), harness.desk.behavior());
+        ready_screen(&harness);
+
+        assert_eq!(harness.displays.create_names(), vec!["书房平板", "客厅平板"]);
     }
 
     #[test]
@@ -3408,6 +3433,72 @@ mod tests {
         assert!(state.list_visible, "回到 App 资源库");
         assert_eq!(harness.desk.left_behind_len(), 1, "记下回来的样子");
         assert!(!harness.paths.phone_record_file().exists(), "当前记录已结算");
+    }
+
+    #[test]
+    fn check_returns_persists_expired_record_cleanup() {
+        let harness = Harness::new();
+        let entry = left_behind_entry(now_ms() - crate::left_behind::KEEP_MILLIS - 60_000);
+        seed_left_behind(&harness, vec![entry]);
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        assert_eq!(harness.desk.left_behind_len(), 0);
+        let books = &harness.desk.inner.shared.books;
+        assert!(books.left_behind_file.load_or_quarantine().expect("saved book").entries.is_empty());
+    }
+
+    #[test]
+    fn check_returns_preserves_unexpired_records_without_rewriting_them() {
+        let harness = Harness::new();
+        let entry = left_behind_entry(now_ms() - crate::left_behind::KEEP_MILLIS + 60_000);
+        seed_left_behind(&harness, vec![entry.clone()]);
+        let path = harness.paths.left_behind_file();
+        let original = std::fs::read(&path).expect("original book");
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        let books = &harness.desk.inner.shared.books;
+        assert_eq!(books.left_behind.lock().expect("book").entries, vec![entry]);
+        assert_eq!(std::fs::read(path).expect("unchanged book"), original);
+    }
+
+    #[test]
+    fn check_returns_persists_cleanup_without_losing_live_records() {
+        let harness = Harness::new();
+        let expired = left_behind_entry(now_ms() - crate::left_behind::KEEP_MILLIS - 60_000);
+        let live = left_behind_entry(now_ms());
+        seed_left_behind(&harness, vec![expired, live.clone()]);
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        let books = &harness.desk.inner.shared.books;
+        assert_eq!(books.left_behind.lock().expect("book").entries, vec![live.clone()]);
+        assert_eq!(books.left_behind_file.load_or_quarantine().expect("saved book").entries, vec![live]);
+    }
+
+    fn left_behind_entry(since: i64) -> LeftBehindEntry {
+        LeftBehindEntry::new(
+            PhoneRecord {
+                app_id: Some("Code.exe".into()),
+                filled: Some(Rect::new(0.0, 0.0, 540.0, 950.0)),
+                ..PhoneRecord::default()
+            },
+            since,
+        )
+    }
+
+    fn seed_left_behind(harness: &Harness, entries: Vec<LeftBehindEntry>) {
+        let books = &harness.desk.inner.shared.books;
+        let book = LeftBehindBook { entries };
+        // 用紧凑 JSON 检查没有过期项时不会被无谓重写成 pretty JSON。
+        std::fs::create_dir_all(&harness.dir).expect("data directory");
+        std::fs::write(harness.paths.left_behind_file(), serde_json::to_string(&book).expect("json"))
+            .expect("seed book");
+        *books.left_behind.lock().expect("book") = book;
     }
 
     #[test]
