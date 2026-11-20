@@ -7,9 +7,9 @@
 //! 2. 按当前包形态拼出资产名（`Snug-v{ver}-win-x64-{selfcontained|frameworkdependent}.zip`，
 //!    上游 C# 的 `SnugWin-v…` 布局只作参考：Rust 版是并行重写版，用自己的发行名），
 //!    顺带找 `checksums.txt`；
-//! 3. 下载 zip、用 `checksums.txt` 里的 SHA-256 校验（校验不过就中止并删临时目录）；
-//! 4. 解压到 staging 的 `payload/`，确认里面有 [`TARGET_EXE`]（`snug.exe`）；
-//! 5. 写一个 `apply-update.ps1`：等本进程退出 → 覆盖文件 → 重新拉起 → 删临时目录。
+//! 3. 要求 `checksums.txt` 含有更新包的 SHA-256，再下载并校验 zip；
+//! 4. 在 System32 下创建受保护 staging 目录，解压并确认其中有普通文件 `snug.exe`；
+//! 5. 写一个 `apply-update.ps1`：等待当前进程退出、原子替换 EXE、校验并重启。
 //!
 //! **更新源可配置**：仓库坐标由编译期 `SNUG_RELEASES_REPO=owner/name` 决定
 //! （见 [`DEFAULT_RELEASES_REPO`]），API/网页/下载地址全部由 [`ReleaseRepo`] 拼；
@@ -24,15 +24,17 @@
 //! - SHA-256 自己实现（见 [`sha256`]），不引入加密库，保证单 exe 零依赖；
 //! - 当前版本编译期取 `CARGO_PKG_VERSION`；
 //! - 发布仓库不写死：C# 里 URL 是常量，这里全部由 `owner/name` 推导。
+//! - 更新暂存目录直接创建在 System32 下，使用受限 ACL；失败时拒绝在普通临时目录降级。
 //!
 //! 手动验证（真机）：
 //! 1. 把版本号改小后启动，应提示有新版本；
-//! 2. 点更新 → 临时目录里出现 zip 与 payload，校验通过；
-//! 3. 程序退出后 PowerShell 脚本覆盖文件并重新启动新版本；
+//! 2. 点更新 → System32 下的受保护暂存目录出现 zip 与 payload，校验通过；
+//! 3. 程序退出后 PowerShell 脚本原子替换 EXE 并重新启动新版本；
 //! 4. 断网时应提示"无法获取最新版本信息"而不是崩溃。
 
 use std::path::{Path, PathBuf};
 
+use crate::system_paths::{create_protected_directory, powershell, system_directory};
 use snug_core::update::{
     is_newer, normalize, parse_latest_release, try_find_sha256, ReleasePackageKind,
     UpdateReleaseInfo,
@@ -193,7 +195,8 @@ impl CurlHttpClient {
 
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let output = Command::new("curl.exe")
+        let executable = system_directory().map_err(|error| error.to_string())?.join("curl.exe");
+        let output = Command::new(executable)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -210,8 +213,14 @@ impl CurlHttpClient {
 
     fn base_args(timeout_seconds: u32) -> Vec<String> {
         vec![
+            // curl only ignores the user's config file when -q comes first.
+            "-q".to_string(),
             "-sS".to_string(),
             "-L".to_string(),
+            "--proto".to_string(),
+            "=https".to_string(),
+            "--proto-redir".to_string(),
+            "=https".to_string(),
             "--max-time".to_string(),
             timeout_seconds.to_string(),
             "-A".to_string(),
@@ -296,12 +305,15 @@ impl PackageExtractor for TarExtractor {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-        let output = Command::new("tar.exe")
+        let executable = system_directory().map_err(|error| error.to_string())?.join("tar.exe");
+        let output = Command::new(executable)
             .args([
                 "-xf",
                 &archive.to_string_lossy(),
                 "-C",
                 &destination.to_string_lossy(),
+                "--",
+                TARGET_EXE,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -337,13 +349,19 @@ pub struct UpdateCheckResult {
     pub checksums_download_url: Option<String>,
 }
 
+impl UpdateCheckResult {
+    /// An update is installable only when both the package and its checksum manifest exist.
+    pub fn is_downloadable(&self) -> bool {
+        self.package_download_url.is_some() && self.checksums_download_url.is_some()
+    }
+}
+
 /// 下载并解压好的更新（C# `PreparedUpdate`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedUpdate {
     pub version: String,
-    pub staging_root: PathBuf,
-    pub payload_dir: PathBuf,
-    pub target_app_dir: PathBuf,
+    staging_root: PathBuf,
+    exe_sha256: String,
 }
 
 /// 更新流程里的失败原因。
@@ -357,6 +375,10 @@ pub enum UpdateError {
     NoRelease,
     /// 这个版本没有对应资产的下载地址。
     MissingPackage { asset: String },
+    /// 缺少发布校验和或目标文件条目，不安装更新。
+    MissingChecksum { asset: String },
+    /// 校验和文件读取失败，不安装更新。
+    ChecksumUnavailable(String),
     /// SHA-256 对不上，已中止。
     ChecksumMismatch { expected: String, actual: String },
     /// 解压成功但包里没有目标 exe。
@@ -376,6 +398,8 @@ impl std::fmt::Display for UpdateError {
             Self::MissingPackage { asset } => {
                 write!(f, "当前版本资产 {asset} 尚未提供直接下载地址。")
             }
+            Self::MissingChecksum { asset } => write!(f, "更新缺少 {asset} 的 SHA-256，已中止更新。"),
+            Self::ChecksumUnavailable(message) => write!(f, "无法读取更新校验和：{message}，已中止更新。"),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
                 "安装包 SHA-256 校验失败（期望 {expected}，实际 {actual}），已中止更新。"
@@ -489,56 +513,79 @@ pub fn detect_package_kind(app_directory: &Path) -> ReleasePackageKind {
     }
 }
 
-/// PowerShell 单引号字符串里的转义（C# `EscapePsSingle`）。
-pub fn escape_powershell_single(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-/// 生成 `apply-update.ps1` 的内容（C# `LaunchApplyScript` 里的 here-string）。
-pub fn apply_script(update: &PreparedUpdate, target_pid: u32, relaunch_minimized: bool) -> String {
-    let args = if relaunch_minimized {
-        format!("'{}'", escape_powershell_single(snug_core::update::MINIMIZED_ARG))
-    } else {
-        "@()".to_string()
-    };
-    let payload = escape_powershell_single(&update.payload_dir.to_string_lossy());
-    let target = escape_powershell_single(&update.target_app_dir.to_string_lossy());
-    let exe = escape_powershell_single(
-        &update.target_app_dir.join(TARGET_EXE).to_string_lossy(),
-    );
-    let staging = escape_powershell_single(&update.staging_root.to_string_lossy());
-
+/// Paths are passed as data in the child environment, never interpolated as PowerShell source.
+fn apply_script(target_pid: u32, relaunch_minimized: bool) -> String {
+    let args = if relaunch_minimized { "'--minimized'" } else { "''" };
     format!(
         r#"$ErrorActionPreference = 'Stop'
-$targetPid = {target_pid}
-$deadline = (Get-Date).AddSeconds(30)
-while ((Get-Date) -lt $deadline) {{
-    $p = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-    if (-not $p) {{ break }}
-    Start-Sleep -Milliseconds 250
-}}
-Start-Sleep -Milliseconds 350
-
-$src = '{payload}'
-$dst = '{target}'
-Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
-    $rel = $_.FullName.Substring($src.Length).TrimStart('\', '/')
-    $outFile = Join-Path $dst $rel
-    $outDir = Split-Path -Parent $outFile
-    if (-not (Test-Path $outDir)) {{ New-Item -ItemType Directory -Path $outDir -Force | Out-Null }}
-    Copy-Item -Path $_.FullName -Destination $outFile -Force
+function Assert-Hash([IO.Stream]$Stream, [string]$Expected) {{
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {{
+        $actual = [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-', '')
+        if ($actual -ne $Expected) {{ throw 'Updated executable SHA-256 does not match.' }}
+    }} finally {{ $sha.Dispose() }}
 }}
 
-$launchExe = '{exe}'
+$src = Join-Path $PSScriptRoot 'payload\snug.exe'
+$dst = $env:SNUG_UPDATE_TARGET
+$expected = $env:SNUG_UPDATE_SHA256
+$backup = Join-Path $PSScriptRoot 'snug-previous.exe'
+$workingDir = [IO.Path]::GetDirectoryName($dst)
 $launchArgs = {args}
-if ($launchArgs.Count -gt 0) {{
-    Start-Process -FilePath $launchExe -ArgumentList $launchArgs -WorkingDirectory $dst
-}} else {{
-    Start-Process -FilePath $launchExe -WorkingDirectory $dst
+$start = [Diagnostics.ProcessStartInfo]::new($dst, $launchArgs)
+$start.UseShellExecute = $false
+$start.WorkingDirectory = $workingDir
+$replaced = $false
+try {{
+    try {{ $old = [Diagnostics.Process]::GetProcessById({target_pid}) }}
+    catch [ArgumentException] {{ $old = $null }}
+    if ($old) {{
+        try {{
+            if (-not $old.WaitForExit(30000)) {{
+                throw 'Snug did not exit within 30 seconds. The original executable was preserved.'
+            }}
+        }} finally {{ $old.Dispose() }}
+    }}
+
+    $file = [IO.File]::OpenRead($src)
+    try {{ Assert-Hash $file $expected }} finally {{ $file.Dispose() }}
+    [IO.File]::Replace($src, $dst, $backup)
+    $replaced = $true
+
+    # Keep the verified file open with read sharing only while starting it.
+    $file = [IO.File]::OpenRead($dst)
+    try {{
+        Assert-Hash $file $expected
+        [Diagnostics.Process]::Start($start).Dispose()
+    }} finally {{ $file.Dispose() }}
+}} catch {{
+    $failure = $_.ToString()
+    $rollbackFailed = $false
+    if ($replaced) {{
+        try {{ [IO.File]::Replace($backup, $dst, [NullString]::Value) }}
+        catch {{ $failure += "`r`nRollback failed: $_"; $rollbackFailed = $true }}
+    }}
+    if (-not $rollbackFailed) {{
+        $targetRunning = $false
+        try {{
+            $old = [Diagnostics.Process]::GetProcessById({target_pid})
+            $targetRunning = $true
+            $old.Dispose()
+        }} catch [ArgumentException] {{}}
+        if (-not $targetRunning -and $start) {{
+            try {{ [Diagnostics.Process]::Start($start).Dispose() }}
+            catch {{ $failure += "`r`nRestarting the original executable failed: $_" }}
+        }}
+    }}
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'apply-error.txt'), $failure)
+    try {{
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [Windows.Forms.MessageBox]::Show("Snug update failed. The previous version was restored.`r`n`r`n$($_.Exception.Message)", 'Snug Update') | Out-Null
+    }} catch {{}}
+    exit 1
 }}
 
-Start-Sleep -Seconds 2
-Remove-Item -Path '{staging}' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSScriptRoot -Recurse -Force -ErrorAction SilentlyContinue
 "#
     )
 }
@@ -660,36 +707,34 @@ pub struct AppUpdateService<H: HttpClient, E: PackageExtractor = TarExtractor> {
     package_kind: ReleasePackageKind,
     /// 发布仓库；`None` 表示没配置，检查更新会直接报 [`UpdateError::NotConfigured`]。
     repo: Option<ReleaseRepo>,
-    /// 当前程序所在目录（覆盖目标）。
-    app_dir: PathBuf,
-    /// 临时目录根。
-    temp_root: PathBuf,
+    #[cfg(test)]
+    test_staging_parent: Option<PathBuf>,
 }
 
 impl<H: HttpClient> AppUpdateService<H, TarExtractor> {
     /// 生产用构造：版本取 [`APP_VERSION`]，包形态按 Rust 版当自包含，
     /// 仓库取编译期 `SNUG_RELEASES_REPO`（没配就是 `None`，更新功能明确不可用）。
-    pub fn new(http: H, app_dir: impl Into<PathBuf>, temp_root: impl Into<PathBuf>) -> Self {
+    pub fn new(http: H) -> Self {
         Self {
             http,
             extractor: TarExtractor,
             current_version: APP_VERSION.to_string(),
             package_kind: ReleasePackageKind::SelfContained,
             repo: ReleaseRepo::from_default(),
-            app_dir: app_dir.into(),
-            temp_root: temp_root.into(),
+            #[cfg(test)]
+            test_staging_parent: None,
         }
     }
 }
 
+#[cfg(test)]
 impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
-    pub fn with_parts(
+    fn with_parts(
         http: H,
         extractor: E,
         current_version: impl Into<String>,
         package_kind: ReleasePackageKind,
         repo: Option<ReleaseRepo>,
-        app_dir: impl Into<PathBuf>,
         temp_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
@@ -698,9 +743,30 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
             current_version: current_version.into(),
             package_kind,
             repo,
-            app_dir: app_dir.into(),
-            temp_root: temp_root.into(),
+            test_staging_parent: Some(temp_root.into()),
         }
+    }
+}
+
+impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
+    fn staging_path(&self, version: &str, unique: u128) -> std::io::Result<PathBuf> {
+        let name = format!("{STAGING_PREFIX}-{}-{}", std::process::id(), staging_dir_name(version, unique));
+        #[cfg(test)]
+        if let Some(parent) = &self.test_staging_parent {
+            return Ok(parent.join(name));
+        }
+        Ok(system_directory()?.join(name))
+    }
+
+    #[cfg(test)]
+    fn test_staging_path(&self, version: &str, unique: u128) -> Option<PathBuf> {
+        self.test_staging_parent.as_ref().map(|parent| {
+            parent.join(format!(
+                "{STAGING_PREFIX}-{}-{}",
+                std::process::id(),
+                staging_dir_name(version, unique)
+            ))
+        })
     }
 
     pub fn current_version(&self) -> &str {
@@ -763,82 +829,96 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
         let Some(download_url) = check.package_download_url.clone() else {
             return Err(UpdateError::MissingPackage { asset: check.package_asset_name.clone() });
         };
+        // Asset names become local paths. Require the single safe filename produced for
+        // our release package rather than accepting an arbitrary tag-derived path.
+        let asset = &check.package_asset_name;
+        if asset != &release_asset_name(&check.latest_version, ReleasePackageKind::SelfContained)
+            || !asset.bytes().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'-'))
+        {
+            return Err(UpdateError::MissingPackage { asset: asset.clone() });
+        }
+        let expected = self.read_checksum(check)?;
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        let staging_root = self
-            .temp_root
-            .join(STAGING_PREFIX)
-            .join(staging_dir_name(&check.latest_version, unique));
-        std::fs::create_dir_all(&staging_root)
+        // The directory is created atomically with its final DACL. Do not use
+        // create_dir_all here: both the script and verified payload are later consumed
+        // by an elevated process, so a user-writable staging path would re-open a TOCTOU.
+        let staging_root = self.staging_path(&check.latest_version, unique)
             .map_err(|error| UpdateError::Io(error.to_string()))?;
+        #[cfg(test)]
+        let create: fn(&Path) -> std::io::Result<()> = if self.test_staging_parent.is_some() {
+            |path| std::fs::create_dir(path)
+        } else {
+            create_protected_directory
+        };
+        #[cfg(not(test))]
+        let create = create_protected_directory;
+        create(&staging_root)
+            .map_err(|error| UpdateError::Io(format!("无法创建受保护的更新目录：{error}")))?;
 
-        let zip_path = staging_root.join(&check.package_asset_name);
-        let payload_dir = staging_root.join("payload");
-
-        // 校验和拿不到不算错（C# 只是 Warn，然后继续）。
-        let checksums = check
-            .checksums_download_url
-            .as_ref()
-            .and_then(|url| self.http.get(url).ok())
-            .filter(HttpResponse::is_success)
-            .map(|response| response.text());
-
-        if let Err(message) = self.http.download(&download_url, &zip_path, progress) {
-            let _ = std::fs::remove_dir_all(&staging_root);
-            return Err(UpdateError::Network(message));
-        }
-
-        if let Some(text) = checksums {
-            match try_find_sha256(&text, &check.package_asset_name) {
-                Some(expected) => {
-                    let actual = sha256_file(&zip_path)?;
-                    if !actual.eq_ignore_ascii_case(&expected) {
-                        let _ = std::fs::remove_dir_all(&staging_root);
-                        return Err(UpdateError::ChecksumMismatch { expected, actual });
-                    }
-                }
-                // 有意偏离 C#：`AppUpdateService.cs` 141-151 行在这一支是**静默跳过**
-                // （`TryFindSha256` 返回 false 时外层没有 else，连 Warn 都没有）。
-                // 行为保持一致（不校验、照常继续），只补一行告警：checksums.txt 改名
-                // 或包名对不上时，整条完整性校验会悄无声息地失效，至少让它留痕。
-                None => crate::warn(&missing_checksum_warning(&check.package_asset_name)),
+        let prepare = || -> Result<PreparedUpdate, UpdateError> {
+            let zip_path = staging_root.join(asset);
+            let payload_dir = staging_root.join("payload");
+            self.http.download(&download_url, &zip_path, progress).map_err(UpdateError::Network)?;
+            let actual = sha256_file(&zip_path)?;
+            if !actual.eq_ignore_ascii_case(&expected) {
+                return Err(UpdateError::ChecksumMismatch { expected, actual });
             }
-        }
-
-        if let Err(message) = self.extractor.extract(&zip_path, &payload_dir) {
+            self.extractor.extract(&zip_path, &payload_dir).map_err(UpdateError::ExtractFailed)?;
+            let target_exe = payload_dir.join(TARGET_EXE);
+            use std::os::windows::fs::MetadataExt;
+            let is_regular_exe = std::fs::symlink_metadata(&target_exe).is_ok_and(|metadata| {
+                // Neither a symlink nor any other Windows reparse point can be an update.
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            });
+            if !is_regular_exe {
+                return Err(UpdateError::MissingPayload { exe: TARGET_EXE.to_string() });
+            }
+            Ok(PreparedUpdate {
+                version: check.latest_version.clone(),
+                staging_root: staging_root.clone(),
+                exe_sha256: sha256_file(&target_exe)?,
+            })
+        };
+        let result = prepare();
+        if result.is_err() {
             let _ = std::fs::remove_dir_all(&staging_root);
-            return Err(UpdateError::ExtractFailed(message));
         }
+        result
+    }
 
-        let target_exe = payload_dir.join(TARGET_EXE);
-        if !target_exe.exists() {
-            let _ = std::fs::remove_dir_all(&staging_root);
-            return Err(UpdateError::MissingPayload { exe: TARGET_EXE.to_string() });
+    fn read_checksum(&self, check: &UpdateCheckResult) -> Result<String, UpdateError> {
+        let missing = || UpdateError::MissingChecksum { asset: check.package_asset_name.clone() };
+        let url = check.checksums_download_url.as_deref().ok_or_else(missing)?;
+        let response = self.http.get(url).map_err(UpdateError::ChecksumUnavailable)?;
+        if !response.is_success() {
+            return Err(UpdateError::ChecksumUnavailable(format!("HTTP {}", response.status)));
         }
-
-        Ok(PreparedUpdate {
-            version: check.latest_version.clone(),
-            staging_root,
-            payload_dir,
-            target_app_dir: self.app_dir.clone(),
-        })
+        try_find_sha256(&response.text(), &check.package_asset_name).ok_or_else(missing)
     }
 }
 
-/// "checksums.txt 里没有这个包名"的告警文案。
-///
-/// C# `AppUpdateService.cs:141-151` 在这一支是静默跳过（`TryFindSha256` 返回 false，
-/// 外层没有 else）；我们行为一致，只把这行日志补上，文案抽出来单独测。
-fn missing_checksum_warning(asset: &str) -> String {
-    format!("checksums.txt 里找不到 {asset}，跳过 SHA-256 校验（C# 同语义，此处只补日志）")
+/// 写脚本并拉起绝对路径下的 PowerShell。父进程不等待替换结果；脚本保留失败记录。
+fn volume_path(path: &Path) -> Result<String, UpdateError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{GetVolumeNameForVolumeMountPointW, GetVolumePathNameW};
+    use windows::core::PCWSTR;
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut mount = vec![0u16; 32_768];
+    let mut volume = [0u16; 64];
+    unsafe {
+        GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut mount)
+            .and_then(|()| GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut volume))
+            .map_err(|error| UpdateError::Io(error.to_string()))?;
+    }
+    Ok(crate::wide::from_wide(&volume))
 }
 
-/// 写脚本并拉起 PowerShell（C# `LaunchApplyScript`）。
-///
-/// 脚本自己会等本进程退出，所以这里不等它、也不检查退出码。
 pub fn launch_apply_script(
     update: &PreparedUpdate,
     relaunch_minimized: bool,
@@ -848,25 +928,34 @@ pub fn launch_apply_script(
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let script_path = update.staging_root.join("apply-update.ps1");
-    let script = apply_script(update, std::process::id(), relaunch_minimized);
-    std::fs::write(&script_path, utf8_with_bom(&script))
-        .map_err(|error| UpdateError::Io(error.to_string()))?;
+    let result = (|| {
+        let target = std::env::current_exe().map_err(|error| UpdateError::Io(error.to_string()))?;
+        // File.Replace requires both files and the backup to be on one volume. Check
+        // before exiting; never fall back to copying into the live EXE.
+        if volume_path(&target)? != volume_path(&update.staging_root)? {
+            return Err(UpdateError::Io("自动更新要求程序与 Windows 位于同一个卷，请手动替换 EXE".into()));
+        }
+        let executable = powershell().map_err(|error| UpdateError::Io(error.to_string()))?;
+        let script_path = update.staging_root.join("apply-update.ps1");
+        let script = apply_script(std::process::id(), relaunch_minimized);
+        std::fs::write(&script_path, utf8_with_bom(&script))
+            .map_err(|error| UpdateError::Io(error.to_string()))?;
 
-    Command::new("powershell.exe")
-        .args([
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-WindowStyle".to_string(),
-            "Hidden".to_string(),
-            "-File".to_string(),
-            script_path.to_string_lossy().to_string(),
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|error| UpdateError::Io(error.to_string()))?;
-    Ok(script_path)
+        Command::new(executable)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script_path)
+            .env_remove("PSModulePath")
+            .env("SNUG_UPDATE_TARGET", &target)
+            .env("SNUG_UPDATE_SHA256", &update.exe_sha256)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| UpdateError::Io(error.to_string()))?;
+        Ok(script_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&update.staging_root);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -912,7 +1001,7 @@ mod tests {
     fn default_repo_comes_from_the_build_time_env() {
         // 测试构建通常没设 SNUG_RELEASES_REPO：生产构造必须如实报告“未配置”，
         // 而不是偷偷用一个写死的仓库。
-        let service = AppUpdateService::new(FakeHttp::new(), ".", ".");
+        let service = AppUpdateService::new(FakeHttp::new());
         assert_eq!(
             service.is_configured(),
             DEFAULT_RELEASES_REPO.and_then(ReleaseRepo::parse).is_some()
@@ -1034,14 +1123,22 @@ mod tests {
             Some("https://example.invalid/fdd.zip")
         );
 
+        let mut no_checksums = release.clone();
+        no_checksums.assets.retain(|asset| !asset.name.eq_ignore_ascii_case(CHECKSUMS_ASSET));
+        let missing_checksums =
+            build_check_result(&no_checksums, "1.0.0", ReleasePackageKind::SelfContained, &repo);
+        assert!(!missing_checksums.is_downloadable());
+
         // 缺资产时下载地址是 None。
         let missing =
             build_check_result(&release, "1.0.0", ReleasePackageKind::SelfContained, &repo);
         assert!(missing.package_download_url.is_some());
+        assert!(missing.is_downloadable(), "包和校验和都存在时应启用下载");
         let no_assets = UpdateReleaseInfo { assets: Vec::new(), ..release };
         let none =
             build_check_result(&no_assets, "1.0.0", ReleasePackageKind::SelfContained, &repo);
         assert_eq!(none.package_download_url, None);
+        assert!(!none.is_downloadable());
     }
 
     #[test]
@@ -1053,29 +1150,55 @@ mod tests {
     }
 
     #[test]
-    fn powershell_escaping_doubles_single_quotes() {
-        assert_eq!(escape_powershell_single(r"C:\it's"), r"C:\it''s");
-        assert_eq!(escape_powershell_single("plain"), "plain");
+    fn test_staging_root_is_isolated_and_uses_production_prefix() {
+        let parent = temp_root();
+        let service = AppUpdateService::with_parts(
+            FakeHttp::new(),
+            FakeExtractor { create_exe: true },
+            "1.2.0",
+            ReleasePackageKind::SelfContained,
+            Some(test_repo()),
+            parent.clone(),
+        );
+        let path = service.test_staging_path("1.2.3", 7).expect("test parent");
+        assert_eq!(path.parent(), Some(parent.as_path()));
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with(STAGING_PREFIX));
     }
 
     #[test]
-    fn apply_script_contains_paths_and_args() {
-        let update = PreparedUpdate {
-            version: "1.3.0".to_string(),
-            staging_root: PathBuf::from(r"C:\Temp\SnugWin-Update\1.3.0-ab"),
-            payload_dir: PathBuf::from(r"C:\Temp\SnugWin-Update\1.3.0-ab\payload"),
-            target_app_dir: PathBuf::from(r"C:\it's\SnugWin"),
-        };
-        let script = apply_script(&update, 4242, true);
-        assert!(script.contains("$targetPid = 4242"));
-        assert!(script.contains(r"$src = 'C:\Temp\SnugWin-Update\1.3.0-ab\payload'"));
-        assert!(script.contains(r"$dst = 'C:\it''s\SnugWin'"), "单引号要转义：{script}");
-        assert!(script.contains(r"$launchExe = 'C:\it''s\SnugWin\snug.exe'"));
-        assert!(script.contains("$launchArgs = '--minimized'"));
-        assert!(script.contains("Remove-Item -Path 'C:\\Temp\\SnugWin-Update\\1.3.0-ab'"));
+    fn production_staging_is_a_direct_system_directory_child() {
+        let service = AppUpdateService::new(FakeHttp::new());
+        let path = service.staging_path("1.2.3", 7).expect("system staging path");
+        let system = system_directory().unwrap();
+        assert_eq!(path.parent(), Some(system.as_path()));
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with(STAGING_PREFIX));
+    }
 
-        let plain = apply_script(&update, 1, false);
-        assert!(plain.contains("$launchArgs = @()"));
+    #[test]
+    fn curl_defaults_ignore_user_config_and_allow_only_https() {
+        let args = CurlHttpClient::base_args(12);
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+        assert!(args.windows(2).any(|pair| pair == ["--proto", "=https"]));
+        assert!(args.windows(2).any(|pair| pair == ["--proto-redir", "=https"]));
+    }
+
+    #[test]
+    fn apply_script_checks_hash_waits_and_rolls_back() {
+        let script = apply_script(4242, true);
+        assert!(script.contains("GetProcessById(4242)"));
+        assert!(script.contains("WaitForExit(30000)"));
+        assert!(script.contains("does not match"));
+        assert!(script.contains("[IO.File]::Replace($src, $dst, $backup)"));
+        assert!(script.contains("[IO.File]::Replace($backup, $dst"));
+        assert!(script.contains("Restarting the original executable failed"));
+        assert!(script.contains("apply-error.txt"));
+        assert!(script.contains("$env:SNUG_UPDATE_TARGET"));
+        assert!(script.contains(r"Join-Path $PSScriptRoot 'payload\snug.exe'"));
+        assert!(!script.contains("Copy-Item"));
+        assert!(script.contains("$launchArgs = '--minimized'"));
+
+        let plain = apply_script(1, false);
+        assert!(plain.contains("$launchArgs = ''"));
         assert!(!plain.contains("--minimized"));
     }
 
@@ -1106,7 +1229,7 @@ mod tests {
     struct FakeHttp {
         responses: HashMap<String, HttpResponse>,
         download_bytes: Vec<u8>,
-        downloads: Mutex<Vec<(String, PathBuf)>>,
+        downloads: Arc<Mutex<Vec<(String, PathBuf)>>>,
         /// 记录每一次 `get`，用来断言“未配置时不发请求”。
         gets: Arc<Mutex<Vec<String>>>,
     }
@@ -1116,7 +1239,7 @@ mod tests {
             Self {
                 responses: HashMap::new(),
                 download_bytes: Vec::new(),
-                downloads: Mutex::new(Vec::new()),
+                downloads: Arc::new(Mutex::new(Vec::new())),
                 gets: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1200,7 +1323,6 @@ mod tests {
             ReleasePackageKind::SelfContained,
             repo,
             temp_root(),
-            temp_root(),
         )
     }
 
@@ -1212,7 +1334,6 @@ mod tests {
             APP_VERSION,
             ReleasePackageKind::SelfContained,
             Some(test_repo()),
-            temp_root(),
             temp_root(),
         )
     }
@@ -1359,7 +1480,7 @@ mod tests {
 
         assert_eq!(prepared.version, "1.3.0");
         assert!(prepared.staging_root.exists());
-        assert!(prepared.payload_dir.join(TARGET_EXE).exists());
+        assert!(prepared.staging_root.join("payload").join(TARGET_EXE).exists());
         assert_eq!(progress, vec![1.0]);
         let _ = std::fs::remove_dir_all(&prepared.staging_root);
     }
@@ -1394,21 +1515,28 @@ mod tests {
 
     #[test]
     fn missing_payload_exe_aborts_and_cleans_up() {
-        let service = service(FakeHttp::new(), false);
+        let hash = sha256_hex(b"payload");
+        let mut http = FakeHttp::new();
+        http.download_bytes = b"payload".to_vec();
+        let http = http.with(
+            "https://example.invalid/checksums.txt",
+            HttpResponse::new(
+                200,
+                format!("{hash}  Snug-v1.3.0-win-x64-selfcontained.zip\n"),
+                "https://example.invalid/checksums.txt",
+            ),
+        );
+        let service = service(http, false);
         let error = service
-            .download_and_prepare(&check_with(None), &mut |_| {})
+            .download_and_prepare(&check_with(Some("https://example.invalid/checksums.txt")), &mut |_| {})
             .expect_err("包里没有 exe 要中止");
         assert_eq!(error, UpdateError::MissingPayload { exe: TARGET_EXE.to_string() });
         assert!(!error.to_string().is_empty());
     }
 
     #[test]
-    fn checksums_without_the_asset_name_skips_verification_like_csharp() {
-        // C# 的 TryFindSha256 找不到包名时返回 false → 整个校验分支跳过（不是放行错误哈希）。
-        // 这条和上一条一起把两条分支都钉住：名字对上必须校验，对不上才跳过。
-        // 注意：C# `AppUpdateService.cs:141-151` 在这一支连日志都没有（静默跳过），
-        // 我们的行为保持一致，只补一行 Warn（见 missing_checksum_warning），所以这里
-        // 断言的是"不报错、照常继续"，日志文案由 missing_checksum_warning_names_the_asset 覆盖。
+    fn checksums_without_the_asset_name_aborts_before_download() {
+        // The package must not download when its own entry is absent from the manifest.
         let mut http = FakeHttp::new();
         http.download_bytes = b"payload".to_vec();
         let http = http.with(
@@ -1419,24 +1547,36 @@ mod tests {
                 "https://example.invalid/checksums.txt",
             ),
         );
-        let prepared = service(http, true)
+        let downloads = http.downloads.clone();
+        let error = service(http, true)
             .download_and_prepare(&check_with(Some("https://example.invalid/checksums.txt")), &mut |_| {})
-            .expect("没有该包名的校验和就跳过校验");
-        assert!(prepared.payload_dir.join(TARGET_EXE).exists());
-        let _ = std::fs::remove_dir_all(&prepared.staging_root);
+            .expect_err("没有匹配校验和必须拒绝");
+        assert!(matches!(error, UpdateError::MissingChecksum { .. }));
+        assert!(downloads.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn checksums_download_failure_still_proceeds() {
-        // checksums 拿不到 → 跳过校验（C# 只是 Warn）。
+    fn checksums_download_failure_aborts_before_download() {
         let mut http = FakeHttp::new();
         http.download_bytes = b"payload".to_vec();
-        let service = service(http, true);
-        let prepared = service
+        let downloads = http.downloads.clone();
+        let error = service(http, true)
             .download_and_prepare(&check_with(Some("https://example.invalid/missing.txt")), &mut |_| {})
-            .expect("没有校验和也能继续");
-        assert!(prepared.payload_dir.join(TARGET_EXE).exists());
-        let _ = std::fs::remove_dir_all(&prepared.staging_root);
+            .expect_err("获取不到校验和必须拒绝");
+        assert!(matches!(error, UpdateError::ChecksumUnavailable(_)));
+        assert!(downloads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_checksum_aborts_before_any_download() {
+        let mut http = FakeHttp::new();
+        http.download_bytes = b"payload".to_vec();
+        let downloads = http.downloads.clone();
+        let error = service(http, true)
+            .download_and_prepare(&check_with(None), &mut |_| {})
+            .expect_err("缺少校验和地址必须拒绝");
+        assert!(matches!(error, UpdateError::MissingChecksum { .. }));
+        assert!(downloads.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1445,7 +1585,7 @@ mod tests {
         assert_eq!(service.current_version(), env!("CARGO_PKG_VERSION"));
 
         // 生产构造与 crate 版本同源（根 Cargo.toml 的 [workspace.package] version）。
-        let production = AppUpdateService::new(FakeHttp::new(), ".", ".");
+        let production = AppUpdateService::new(FakeHttp::new());
         assert_eq!(production.current_version(), APP_VERSION);
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"), "版本只能有一个来源");
 
@@ -1501,11 +1641,4 @@ mod tests {
         assert_eq!(try_find_sha256(&format!("{}  {asset}\n", "zz".repeat(32)), asset), None);
     }
 
-    #[test]
-    fn missing_checksum_warning_names_the_asset() {
-        // 名字对不上时行为不变（继续、不校验），但必须留一行日志说明"校验没生效"。
-        let message = missing_checksum_warning("Snug-v1.3.0-win-x64-selfcontained.zip");
-        assert!(message.contains("Snug-v1.3.0-win-x64-selfcontained.zip"), "{message}");
-        assert!(message.contains("跳过 SHA-256 校验"), "{message}");
-    }
 }

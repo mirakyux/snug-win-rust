@@ -2,7 +2,7 @@
 //!
 //! 对应 C# 版 `SnugWin.App.AppController`。区别在于本移植不引 async 运行时：
 //! `snug-core::desk::Desk` 的方法只入队，真正的动作在它自己的工作线程里串行执行（对应 C# `SerialLane`）。
-//! 这里再起一个轻量线程定时 `idle()`，让重试、超时、watch 这类"时间驱动"的事情有机会跑。
+//! 控制线程处理界面动作和屏幕愿望；UU 探测在独立线程运行，只发布最新结果。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +12,7 @@ use std::time::Duration;
 use snug_core::desk::{
     AppControl, DeskSet, DeskSetEvents, DeskSetOptions, DeskState, PhoneDisplays, PhoneScreenPhase,
 };
+use snug_core::session::{ControllerTable, UUSignals};
 use snug_core::touch::{TouchOptions, TouchRegion};
 use snug_core::windows::{AppInfo, WindowInfo};
 use snug_core::{AppConfig, Paths, Rect};
@@ -83,6 +84,38 @@ impl snug_win::touch::TouchEvents for HookEvents {
 /// 而是把要做的动作塞进队列，由后台线程在两次 `idle()` 之间执行。
 type DeskAction = Box<dyn FnOnce(&mut DeskSet) + Send>;
 
+const UU_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const UU_SAMPLE_MAX_AGE: f64 = 5.0;
+
+struct UuSample {
+    sampled_at: f64,
+    signals: snug_win::UuSignalSet,
+}
+
+type LatestUuSample = Arc<std::sync::Mutex<Option<UuSample>>>;
+
+enum UuReading {
+    Fresh(snug_win::UuSignalSet),
+    Pending,
+    Stale,
+}
+
+fn read_uu_sample(
+    latest: &std::sync::Mutex<Option<UuSample>>,
+    now: f64,
+    last_sample_at: &mut f64,
+) -> UuReading {
+    let sample = latest.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match sample {
+        Some(sample) if now - sample.sampled_at <= UU_SAMPLE_MAX_AGE => {
+            *last_sample_at = sample.sampled_at;
+            UuReading::Fresh(sample.signals)
+        }
+        _ if now - *last_sample_at > UU_SAMPLE_MAX_AGE => UuReading::Stale,
+        _ => UuReading::Pending,
+    }
+}
+
 /// 控制器：持有状态机与后台线程，界面只读它。
 pub struct Controller {
     /// 多屏管理器（对应 C# `DeskSet`）：一块屏一个 desk，共用一条串行队列。
@@ -113,15 +146,15 @@ pub struct Controller {
     displays: Arc<WinPhoneDisplays>,
     /// 手势钩子（C# `TouchHookService`）。
     touch: Arc<snug_win::TouchHook>,
-    /// UU 远程探测（C# `UUSensor`）：由后台线程每秒采样一次。
-    uu: Arc<snug_win::UuSensor>,
+    /// 用户明确要求保留手机屏，不依赖 UU 探测是否有结果。
+    manual_override: Arc<AtomicBool>,
     /// 手机屏总开关（对应 C# `_config.PhoneScreen`）。
     ///
     /// 它只是"允许开屏"，真正开不开还要看会话：C# 每个 tick 都算
     /// `_config.PhoneScreen && _session.InEpisode && WantsPhoneScreen(...)` 再 `SetWanted`。
     /// 移植时漏了这一层（只在启动时设一次），真机表现就是"退出远控后虚拟屏还挂着"。
     phone_enabled: Arc<AtomicBool>,
-    /// UU 远程会话状态机（采样线程每拍更新，界面读它判断"在不在会话里"）。
+    /// UU 远程会话状态机（控制线程消费采样结果，界面读它判断"在不在会话里"）。
     session: Arc<std::sync::Mutex<snug_core::session::RemoteSession>>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: std::sync::Mutex<Option<TouchRegion>>,
@@ -201,8 +234,37 @@ impl Controller {
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
         let desks_worker = desks.clone();
-        let uu = Arc::new(snug_win::UuSensor::new());
-        let uu_worker = uu.clone();
+        let manual_override = Arc::new(AtomicBool::new(false));
+        let manual_worker = manual_override.clone();
+        let latest_uu: LatestUuSample = Arc::new(std::sync::Mutex::new(None));
+        {
+            let latest = latest_uu.clone();
+            let stop = running.clone();
+            // UIA 调用可能被外部进程卡住：控制线程读最新结果，退出时也不等待探测线程。
+            if let Err(error) = std::thread::Builder::new()
+                .name("snug-uu-sampler".to_string())
+                .spawn(move || {
+                    let sensor = snug_win::UuSensor::new();
+                    while stop.load(Ordering::Relaxed) {
+                        let began = std::time::Instant::now();
+                        let sampled_at = began.duration_since(clock).as_secs_f64();
+                        let signals = sensor.sample(sampled_at);
+                        let elapsed = began.elapsed();
+                        if !stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        *latest.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(UuSample { sampled_at, signals });
+                        if elapsed > UU_SAMPLE_INTERVAL {
+                            crate::warn!("UU：一次探测耗时 {} ms", elapsed.as_millis());
+                        }
+                        std::thread::sleep(UU_SAMPLE_INTERVAL.saturating_sub(elapsed));
+                    }
+                })
+            {
+                crate::warn!("UU：无法启动探测线程：{error}");
+            }
+        }
         let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
         let phone_enabled_worker = phone_enabled.clone();
         let session_worker = session.clone();
@@ -223,8 +285,6 @@ impl Controller {
         let worker = std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
-                // UU 采样：一路读不到不该影响状态机，`sample` 自己保证只返回"读不到"。
-                // 采样节奏照 C# 的 1 秒一次；`idle`/`check_returns` 保持 500ms。
                 // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
                 // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
                 use snug_win::display::DisplayApi;
@@ -232,11 +292,14 @@ impl Controller {
                 let mut last_topology: Option<Vec<(u32, i32, i32, i32, i32)>> = None;
                 // 与 `topology_changing` 回调共用同一根时间轴（会话状态机内部按秒比较）。
                 let started = clock;
-                let mut last_sample = -1.0_f64;
+                let mut last_policy_update = -1.0_f64;
+                let mut last_uu_sample = 0.0_f64;
+                let mut uu_sample_stale = false;
+                let mut last_manual = false;
                 let mut last_topology_check = -1.0_f64;
                 let mut last_check_returns = -1.0_f64;
                 let mut last_connected = false;
-                let mut last_signals: Option<(bool, bool, Option<bool>, bool)> = None;
+                let mut last_signals = None;
                 while stop.load(Ordering::Relaxed) {
                     // 界面排过来的动作先做（只是入队，很快）：这样界面线程永远不用在
                     // `DeskSet` 的锁上等——那把锁在 `idle()` 里可能被建屏占住好几秒。
@@ -281,39 +344,69 @@ impl Controller {
                         }
                     }
                     let now = started.elapsed().as_secs_f64();
-                    if now - last_sample >= 1.0 {
-                        last_sample = now;
-                        let sampled = uu_worker.sample(now);
-                        // 真机联调靠日志判断"UU 到底探测到了什么"，所以原始信号变了就记一行。
-                        let summary = (
-                            sampled.client_running,
-                            sampled.client_visible,
-                            sampled.capture_active,
-                            sampled.peer_active,
-                        );
-                        if last_signals != Some(summary) {
-                            crate::info!(
-                                "UU 探测：客户端={} 覆盖窗={} 推流={:?} 对端={} 控制端={}（{}）",
-                                summary.0,
-                                summary.1,
-                                summary.2,
-                                summary.3,
-                                sampled.controllers.names.len(),
-                                if sampled.controllers.readable { "可读" } else { "读不到" }
-                            );
-                            last_signals = Some(summary);
-                        }
-                        let signals = sampled.to_signals();
+                    let manual = manual_worker.load(Ordering::Relaxed);
+                    if now - last_policy_update >= 1.0 || manual != last_manual {
+                        last_policy_update = now;
+                        last_manual = manual;
+                        let signals = if manual {
+                            // 手动强制只影响 wish；不要把合成信号写进真实远程会话状态。
+                            None
+                        } else {
+                            match read_uu_sample(&latest_uu, now, &mut last_uu_sample) {
+                                UuReading::Fresh(sampled) => {
+                                    if uu_sample_stale {
+                                        crate::info!("UU：探测已恢复");
+                                        uu_sample_stale = false;
+                                    }
+                                    let summary = (
+                                        sampled.client_running,
+                                        sampled.client_visible,
+                                        sampled.capture_active,
+                                        sampled.peer_active,
+                                        sampled.controllers.names.len(),
+                                        sampled.controllers.readable,
+                                    );
+                                    if last_signals != Some(summary) {
+                                        crate::info!(
+                                            "UU 探测：客户端={} 服务端可见窗候选={} 推流={:?} 对端={} 控制端={}（{}）",
+                                            summary.0,
+                                            summary.1,
+                                            summary.2,
+                                            summary.3,
+                                            summary.4,
+                                            if summary.5 { "可读" } else { "读不到" }
+                                        );
+                                        last_signals = Some(summary);
+                                    }
+                                    Some(sampled.to_signals())
+                                }
+                                UuReading::Pending => None,
+                                UuReading::Stale => {
+                                    if !uu_sample_stale {
+                                        crate::warn!(
+                                            "UU：超过 {UU_SAMPLE_MAX_AGE} 秒没有新鲜探测结果，按无新证据推进会话"
+                                        );
+                                        uu_sample_stale = true;
+                                    }
+                                    Some(UUSignals {
+                                        overlay_visible: false,
+                                        controllers: ControllerTable::unreadable(),
+                                        capture_active: None,
+                                    })
+                                }
+                            }
+                        };
                         // 会话判定用 `RemoteSession`（不只是 ConnectionTracker）：C# 的
                         // `_session.InEpisode` 决定"该不该有屏"，中断后还有一段重连窗口，
                         // 单用 `ConnectionTracker` 会把这段丢掉。
                         let (connected, in_episode, controllers_len, ended) = {
                             let mut session =
                                 session_worker.lock().unwrap_or_else(|e| e.into_inner());
-                            let transitions = session.update(&signals, now);
-                            let ended = transitions
-                                .iter()
-                                .any(|t| matches!(t, snug_core::session::SessionTransition::Ended));
+                            let ended = signals.is_some_and(|signals| {
+                                session.update(&signals, now).iter().any(|t| {
+                                    matches!(t, snug_core::session::SessionTransition::Ended)
+                                })
+                            });
                             (
                                 session.is_connected(),
                                 session.in_episode(),
@@ -338,7 +431,7 @@ impl Controller {
                         //   _desks.SetRemote(_session.InEpisode);
                         // 与 1.2 的区别：不再按控制端类型判断要不要开屏（多设备时代那套
                         // 启发式已经不准了），只看"有没有会话/手动强制"，屏列表自己带 enabled。
-                        let remote = in_episode || uu_worker.manual_override();
+                        let remote = in_episode || manual;
                         let enabled = phone_enabled_worker.load(Ordering::Relaxed);
                         let active = active_screen_worker
                             .lock()
@@ -351,6 +444,7 @@ impl Controller {
                         };
                         if let Ok(mut desks) = desks_worker.lock() {
                             desks.set_wishes(wishes);
+                            // 手动强制影响屏愿望，但保留原语义：DeskSet 的"远控"标记只来自真实会话。
                             desks.set_remote(in_episode);
                         }
                     }
@@ -386,7 +480,11 @@ impl Controller {
                     std::thread::sleep(Duration::from_millis(500));
                 }
             })
+            .map_err(|error| crate::warn!("手机屏：无法启动控制线程：{error}"))
             .ok();
+        if worker.is_none() {
+            running.store(false, Ordering::Relaxed);
+        }
 
 
         Self {
@@ -397,7 +495,7 @@ impl Controller {
             active_screen,
             displays,
             touch,
-            uu,
+            manual_override,
             phone_enabled,
             session,
             touch_region: std::sync::Mutex::new(None),
@@ -548,18 +646,15 @@ impl Controller {
         }
     }
 
-    /// 手动强制（C# `AppController.SetManualOverride` → `UUSensor.ManualOverride`）。
-    ///
-    /// 语义是"不管 UU 连没连都保持手机屏"。现在是真的：采样线程每秒看一次这个开关，
-    /// 打开时 `sample` 直接给"在远程"的信号。
+    /// 手动强制保持手机屏；不把它写入真实远程会话的证据。
     pub fn set_manual_override(&self, on: bool) {
         crate::info!("手动强制手机屏 = {on}");
-        self.uu.set_manual_override(on);
+        self.manual_override.store(on, Ordering::Relaxed);
     }
 
     /// 当前"手动强制"状态（设置窗回显用）。
     pub fn manual_override(&self) -> bool {
-        self.uu.manual_override()
+        self.manual_override.load(Ordering::Relaxed)
     }
 
     /// 手机屏的屏幕矩形（物理像素）。界面窗口要搬到这块屏上，对应 C#
@@ -797,7 +892,7 @@ fn active_wishes(
 
 #[cfg(test)]
 mod tests {
-    use super::active_wishes;
+    use super::{UuReading, active_wishes, read_uu_sample};
     use snug_core::AppConfig;
 
     fn config_with_one_screen() -> AppConfig {
@@ -819,6 +914,30 @@ mod tests {
         screens.push(tablet.sanitize());
         config.screens = Some(screens);
         config
+    }
+
+    #[test]
+    fn uu_sample_reader_uses_latest_fresh_result_and_expires_old_data() {
+        let latest = std::sync::Mutex::new(Some(super::UuSample {
+            sampled_at: 4.0,
+            signals: snug_win::UuSignalSet::empty(),
+        }));
+        let mut last = 0.0;
+        assert!(matches!(read_uu_sample(&latest, 5.0, &mut last), UuReading::Fresh(_)));
+        assert_eq!(last, 4.0);
+        assert!(matches!(read_uu_sample(&latest, 6.0, &mut last), UuReading::Pending));
+        assert!(matches!(read_uu_sample(&latest, 10.0, &mut last), UuReading::Stale));
+    }
+
+    #[test]
+    fn uu_sample_reader_does_not_accept_a_result_that_arrived_too_late() {
+        let latest = std::sync::Mutex::new(Some(super::UuSample {
+            sampled_at: 1.0,
+            signals: snug_win::UuSignalSet::empty(),
+        }));
+        let mut last = 0.0;
+        assert!(matches!(read_uu_sample(&latest, 7.0, &mut last), UuReading::Stale));
+        assert_eq!(last, 0.0, "stale observation must not reset the expiry clock");
     }
 
     /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `remote` 这一段。

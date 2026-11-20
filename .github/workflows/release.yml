@@ -35,6 +35,8 @@ jobs:
       - name: Resolve tag and version
         id: meta
         shell: pwsh
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: |
           # 版本号只有一个来源：根 Cargo.toml 的 [workspace.package] version。
           $toml = Get-Content 'Cargo.toml' -Raw
@@ -43,7 +45,7 @@ jobs:
           $version = $m.Groups[1].Value
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "版本号格式不对：$version" }
 
-          $tag = '${{ inputs.tag }}'.Trim()
+          $tag = ([string]$env:RELEASE_TAG_INPUT).Trim()
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v$version" }
           if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "tag 必须形如 v1.2.3，收到：$tag" }
           if ($tag -ne "v$version") {
@@ -58,11 +60,14 @@ jobs:
         # 编译期 SNUG_RELEASES_REPO 决定"检查更新"用哪个仓库。仓库变量没配就**不设**，
         # 否则 option_env! 会拿到空串，更新器会当成"配了一个空仓库"。
         shell: pwsh
+        env:
+          RELEASE_REPO_INPUT: ${{ vars.SNUG_RELEASES_REPO }}
         run: |
-          $repo = '${{ vars.SNUG_RELEASES_REPO }}'.Trim()
+          $repo = ([string]$env:RELEASE_REPO_INPUT).Trim()
           if ([string]::IsNullOrWhiteSpace($repo)) {
             Write-Host "未配置仓库变量 SNUG_RELEASES_REPO：本次构建的「检查更新」不可用"
           } else {
+            if ($repo -notmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') { throw 'SNUG_RELEASES_REPO 必须为 owner/name' }
             "SNUG_RELEASES_REPO=$repo" >> $env:GITHUB_ENV
             Write-Host "更新源 = $repo"
           }
@@ -106,9 +111,12 @@ jobs:
 
       - name: Generate release notes
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          $version = '${{ steps.meta.outputs.version }}'
-          $tag = '${{ steps.meta.outputs.tag }}'
+          $version = $env:RELEASE_VERSION
+          $tag = $env:RELEASE_TAG
 
           # 自上一个 tag 以来的提交，作为「本版变化」的原始素材。
           $prev = git describe --tags --abbrev=0 --exclude "$tag" "$tag^" 2>$null

@@ -8,7 +8,8 @@
 | 线程 | 干什么 |
 | --- | --- |
 | **界面线程**（主线程） | egui 每帧：读状态快照、画界面、把 desk 操作塞进 `pending` 队列 |
-| **app worker**（`snug-desk-idle`，`controller.rs`） | 每 500ms 一拍：取 `pending` 执行、采样 UU、算屏愿望、发布快照 |
+| **app worker**（`snug-desk-idle`，`controller.rs`） | 每 500ms 一拍：取 `pending` 执行、消费最新 UU 结果、算屏愿望、发布快照 |
+| **UU sampler**（`snug-uu-sampler`） | 每秒做一次进程/UIA/日志采样，只保留最新结果；UIA 卡顿不阻塞 app worker，超过 5 秒的结果按无新证据处理 |
 | **lane 线程**（`snug-desk`，`serial_lane`） | **真正执行 desk 动作**（建屏/撤屏/铺窗/还原），按入队顺序 |
 | **watch / retry 线程** | 窗口出现/退出/关闭的等待；建屏失败后的重试阶梯（5/15/30s） |
 

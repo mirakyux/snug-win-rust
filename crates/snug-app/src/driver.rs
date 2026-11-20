@@ -11,8 +11,9 @@
 //! 全程在后台线程：装驱动要几十秒（msiexec），不能卡住界面。
 //! 失败了也不拦着程序启动——建屏的重试阶梯还在，设置页里也能手动再来一次。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use snug_win::system_paths::{create_protected_directory, powershell, system_directory};
 
 /// 装完等管道就绪的上限。msiexec 装完到服务起管道通常几秒，给足余量。
 const PIPE_WAIT: Duration = Duration::from_secs(40);
@@ -22,11 +23,6 @@ const DRIVER_ARCHIVE: &[u8] =
 const DRIVER_SCRIPT: &[u8] = include_bytes!("../../../driver/Install-SnugDriver.ps1");
 const DRIVER_ARCHIVE_NAME: &str = "virtual-desktop-driver-installer-x64.zip";
 const DRIVER_SCRIPT_NAME: &str = "Install-SnugDriver.ps1";
-const INSTALL_DIRECTORY_SDDL: &str =
-    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;RC;;;OW)";
-#[cfg(test)]
-const TEST_DIRECTORY_SDDL: &str =
-    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
 static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 独占的临时安装目录；只在安装期间存在，不依赖 exe 所在目录可写。
@@ -42,110 +38,21 @@ impl BundledDriver {
             .as_nanos();
         // 不使用 TEMP/TMP、Windows\Temp 或 ProgramData：这些父目录可能允许普通用户
         // 创建/删除子项。直接放在受系统 ACL 保护的 System32 下，避免父级 DELETE_CHILD 竞态。
-        let directory = secure_install_root()?.join(format!("snug-driver-{}-{nonce}", std::process::id()));
-        Self::extract_to(&directory)
-    }
-
-    fn extract_to(directory: &Path) -> std::io::Result<Self> {
-        // Directory appears with its final DACL in one API call; never create an exposed staging path.
-        create_directory_with_sddl(directory, INSTALL_DIRECTORY_SDDL)?;
+        let directory = system_directory()?.join(format!("snug-driver-{}-{nonce}", std::process::id()));
+        create_protected_directory(&directory)?;
         Self::write_contents(directory)
     }
 
-    #[cfg(test)]
-    fn extract_to_with_sddl(directory: &Path, sddl: &str) -> std::io::Result<Self> {
-        create_directory_with_sddl(directory, sddl)?;
-        Self::write_contents(directory)
-    }
-
-    fn write_contents(directory: &Path) -> std::io::Result<Self> {
-        let bundle = Self { directory: directory.to_path_buf() };
+    fn write_contents(directory: PathBuf) -> std::io::Result<Self> {
+        let bundle = Self { directory };
         std::fs::write(bundle.script(), DRIVER_SCRIPT)?;
-        std::fs::write(directory.join(DRIVER_ARCHIVE_NAME), DRIVER_ARCHIVE)?;
+        std::fs::write(bundle.directory.join(DRIVER_ARCHIVE_NAME), DRIVER_ARCHIVE)?;
         Ok(bundle)
     }
 
     fn script(&self) -> PathBuf {
         self.directory.join(DRIVER_SCRIPT_NAME)
     }
-}
-
-/// System32 父目录对普通 Users 只有读取/执行权限，不能创建、删除或替换子项。
-fn secure_install_root() -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-
-    let mut buffer = vec![0u16; 260];
-    loop {
-        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        if length == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if (length as usize) < buffer.len() {
-            buffer.truncate(length as usize);
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
-        }
-        buffer.resize(length as usize + 1, 0);
-    }
-}
-
-/// 目录由 Windows 一次性创建并附带完整安全描述符；不留出事后修 ACL 的竞态窗口。
-fn create_directory_with_sddl(path: &Path, sddl: &str) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut descriptor = std::ptr::null_mut();
-    let mut _descriptor_size = 0u32;
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            1,
-            &mut descriptor,
-            &mut _descriptor_size,
-        )
-    };
-    if converted == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let attributes = SecurityAttributes {
-        length: std::mem::size_of::<SecurityAttributes>() as u32,
-        descriptor,
-        inherit_handle: 0,
-    };
-    let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) };
-    let error = (created == 0).then(std::io::Error::last_os_error);
-    unsafe {
-        LocalFree(descriptor);
-    }
-    match error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-#[repr(C)]
-struct SecurityAttributes {
-    length: u32,
-    descriptor: *mut std::ffi::c_void,
-    inherit_handle: i32,
-}
-
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sddl: *const u16,
-        revision: u32,
-        descriptor: *mut *mut std::ffi::c_void,
-        descriptor_size: *mut u32,
-    ) -> i32;
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
-    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
-    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
 impl Drop for BundledDriver {
@@ -233,7 +140,14 @@ fn install_bundled() -> bool {
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
          & '{escaped}' -Action Install; exit $LASTEXITCODE"
     );
-    let output = std::process::Command::new("powershell.exe")
+    let powershell = match powershell() {
+        Ok(path) => path,
+        Err(error) => {
+            crate::warn!("驱动：无法定位系统 PowerShell：{error}");
+            return false;
+        }
+    };
+    let output = std::process::Command::new(powershell)
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
         // **别把 PowerShell 7 的 `PSModulePath` 传下去。**
         // 真机踩到过：本程序的父进程若是 PS7（开发环境、或从 PS7 里启动的批处理），
@@ -415,8 +329,8 @@ mod tests {
     fn standalone_driver_extracts_without_sidecar_files_and_cleans_up() {
         let directory = isolated_driver_dir("standalone");
         {
-            // 测试进程是普通完整性级别，只创建同级标签；生产路径固定使用 High。
-            let bundle = BundledDriver::extract_to_with_sddl(&directory, TEST_DIRECTORY_SDDL).unwrap();
+            std::fs::create_dir(&directory).unwrap();
+            let bundle = BundledDriver::write_contents(directory.clone()).unwrap();
             assert_eq!(bundle.script(), directory.join(DRIVER_SCRIPT_NAME));
             assert_eq!(std::fs::read(bundle.script()).unwrap(), DRIVER_SCRIPT);
             assert_eq!(std::fs::read(directory.join(DRIVER_ARCHIVE_NAME)).unwrap(), DRIVER_ARCHIVE);
@@ -426,60 +340,6 @@ mod tests {
             std::fs::write(installer.join("test.msi"), b"temporary installer").unwrap();
         }
         assert!(!directory.exists(), "安装完成后不应保留驱动临时副本");
-    }
-
-    #[test]
-    fn extraction_refuses_to_reuse_an_existing_directory() {
-        let directory = isolated_driver_dir("existing");
-        std::fs::create_dir(&directory).unwrap();
-        let sentinel = directory.join(DRIVER_SCRIPT_NAME);
-        std::fs::write(&sentinel, b"existing file").unwrap();
-        let error = BundledDriver::extract_to_with_sddl(&directory, TEST_DIRECTORY_SDDL).err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"existing file");
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn installer_directory_descriptor_has_protected_owner_acl() {
-        assert!(INSTALL_DIRECTORY_SDDL.starts_with("D:P"), "DACL inheritance must be protected");
-        assert!(INSTALL_DIRECTORY_SDDL.contains(";;;SY)"), "SYSTEM must retain full access");
-        assert!(INSTALL_DIRECTORY_SDDL.contains(";;;BA)"), "elevated Administrators must retain full access");
-        assert!(
-            INSTALL_DIRECTORY_SDDL.contains("(A;OICI;RC;;;OW)"),
-            "the medium-integrity owner gets read-control only, with inherited protection"
-        );
-        assert!(
-            INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;BA)"),
-            "the elevated application must retain inherited full access"
-        );
-        assert!(
-            secure_install_root()
-                .unwrap()
-                .to_string_lossy()
-                .to_lowercase()
-                .ends_with("\\system32")
-        );
-        let sddl: Vec<u16> = INSTALL_DIRECTORY_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut descriptor = std::ptr::null_mut();
-        let mut descriptor_size = 0u32;
-        let converted = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                1,
-                &mut descriptor,
-                &mut descriptor_size,
-            )
-        };
-        assert_ne!(converted, 0, "Windows must accept the production ACL descriptor");
-        assert!(!descriptor.is_null());
-        assert!(INSTALL_DIRECTORY_SDDL.starts_with("D:P"));
-        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;SY)"));
-        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;FA;;;BA)"));
-        assert!(INSTALL_DIRECTORY_SDDL.contains("(A;OICI;RC;;;OW)"));
-        unsafe {
-            LocalFree(descriptor);
-        }
     }
 
     #[test]

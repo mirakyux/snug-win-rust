@@ -268,14 +268,8 @@ impl PhoneHomeApp {
     fn start_update_check(&mut self) {
         use crate::settings::UpdateUiState;
 
-        let app_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-            .unwrap_or_default();
         let service = snug_win::update::AppUpdateService::new(
             snug_win::update::CurlHttpClient::default(),
-            app_dir,
-            std::env::temp_dir(),
         );
         if !service.is_configured() {
             crate::warn!("设置：更新检查不可用——构建时没有设置 SNUG_RELEASES_REPO");
@@ -288,12 +282,16 @@ impl PhoneHomeApp {
         self.settings.set_update_state(UpdateUiState::Checking);
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("snug-update-check".to_string())
             .spawn(move || {
                 let _ = tx.send(service.check_for_update());
             })
-            .ok();
+        {
+            self.update_rx = None;
+            crate::warn!("设置：无法启动更新检查线程 {err}");
+            self.settings.set_update_state(UpdateUiState::CheckFailed(err.to_string()));
+        }
     }
 
     /// 每帧收一次后台检查的结果。
@@ -325,7 +323,7 @@ impl PhoneHomeApp {
                 );
                 self.settings.set_update_state(UpdateUiState::Available {
                     version: result.latest_version.clone(),
-                    downloadable: result.package_download_url.is_some(),
+                    downloadable: result.is_downloadable(),
                 });
                 self.last_update = Some(result);
             }
@@ -354,14 +352,8 @@ impl PhoneHomeApp {
         let version = check.latest_version.clone();
         crate::info!("设置：开始下载 v{version}");
 
-        let app_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-            .unwrap_or_default();
         let service = snug_win::update::AppUpdateService::new(
             snug_win::update::CurlHttpClient::default(),
-            app_dir,
-            std::env::temp_dir(),
         );
         if !service.is_configured() {
             self.settings.set_update_state(UpdateUiState::InstallFailed {
@@ -378,7 +370,7 @@ impl PhoneHomeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.install_rx = Some(rx);
         let progress_tx = tx.clone();
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("snug-update-download".to_string())
             .spawn(move || {
                 let mut progress = |fraction: f64| {
@@ -387,7 +379,14 @@ impl PhoneHomeApp {
                 let outcome = service.download_and_prepare(&check, &mut progress);
                 let _ = tx.send(InstallOutcome::Done(outcome));
             })
-            .ok();
+        {
+            self.install_rx = None;
+            crate::warn!("设置：无法启动下载线程 {err}");
+            self.settings.set_update_state(UpdateUiState::InstallFailed {
+                version,
+                message: err.to_string(),
+            });
+        }
     }
 
     /// 每帧收一次下载进度与结果。
@@ -403,6 +402,15 @@ impl PhoneHomeApp {
                 Err(TryRecvError::Disconnected) => {
                     self.install_rx = None;
                     crate::warn!("设置：下载线程异常结束");
+                    let version = self
+                        .last_update
+                        .as_ref()
+                        .map(|check| check.latest_version.clone())
+                        .unwrap_or_default();
+                    self.settings.set_update_state(UpdateUiState::InstallFailed {
+                        version,
+                        message: "下载线程异常结束".to_string(),
+                    });
                     return;
                 }
             };
@@ -820,7 +828,8 @@ impl PhoneHomeApp {
             SettingsAction::OpenLogDirectory => {
                 let dir = self.paths.log_directory();
                 crate::info!("设置：打开日志目录 {}", dir.display());
-                if let Err(err) = std::process::Command::new("explorer").arg(&dir).spawn() {
+                let explorer = snug_win::system_paths::system_tool("explorer.exe");
+                if let Err(err) = explorer.and_then(|path| std::process::Command::new(path).arg(&dir).spawn()) {
                     crate::warn!("打开日志目录失败：{err}");
                 }
             }
@@ -829,9 +838,10 @@ impl PhoneHomeApp {
                 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
                 if REPOSITORY.is_empty() {
                     crate::warn!("设置：仓库地址未配置（Cargo.toml 缺 repository），无法打开");
-                } else if let Err(err) = std::process::Command::new("cmd")
+                } else if let Err(err) = snug_win::system_paths::system_tool("cmd.exe")
+                    .and_then(|path| std::process::Command::new(path)
                     .args(["/c", "start", "", REPOSITORY])
-                    .spawn()
+                    .spawn())
                 {
                     crate::warn!("打开仓库主页失败：{err}");
                 }

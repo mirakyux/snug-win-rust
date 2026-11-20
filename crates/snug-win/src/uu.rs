@@ -7,17 +7,18 @@
 //! 2. UIA 读 `GameViewer.exe` 窗口里的"本机被控中"控制端表；
 //! 3. `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 里 server 的 ESTABLISHED 对端
 //!    （排除回环、80/443）；
-//! 4. `streamer_log_controlled_*_<pid>.slog` 的持续增长（3 秒内至少两次增长、
-//!    最多保持 2 秒，避免单次刷盘造成假在线）。
+//! 4. `streamer_log_controlled_*_<pid>.slog` 的持续增长（相邻增长最多 15 秒，
+//!    最近一次增长也最多保持 15 秒）。
 //!
 //! [`UuSensor::sample`] 只出原始信号，不替上层做判断；合成规则在 core 的
 //! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 为 `None` 表示"读不到"，
 //! 与 `false`（确定没在推流）区分开——C# 读不到时给 `false`，这里按需求给 `None`。
 //!
 //! 推流 `.slog` 增长不是远程连接的充分证据：本地运行 GameViewer/游戏时日志也可能增长，
-//! 已经造成无远程时虚拟屏反复弹出（历史复现见 `docs/upstream-watch.md`）。因此现在分成两步：
-//! 新会话必须先看到可见覆盖层或读到非空控制端表；一旦会话建立，`.slog` 心跳可维持空闲会话，
-//! 且在 15 秒重连窗口内可恢复。单独的 TCP 对端和日志增长只作诊断/连续性，不能开启新会话。
+//! 已经造成无远程时虚拟屏反复弹出（历史复现见 `docs/upstream-watch.md`）。因此当前策略是：
+//! 新连接与断线恢复都要求 UIA 在控制表中读到远程控制行；`.slog` 只能在最近该证据后的
+//! 15 秒内维持既有连接。`client_visible` 仍只是诊断字段：“服务进程有可见且大于 10×10
+//! 的顶层窗口”启发式，尚未确认窗口身份一定是远控覆盖层，因此不参与准入。TCP 对端只作诊断。
 //!
 //! 取舍：若 UU 在托盘隐藏且会话开始时既无覆盖窗又读不到控制端，自动开屏不会触发；
 //! 用户可用手动强制模式开启。不能通过把现有 TCP/日志阈值调得更短解决两类状态的歧义。
@@ -51,14 +52,14 @@ use crate::wide::from_wide;
 pub struct UuSignalSet {
     /// `GameViewer.exe`（远程客户端）在跑。
     pub client_running: bool,
-    /// `GameViewerServer.exe` 有可见窗口（C# `overlayVisible`，悬浮球/覆盖层）。
+    /// `GameViewerServer.exe` 有可见窗候选；当前只按可见性和尺寸筛选，未验证覆盖层身份。
     pub client_visible: bool,
     /// UIA 读到的控制端表；`readable == false` 表示读不到。
     pub controllers: ControllerTable,
     /// `None` = 读不到（进程不在、日志目录读不到），`Some(false)` = 确定没在推流。
     ///
-    /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。只维持已经确认的会话，
-    /// 不再单独作为新会话的开始证据。
+    /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。它只能短暂维持最近有远端证据的
+    /// 会话，不能独自开启新连接或从断开中恢复。
     pub capture_active: Option<bool>,
     /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。**只作诊断**，不参与判定。
     pub peer_active: bool,
@@ -267,7 +268,7 @@ impl LogGrowth {
 pub trait UuProbe: Send + Sync {
     /// `Process.GetProcessesByName(name)` 取第一个 pid（名字不带扩展名）。
     fn process_pid(&self, name: &str) -> Option<i32>;
-    /// `HasVisibleWindow`：pid 有可见且大于 10×10 的顶层窗口。
+    /// `HasVisibleWindow` 启发式：pid 有可见且大于 10×10 的顶层窗口；不证明它就是远控覆盖层。
     fn has_visible_window(&self, pid: i32) -> bool;
     /// pid 的所有可见顶层窗口句柄（UIA 用）。
     fn visible_windows(&self, pid: i32) -> Vec<u64>;
@@ -585,16 +586,15 @@ impl UuProbe for WinProbe {
     }
 
     fn controllers(&self, handles: &[u64]) -> (ControllerTable, Option<ControllerDiagnosis>) {
-        match crate::uia::Uia::new() {
-            Ok(uia) => {
-                let table = uia.read_controllers(handles);
+        match crate::uia::with_thread_uia(|uia| uia.read_controllers(handles)) {
+            Some(table) => {
                 if table.readable {
                     (table, None)
                 } else {
                     (table, Some(ControllerDiagnosis::UiaUnreadable))
                 }
             }
-            Err(_) => (
+            None => (
                 ControllerTable::unreadable(),
                 Some(ControllerDiagnosis::ComFailed),
             ),

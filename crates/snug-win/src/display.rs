@@ -1368,7 +1368,11 @@ impl DisplayApi for WinDisplay {
         let Some(instance_id) = find_virtual_display_instance_id() else {
             return false;
         };
-        let status = std::process::Command::new("pnputil.exe")
+        let executable = match crate::system_paths::system_tool("pnputil.exe") {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        let status = std::process::Command::new(executable)
             .args(["/restart-device", &instance_id])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

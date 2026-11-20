@@ -25,7 +25,7 @@ use snug_core::Rect;
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
@@ -343,17 +343,40 @@ impl UiaNode for ComElement {
 pub struct Uia {
     automation: IUIAutomation,
     walker: IUIAutomationTreeWalker,
+    _com: Option<ComInitialization>,
+}
+
+struct ComInitialization;
+
+impl Drop for ComInitialization {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
 }
 
 impl Uia {
-    /// 建一个 UIA 会话。COM 初始化失败（比如线程已经是 STA）也能继续用。
+    /// 建一个 UIA 会话。每次成功的 CoInitializeEx（包括 S_FALSE）都由会话析构配对释放；
+    /// 如果线程已用另一种 apartment 初始化，则不取得也不释放 COM 引用。
     pub fn new() -> windows::core::Result<Self> {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let automation: IUIAutomation =
-                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let walker = automation.RawViewWalker()?;
-            Ok(Self { automation, walker })
+            let status = CoInitializeEx(None, COINIT_MULTITHREADED);
+            // RPC_E_CHANGED_MODE only means this thread already chose a different apartment.
+            // CoCreateInstance may still work there; preserve the old behavior, but never
+            // balance an initialization reference that this call did not acquire.
+            let com = status.is_ok().then_some(ComInitialization);
+            let created = (|| {
+                let automation: IUIAutomation =
+                    CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+                let walker = automation.RawViewWalker()?;
+                Ok((automation, walker))
+            })();
+            match created {
+                Ok((automation, walker)) => Ok(Self { automation, walker, _com: com }),
+                Err(error) => {
+                    drop(com);
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -400,7 +423,7 @@ impl Uia {
 /// 复用之后同一窗口的查找是 50–170ms。
 ///
 /// 用 thread_local 而不是全局缓存：COM 接口是套间绑定的，跨线程共享会出错；
-/// 桌面动作都跑在同一条 lane 线程上，正好每线程一个。
+/// 桌面动作和 UU 传感器分别在固定线程上运行，各自保留一份。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UiaCloseButtons;
 
@@ -409,16 +432,21 @@ thread_local! {
     static UIA_CACHE: std::cell::RefCell<Option<Uia>> = const { std::cell::RefCell::new(None) };
 }
 
+/// 在当前线程复用 UIA 会话。UIA/COM 接口不能在线程间共享；每条固定用途线程各有一份。
+pub fn with_thread_uia<T>(body: impl FnOnce(&Uia) -> T) -> Option<T> {
+    UIA_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        if slot.is_none() {
+            // 初始化失败不缓存，下次探测仍可重试。
+            *slot = Uia::new().ok();
+        }
+        slot.as_ref().map(body)
+    })
+}
+
 impl crate::window::CloseButtonFinder for UiaCloseButtons {
     fn find_close_button(&self, handle: u64) -> Option<Rect> {
-        UIA_CACHE.with(|cache| {
-            let mut slot = cache.borrow_mut();
-            if slot.is_none() {
-                // 建不出来就别缓存失败（下次重试，例如 COM 一时忙）。
-                *slot = Uia::new().ok();
-            }
-            slot.as_ref()?.find_close_button(handle)
-        })
+        with_thread_uia(|uia| uia.find_close_button(handle)).flatten()
     }
 }
 

@@ -55,7 +55,8 @@ impl CommandRunner for SystemRunner {
         /// 不弹命令行窗口。
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let child = Command::new(program)
+        let executable = crate::system_paths::system_tool(program)?;
+        let child = Command::new(executable)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

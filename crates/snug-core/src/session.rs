@@ -113,17 +113,17 @@ pub struct UUSignals {
 }
 
 impl UUSignals {
-    /// 足以准入一个*新*远程会话的信号。
-    /// 推流日志增长可以维持已准入的会话，但它本身有歧义：本地使用 GameViewer 也会刷新日志。
+    /// 足以开始或恢复远程连接的证据。
+    ///
+    /// Server 进程的可见窗口只是尺寸启发式，无法区分覆盖层与其它游戏窗口，
+    /// 所以只有 UIA 读到被控端控制表中的远程控制行才可准入。
     pub fn has_remote_evidence(&self) -> bool {
-        self.overlay_visible || (self.controllers.readable && !self.controllers.names.is_empty())
+        self.controllers.readable && !self.controllers.names.is_empty()
     }
 
-    /// 维持已准入会话的信号，包括推流日志心跳。
+    /// 采样中包含在场迹象。状态机还会检查日志是否有资格维持已有连接。
     pub fn is_present(&self) -> bool {
-        self.overlay_visible
-            || !self.controllers.names.is_empty()
-            || self.capture_active == Some(true)
+        self.has_remote_evidence() || self.capture_active == Some(true)
     }
 }
 
@@ -158,12 +158,17 @@ pub const DISCONNECT_DEBOUNCE: f64 = 1.5;
 /// 自己动过 UI 之后的静默期，期间不判定断开。
 pub const QUIET_WINDOW: f64 = 5.0;
 
+/// 推流日志可能包含本地 GameViewer 活动，不能独自无限延长远程会话。
+/// 它只在最近一次远端证据后短暂维持连接；之后必须重新看到覆盖层或控制端。
+const CAPTURE_CONTINUITY_WINDOW: f64 = 15.0;
+
 /// 连接跟踪（对应 C# `ConnectionTracker`）。
 #[derive(Debug, Clone)]
 pub struct ConnectionTracker {
     is_connected: bool,
     controllers: Vec<String>,
     last_present_at: Option<f64>,
+    last_remote_evidence_at: Option<f64>,
     quiet_until: Option<f64>,
 }
 
@@ -175,7 +180,13 @@ impl Default for ConnectionTracker {
 
 impl ConnectionTracker {
     pub fn new() -> Self {
-        Self { is_connected: false, controllers: Vec::new(), last_present_at: None, quiet_until: None }
+        Self {
+            is_connected: false,
+            controllers: Vec::new(),
+            last_present_at: None,
+            last_remote_evidence_at: None,
+            quiet_until: None,
+        }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -195,38 +206,35 @@ impl ConnectionTracker {
         };
     }
 
-    /// 喂一次采样，返回变化（对应 C# `Update`）。
+    /// 喂一次采样。日志心跳只能短暂维持已有连接，不能开始或恢复连接。
     pub fn update(&mut self, signals: &UUSignals, now: f64) -> Option<ConnectionEvent> {
-        self.update_with_evidence_gate(signals, now, false)
-    }
+        let remote_evidence = signals.has_remote_evidence();
+        if remote_evidence {
+            self.last_remote_evidence_at = Some(now);
+        }
 
-    /// 在重连窗口内，推流心跳可以恢复已准入的会话。
-    fn update_with_evidence_gate(
-        &mut self,
-        signals: &UUSignals,
-        now: f64,
-        episode_active: bool,
-    ) -> Option<ConnectionEvent> {
-        // 本地 GameViewer 的推流心跳不能创建新会话；已准入会话的重连窗口内则可作为续期证据。
-        if !self.is_connected && !signals.has_remote_evidence() && !episode_active {
+        // 本地 GameViewer 也会刷新推流日志。掉线后必须重新观察到远端证据才能恢复，
+        // 否则本地日志会把 interrupted episode 不断复活，让虚拟屏永远留着。
+        if !self.is_connected && !remote_evidence {
             return None;
         }
 
+        let capture_is_recent = self
+            .last_remote_evidence_at
+            .is_some_and(|last| now - last <= CAPTURE_CONTINUITY_WINDOW);
+        let present = remote_evidence || (signals.capture_active == Some(true) && capture_is_recent);
         let names = signals.controllers.names.clone();
-        if signals.is_present() {
+        if present {
             self.last_present_at = Some(now);
         }
 
         if !self.is_connected {
-            if !signals.is_present() {
-                return None;
-            }
             self.is_connected = true;
             self.controllers = names.clone();
             return Some(ConnectionEvent::Connected(names));
         }
 
-        if signals.is_present() {
+        if present {
             if names.is_empty() || same_set(&names, &self.controllers) {
                 return None;
             }
@@ -427,7 +435,7 @@ impl RemoteSession {
             self.episode_began_at = None;
         }
 
-        match self.tracker.update_with_evidence_gate(signals, now, self.episode.is_active()) {
+        match self.tracker.update(signals, now) {
             Some(ConnectionEvent::Connected(controllers)) => {
                 if self.episode.connected(now) == EpisodeChange::Began {
                     self.episode_began_at = Some(now);
@@ -617,8 +625,8 @@ mod tests {
         let mut tracker = ConnectionTracker::new();
         let t0 = 0.0;
 
-        let first = tracker.update(&UUSignals { overlay_visible: true, controllers: ControllerTable::unreadable(), capture_active: None }, t0);
-        assert_eq!(first, Some(ConnectionEvent::Connected(Vec::new())));
+        let first = tracker.update(&present_signals(), t0);
+        assert_eq!(first, Some(ConnectionEvent::Connected(vec!["iPhone 17".into()])));
         assert!(tracker.is_connected());
 
         // 短暂消失 < 1.5s 不断开。
@@ -633,6 +641,21 @@ mod tests {
         // 静默期 + 防抖都过去才断开。
         assert_eq!(tracker.update(&absent(), t0 + 7.0), Some(ConnectionEvent::Disconnected));
         assert!(!tracker.is_connected());
+    }
+
+    #[test]
+    fn visible_server_window_without_a_remote_controller_cannot_start_a_session() {
+        let mut tracker = ConnectionTracker::new();
+        let local_game_window = UUSignals {
+            overlay_visible: true,
+            controllers: ControllerTable::unreadable(),
+            capture_active: Some(true),
+        };
+
+        for now in [0.0, 1.0, 2.0, 20.0] {
+            assert_eq!(tracker.update(&local_game_window, now), None);
+            assert!(!tracker.is_connected());
+        }
     }
 
     #[test]
@@ -720,38 +743,55 @@ mod tests {
     }
 
     #[test]
-    fn capture_log_keeps_an_admitted_idle_session_and_can_resume_it() {
+    fn capture_log_cannot_extend_a_live_session_indefinitely() {
         let mut session = RemoteSession::new();
         let admitted = UUSignals {
             overlay_visible: true,
-            controllers: ControllerTable::unreadable(),
+            controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: Some(true),
         };
-        let idle_stream = UUSignals {
+        let capture_only = UUSignals {
             overlay_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(true),
         };
-        let quiet = UUSignals {
-            overlay_visible: false,
-            controllers: ControllerTable::unreadable(),
-            capture_active: Some(false),
-        };
-
         assert_eq!(
             session.update(&admitted, 0.0),
-            vec![SessionTransition::Began(Vec::new())]
+            vec![SessionTransition::Began(vec!["iPhone 17".into()])]
         );
-        assert!(session.update(&idle_stream, 10.0).is_empty());
+        for tick in 1..=16 {
+            assert!(session.update(&capture_only, f64::from(tick)).is_empty());
+        }
         assert!(session.is_connected());
         assert_eq!(
-            session.update(&quiet, 12.0),
+            session.update(&capture_only, 17.0),
             vec![SessionTransition::Interrupted]
         );
         assert!(session.in_episode());
+        for tick in 18..=32 {
+            assert!(session.update(&capture_only, f64::from(tick)).is_empty());
+            assert!(!session.is_connected());
+        }
+        assert_eq!(session.update(&capture_only, 33.0), vec![SessionTransition::Ended]);
+        assert!(!session.in_episode());
+    }
+
+    #[test]
+    fn capture_log_cannot_resume_after_disconnect_even_with_recent_remote_evidence() {
+        let mut session = RemoteSession::new();
+        let admitted = present_signals();
+        let capture_only = UUSignals { capture_active: Some(true), ..absent() };
+
+        session.update(&admitted, 0.0);
         assert_eq!(
-            session.update(&idle_stream, 14.0),
-            vec![SessionTransition::Resumed(Vec::new())]
+            session.update(&absent(), 2.0),
+            vec![SessionTransition::Interrupted]
+        );
+        assert!(session.update(&capture_only, 3.0).is_empty());
+        assert!(!session.is_connected());
+        assert_eq!(
+            session.update(&admitted, 4.0),
+            vec![SessionTransition::Resumed(admitted.controllers.names)]
         );
         assert!(session.is_connected());
     }
@@ -777,7 +817,7 @@ mod tests {
         let mut session = RemoteSession::new();
         let admitted = UUSignals {
             overlay_visible: true,
-            controllers: ControllerTable::unreadable(),
+            controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: Some(true),
         };
         let quiet = UUSignals {

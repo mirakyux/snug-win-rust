@@ -26,6 +26,7 @@ pub mod uu;
 pub mod elevation;
 pub mod placement;
 pub mod startup;
+pub mod system_paths;
 pub mod update;
 pub mod selection_action;
 
