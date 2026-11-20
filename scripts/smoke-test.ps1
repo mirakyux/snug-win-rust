@@ -6,11 +6,11 @@ PASS/FAIL，然后收尾。**它自己不会改显示配置**；改不改由传�
   -Phase A  配置里 phone_screen=false，只验证托盘/设置窗/单实例/日志，不建虚拟屏（默认）
   -Phase B  phone_screen=true，真的建虚拟屏、搬窗口（会动显示配置，需先退掉 C# 正式版）
 
-用法（当前会话需要有管理员权限，因为 snug.exe 的清单是 requireAdministrator）：
+用法（GUI 默认 asInvoker，阶段 A 从普通权限终端运行）：
   pwsh -File scripts\smoke-test.ps1 -Phase A
   pwsh -File scripts\smoke-test.ps1 -Phase B -Seconds 60
 
-如果当前会话不是管理员，脚本会提示你先开一个管理员终端。
+阶段 B 的首次驱动管道访问可能请求受限代理的 UAC。
 #>
 
 [CmdletBinding()]
@@ -29,10 +29,6 @@ function Fail($text) { Write-Host "FAIL: $text" -ForegroundColor Red; exit 1 }
 
 # ---- 前置检查 ---------------------------------------------------------------
 Write-Step "检查运行环境"
-
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Fail "当前会话不是管理员。snug.exe 的清单要求提权，请用管理员终端再跑这个脚本。"
-}
 
 $exePath = [System.IO.Path]::GetFullPath($Exe)
 if (-not (Test-Path $exePath)) { Fail "找不到 $exePath（先 cargo build --release -p snug-app --offline）" }
@@ -69,9 +65,7 @@ $beforeMonitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBas
 Write-Host "  跑之前显示器数：$($beforeMonitors.Count)"
 
 # ---- 启动 -------------------------------------------------------------------
-# 不要用 `Start-Process`：它走 ShellExecute，对一个刚编译出来、带 requireAdministrator
-# 清单的 exe，会先去问 Shell/提权通道，表现为「打开文件 - 安全警告」或迟迟不起进程。
-# 直接从本进程 CreateProcess 启动（UseShellExecute=$false）不经过 shell，行为可预期。
+# 使用 CreateProcess 启动普通权限 GUI，不经由 ShellExecute。
 Write-Step "启动 snug.exe"
 $env:SNUGWIN_HOME = $DataDir
 $startedAt = Get-Date
@@ -79,10 +73,12 @@ $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exePath
 $psi.WorkingDirectory = (Split-Path $exePath)
 $psi.UseShellExecute = $false
+$psi.Arguments = '--minimized'
 $proc = [System.Diagnostics.Process]::Start($psi)
 if (-not $proc) { Fail "进程没有启动起来" }
 Write-Host "  pid=$($proc.Id)"
 
+try {
 Start-Sleep -Seconds $Seconds
 $alive = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
 if (-not $alive) { Write-Host "  进程已退出（可能自己崩了或单实例互斥），继续看日志" -ForegroundColor Yellow }
@@ -105,11 +101,12 @@ $checks = [ordered]@{
     '启动行'         = 'SnugWin \(Rust\) 启动 v\d'
     '数据目录隔离'   = [regex]::Escape($DataDir)
     '驱动管道检测'   = '虚拟屏驱动管道：'
-    '托盘'           = '托盘(已就绪|创建失败)'
+    '托盘'           = '托盘已就绪'
     'UU 探测'        = 'UU 探测：'
     '未出现 panic'   = $null   # 反向检查
 }
 $failed = @()
+if (-not $alive) { $failed += '进程提前退出' }
 foreach ($name in $checks.Keys) {
     if ($name -eq '未出现 panic') { continue }
     if ($text -match $checks[$name]) {
@@ -119,7 +116,7 @@ foreach ($name in $checks.Keys) {
         $failed += $name
     }
 }
-if ($text -match 'panicked|RUST_BACKTRACE') {
+if ($text -match 'panicked|RUST_BACKTRACE|未捕获的 panic') {
     Write-Host "  [!!] 日志里有 panic" -ForegroundColor Red
     $failed += 'panic'
 } else {
@@ -143,6 +140,7 @@ if ($Phase -eq 'B') {
 Write-Step "关键日志（最后 30 行）"
 Get-Content $log.FullName -Tail 30 | ForEach-Object { "  $_" }
 
+} finally {
 # ---- 收尾 -------------------------------------------------------------------
 Write-Step "收尾"
 if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
@@ -167,6 +165,7 @@ if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
     Write-Host "  进程早已退出"
 }
 Remove-Item Env:\SNUGWIN_HOME -ErrorAction SilentlyContinue
+}
 
 if ($failed.Count -gt 0) {
     Write-Host ""

@@ -57,17 +57,19 @@ GitHub → **Actions → Release → Run workflow**，参数：
 | 参数 | 说明 |
 | --- | --- |
 | `tag` | 留空则用根 `Cargo.toml` 的版本推导成 `v1.3.0`；手填则必须与 `Cargo.toml` 的版本一致，否则工作流直接失败（资产名按 exe 版本生成，对不上就发错包） |
-| `draft` | 勾上则先建草稿，检查无误再手动发布 |
+| 草稿 | Release 工作流始终创建草稿，不直接公开 |
 
 工作流（`.github/workflows/release.yml`）按顺序做：
 
 1. `scripts/fetch-driver.ps1`（编译前下载官方驱动安装包，核对 SHA-256）；
-2. 全仓 `cargo test --workspace`；
-3. `cargo build --release -p snug-app`；
+2. 全仓 Debug 与 Release 两种 profile 的 `cargo test --workspace`；
+3. 正确性/可疑用法 Clippy 门禁、显式管理员 staging ACL 测试，以及 `cargo build --release -p snug-app`；
 4. `scripts/build-release.ps1`（`dist/` 里的单 exe、更新 zip 与 `checksums.txt`）；
 5. `scripts/preflight.ps1`（版本 / 体积 / 清单 / 依赖 / 发行包结构与校验和）；
 6. 用 `.github/release-notes-template.md` 生成说明（含自上一个 tag 以来的提交、校验和）；
-7. 建 Release 并上传 `snug.exe`、`Snug-v<版本>-win-x64-selfcontained.zip` 与 `checksums.txt`。
+7. 在单独的写权限 job 建草稿并上传 `snug.exe`、`Snug-v<版本>-win-x64-selfcontained.zip` 与 `checksums.txt`。
+
+下载草稿附件，在 Windows 上完成 `docs/acceptance.md`，记录实际 EXE 的 SHA-256。然后运行 **Publish verified draft**，填入草稿 tag 与该哈希。它验证草稿文件、两个校验和，以及 ZIP 内唯一 EXE 的内容，再公开同一份附件，**不会重新构建**。哈希不匹配、校验和缺失或附件已改变，均拒绝公开。
 
 **只保留手动触发**：参考项目还支持推 tag 自动发，但本项目的发版前提是真机验收
 （`docs/acceptance.md`）走完，一次 push 不该直接把包发出去。
@@ -125,4 +127,6 @@ SNUG_RELEASES_REPO = "mirakyux/snug-win-rust"
 
 自动更新会下载 zip → 用 `checksums.txt` 校验 → 解压到 staging → 写
 `apply-update.ps1`（等本进程退出 → 覆盖 → 重启 → 删临时目录）。
-这条链只在真机点过才知道通不通，见 `docs/acceptance.md` 之外的"仍未知"清单。
+自动更新的下载、暂存、替换与重启都只在普通权限下执行，不提供管理员更新入口。暂存目录在当前 EXE 同级原子创建，避免跨卷复制进运行文件；既有哈希校验、原子替换和失败回滚保留。管理员兼容模式需先退出并普通启动再更新；受保护安装目录会明确报错，请手动替换 EXE。这样无需让高权限进程按用户可改的目标路径写入。
+
+自动测试会在隔离目录中实际执行替换、校验失败、锁定、超时和回滚。真实发布文件的 UAC、受保护安装目录和驱动效果仍须按验收单验证。

@@ -177,7 +177,7 @@ impl Controller {
         paths: &Paths,
         on_change: impl Fn() + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let displays = Arc::new(WinPhoneDisplays::with_paths(paths));
         let windows = Arc::new(WinWindows::new());
         let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
@@ -241,7 +241,7 @@ impl Controller {
             let latest = latest_uu.clone();
             let stop = running.clone();
             // UIA 调用可能被外部进程卡住：控制线程读最新结果，退出时也不等待探测线程。
-            if let Err(error) = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("snug-uu-sampler".to_string())
                 .spawn(move || {
                     let sensor = snug_win::UuSensor::new();
@@ -261,9 +261,9 @@ impl Controller {
                         std::thread::sleep(UU_SAMPLE_INTERVAL.saturating_sub(elapsed));
                     }
                 })
-            {
-                crate::warn!("UU：无法启动探测线程：{error}");
-            }
+                .map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("无法启动 UU 探测线程：{error}"))
+                })?;
         }
         let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
         let phone_enabled_worker = phone_enabled.clone();
@@ -282,7 +282,7 @@ impl Controller {
             Arc::new(HookEvents { queue: touch_events.clone() }),
         ));
         let touch_events_worker = touch_events.clone();
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
                 // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
@@ -480,14 +480,21 @@ impl Controller {
                     std::thread::sleep(Duration::from_millis(500));
                 }
             })
-            .map_err(|error| crate::warn!("手机屏：无法启动控制线程：{error}"))
-            .ok();
-        if worker.is_none() {
-            running.store(false, Ordering::Relaxed);
-        }
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                // The sampler may be blocked inside an external UIA provider; signal it
+                // to stop, but do not block startup cleanup waiting for an uncancellable COM call.
+                running.store(false, Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("无法启动手机屏控制线程：{error}"),
+                ));
+            }
+        };
 
 
-        Self {
+        Ok(Self {
             desks,
             snapshots,
             pending,
@@ -503,8 +510,8 @@ impl Controller {
             selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
             paths: paths.clone(),
             running,
-            worker,
-        }
+            worker: Some(worker),
+        })
     }
 
     /// 主触控屏的 id（单屏界面默认操作的那块）。

@@ -4,6 +4,9 @@
 //! 底部指示条（返回资源库 / 相机键）。当前阶段是骨架 + 真实数据接口占位。
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneCatalog};
@@ -25,6 +28,63 @@ pub enum HomeTab {
 /// 改这里必须和 `main.rs` 里 `ViewportBuilder::with_title` 保持一致。
 pub const WINDOW_TITLE: &str = "Snug 手机屏";
 
+/// Periodically wakes eframe so tray and quit polling keeps running for hidden windows.
+pub struct UiHeartbeat {
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl UiHeartbeat {
+    pub fn start(ctx: egui::Context) -> std::io::Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let worker = std::thread::Builder::new()
+            .name("snug-ui-tick".to_string())
+            .spawn(move || {
+                while worker_running.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if worker_running.load(Ordering::Relaxed) {
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .map_err(|error| {
+                std::io::Error::new(error.kind(), format!("无法启动界面心跳线程：{error}"))
+            })?;
+        Ok(Self { running, worker: Some(worker) })
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for UiHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_stops_and_releases_its_worker_idempotently() {
+        let mut heartbeat = UiHeartbeat::start(egui::Context::default()).unwrap();
+        let weak = Arc::downgrade(&heartbeat.running);
+        heartbeat.stop();
+        heartbeat.stop();
+        assert!(heartbeat.worker.is_none());
+        assert!(!heartbeat.running.load(Ordering::Relaxed));
+        drop(heartbeat);
+        assert!(weak.upgrade().is_none(), "the worker must release its state before shutdown returns");
+    }
+}
+
 pub struct PhoneHomeApp {
     pub config: AppConfig,
     pub paths: Paths,
@@ -37,6 +97,8 @@ pub struct PhoneHomeApp {
     /// 上次查驱动状态的时间（设置窗开着时每帧都会问一次，按 250ms 节流）。
     pipe_checked: Option<std::time::Instant>,
     pub controller: Controller,
+    /// Hidden-window repaint worker; joined during app shutdown.
+    ui_heartbeat: UiHeartbeat,
     pub tab: HomeTab,
     pub search: String,
     /// 上一帧这个窗口有没有键盘焦点（只在变化时记一行，排查"输入不进来"）。
@@ -132,6 +194,7 @@ impl PhoneHomeApp {
         pipe_ready: bool,
         start_minimized: bool,
         controller: Controller,
+        ui_heartbeat: UiHeartbeat,
     ) -> Self {
         let mut settings = SettingsWindow::new();
         settings.set_catalog(catalog.clone());
@@ -153,6 +216,7 @@ impl PhoneHomeApp {
             pipe_ready,
             pipe_checked: None,
             controller,
+            ui_heartbeat,
             tab: HomeTab::Running,
             search: String::new(),
             window_focused: false,
@@ -350,6 +414,13 @@ impl PhoneHomeApp {
             return;
         };
         let version = check.latest_version.clone();
+        if self.elevated {
+            self.settings.set_update_state(UpdateUiState::InstallFailed {
+                version,
+                message: "自动更新只在普通权限下执行，请退出并普通启动 Snug；受保护安装目录请手动替换 EXE。".into(),
+            });
+            return;
+        }
         crate::info!("设置：开始下载 v{version}");
 
         let service = snug_win::update::AppUpdateService::new(
@@ -514,6 +585,7 @@ impl PhoneHomeApp {
         }
         self.finished = true;
         crate::info!("收尾：开始（撤托盘 + 撤屏 + 归位窗口 + 存配置）");
+        self.ui_heartbeat.stop();
         // 托盘要先撤掉：进程退出后留着图标，explorer 会留一个"幽灵图标"直到鼠标划过。
         self.tray = None;
         // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
@@ -828,7 +900,7 @@ impl PhoneHomeApp {
             SettingsAction::OpenLogDirectory => {
                 let dir = self.paths.log_directory();
                 crate::info!("设置：打开日志目录 {}", dir.display());
-                let explorer = snug_win::system_paths::system_tool("explorer.exe");
+                let explorer = snug_win::system_paths::explorer();
                 if let Err(err) = explorer.and_then(|path| std::process::Command::new(path).arg(&dir).spawn()) {
                     crate::warn!("打开日志目录失败：{err}");
                 }
@@ -850,7 +922,7 @@ impl PhoneHomeApp {
                 if self.elevated {
                     crate::info!("设置：已经是管理员，无需重启");
                 } else {
-                    match snug_win::restart_elevated(&[]) {
+                    match snug_win::restart_elevated(&["--wait-for-parent".into(), std::process::id().to_string()]) {
                         Ok(()) => {
                             crate::info!("设置：已请求以管理员身份重启，本进程退出");
                             self.request_exit = true;

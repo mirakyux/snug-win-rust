@@ -17,6 +17,7 @@ pub mod display;
 pub mod touch;
 pub mod uia;
 pub mod vdd;
+pub mod vdd_broker;
 mod wide;
 pub mod window;
 pub mod apps;

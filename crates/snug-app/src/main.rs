@@ -8,6 +8,7 @@ mod controller;
 mod driver;
 mod library;
 mod logging;
+mod privileged;
 mod settings;
 mod theme;
 mod shots;
@@ -20,6 +21,26 @@ use eframe::egui;
 use snug_core::{AppConfig, Paths, PhoneCatalog, ScreenFit};
 
 fn main() -> eframe::Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match privileged::dispatch(&arguments) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            if !privileged::is_background_request(&arguments) {
+                snug_win::elevation::show_error_dialog(&error.to_string());
+            }
+            return Err(eframe::Error::AppCreation(Box::new(error)));
+        }
+    }
+    if let Some(index) = arguments.iter().position(|arg| arg == "--wait-for-parent") {
+        let wait = arguments.get(index + 1).and_then(|arg| arg.parse().ok())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "缺少先前实例的进程号"))
+            .and_then(snug_win::elevation::wait_for_same_executable_process);
+        if let Err(error) = wait {
+            snug_win::elevation::show_error_dialog(&error.to_string());
+            return Err(eframe::Error::AppCreation(Box::new(error)));
+        }
+    }
     let paths = Paths::default();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!("无法创建数据目录 {}：{err}", paths.data_dir().display());
@@ -51,9 +72,22 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    // Global startup tasks must not be rewritten by an isolated test instance.
+    if std::env::var_os("SNUGWIN_HOME").is_none()
+        && let Err(error) = std::thread::Builder::new()
+            .name("snug-startup-refresh".into())
+            .spawn(|| {
+                if snug_win::StartupService::for_current_exe().refresh_path_if_enabled() {
+                    crate::info!("开机任务已迁移到当前路径和普通权限，下次启动生效");
+                }
+            })
+    {
+        crate::warn!("无法启动开机任务迁移检查：{error}");
+    }
+
     // `--minimized` 是开机自启那条计划任务的参数（C# `StartupTaskDefinition.MinimizedArg`）。
     // 以前这个参数没人解析，等于自启和手动启动长得一样；现在它决定"要不要闪一次窗"。
-    let start_minimized = has_minimized_flag(std::env::args().skip(1));
+    let start_minimized = has_minimized_flag(arguments);
     crate::info!(
         "启动形态：{}",
         if start_minimized {
@@ -80,12 +114,6 @@ fn main() -> eframe::Result<()> {
         "虚拟屏驱动管道：{}",
         if pipe_ready { "就绪" } else { "未检测到（手机屏功能需要驱动）" }
     );
-    // 没有驱动就**自己装**：发布包里带着官方安装包，本进程清单是 requireAdministrator，
-    // 不需要用户去别处下载、也不需要额外点一次 UAC。后台线程做，别挡启动；
-    // 装完命名管道起来后，建屏的重试阶梯自然就把手机屏拉起来。
-    if !pipe_ready {
-        driver::spawn_ensure_installed();
-    }
 
     let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
     let logical = fit.size(fit.base_width());
@@ -118,23 +146,17 @@ fn main() -> eframe::Result<()> {
             // 心跳线程：eframe 在窗口长期没输入时会停在 Wait 上，而我们要靠 `update()`
             // 去轮询托盘事件、退出请求、搬窗。真机上撞到过"隐藏窗口后一帧都不出"，
             // 所以这里明确按节奏叫醒它，不依赖"窗口可见"这个前提。
-            {
-                let ctx = cc.egui_ctx.clone();
-                std::thread::Builder::new()
-                    .name("snug-ui-tick".to_string())
-                    .spawn(move || loop {
-                        std::thread::sleep(std::time::Duration::from_millis(250));
-                        ctx.request_repaint();
-                    })
-                    .ok();
-            }
+            let ui_heartbeat = ui::UiHeartbeat::start(cc.egui_ctx.clone())?;
             let controller = controller::Controller::start(
                 &config,
                 &paths,
                 move || repaint_ctx.request_repaint(),
                 |line: &str| crate::info!("desk: {line}"),
-            );
+            )?;
             crate::info!("控制器已启动（手机屏 {}）", if pipe_ready { "可用" } else { "不可用" });
+            if !pipe_ready && let Err(error) = driver::spawn_ensure_installed() {
+                crate::warn!("驱动安装后台任务无法启动：{error}");
+            }
             Ok(Box::new(ui::PhoneHomeApp::new(
                 config,
                 catalog,
@@ -142,12 +164,14 @@ fn main() -> eframe::Result<()> {
                 pipe_ready,
                 start_minimized,
                 controller,
+                ui_heartbeat,
             )))
         }),
     );
 
     if let Err(err) = &result {
         crate::error!("界面异常退出：{err}");
+        snug_win::elevation::show_error_dialog(&format!("Snug 无法正常启动或运行：\n{err}\n\n请查看日志了解详情。"));
     } else {
         crate::info!("事件循环已退出");
     }

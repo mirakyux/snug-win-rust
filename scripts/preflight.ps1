@@ -10,7 +10,7 @@
       1. 版本：exe 资源里的 FileVersion/ProductVersion 与根 Cargo.toml 的
          [workspace.package] version 一致，且是三段数字（更新器按它跟 tag 比）；
       2. 体积：应用 8 MiB + 内嵌驱动 4 MiB，总预算 12 MiB；
-      3. 清单：requestedExecutionLevel = requireAdministrator（建虚拟屏、改显示配置要提权）；
+      3. 清单：requestedExecutionLevel = asInvoker（GUI/更新普通权限，驱动任务单独 UAC）；
          顺带核对 PerMonitorV2 / longPathAware / activeCodePage=UTF-8；
       4. 依赖：dumpbin /dependents 里只有系统 DLL（零运行时依赖的实证，
          不应出现 VCRUNTIME140 / MSVCP140 之类的可再发行组件）；
@@ -225,10 +225,10 @@ if (-not $vcvars) {
             Fail "mt.exe 抽不出清单（输出：$manifest）"
         } else {
             $xml = Get-Content -LiteralPath $manifestPath -Raw
-            if ($xml -match 'level\s*=\s*"requireAdministrator"') {
-                Pass 'requestedExecutionLevel = requireAdministrator'
+            if ($xml -match 'level\s*=\s*"asInvoker"') {
+                Pass 'requestedExecutionLevel = asInvoker'
             } else {
-                Fail '清单里没有 requireAdministrator（建虚拟屏/改显示配置会失败）'
+                Fail '清单必须使用 asInvoker，GUI 不应默认请求管理员权限'
             }
             foreach ($needle in @('PerMonitorV2', 'longPathAware', 'activeCodePage')) {
                 if ($xml -match [regex]::Escape($needle)) { Pass "清单含 $needle" }

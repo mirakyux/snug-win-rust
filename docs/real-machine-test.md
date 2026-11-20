@@ -29,12 +29,12 @@ pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe
 
 ```powershell
 # 1. 独立数据目录，配一份 phone_screen=false 的初始配置
-$home = "$env:USERPROFILE\snug-rs-test"
-New-Item -ItemType Directory -Force "$home\logs" | Out-Null
-'{"phoneScreen":false}' | Set-Content "$home\config.json" -Encoding utf8
+$testData = "$env:USERPROFILE\snug-rs-test"
+New-Item -ItemType Directory -Force "$testData\logs" | Out-Null
+'{"phoneScreen":false}' | Set-Content "$testData\config.json" -Encoding utf8
 
-# 2. 用隔离目录启动（manifest 是 requireAdministrator，会弹 UAC）
-$env:SNUGWIN_HOME = $home
+# 2. 从普通权限终端启动（manifest 为 asInvoker）
+$env:SNUGWIN_HOME = $testData
 .\target\release\snug.exe
 ```
 
@@ -43,7 +43,7 @@ $env:SNUGWIN_HOME = $home
 - 托盘出现 `snugwin-idle.ico`，提示文字 `SnugWin - 手机屏：关`
 - 双击托盘 / 右键"打开设置与诊断..." → 设置窗五个页签可翻（控制中心 / 手势与交互 / 驱动与日志 / 关于与更新 / 多屏与设备）
 - 设置窗"驱动与日志"页显示管道就绪（这台机器驱动已装）
-- `$home\logs\snug-YYYYMMDD.log` 里有启动行、数据目录行、托盘就绪行
+- `$testData\logs\snug-YYYYMMDD.log` 里有启动行、数据目录行、托盘就绪行
 - 关闭设置窗、托盘"退出 SnugWin（先还原窗口）"能干净退出，托盘图标消失
 
 退出后检查：`%LOCALAPPDATA%\SnugWin\config.json` **时间戳没变**（证明没串到正式版目录）。
@@ -51,6 +51,8 @@ $env:SNUGWIN_HOME = $home
 ## 阶段 B：真接管手机屏（会建虚拟屏，动显示配置）
 
 前提：C# 正式版已经退出（托盘右键退出），否则两边会抢同一个驱动管道。
+GUI 保持普通权限；驱动管道拒绝普通权限访问时，首次真实建屏会请求受限 VDD 代理的 UAC。
+取消或代理失败后，本次 GUI 生命周期内不再反复请求 UAC；修正问题后重启 GUI 再试。
 
 ```powershell
 Stop-Process -Name SnugWin.App -ErrorAction SilentlyContinue
@@ -102,12 +104,12 @@ UI 线程阻塞等 desk 线程撤屏，而 desk 线程正在做窗口快照（`E
 `probe_window` 直接跳过本进程的窗口。**以后再加"枚举窗口顺便读标题"的代码，不要回头用
 `GetWindowTextW` / `GetWindowTextLengthW`。**
 
-### 启动方式：脚本里别用 `Start-Process`
+### 启动方式：脚本明确使用 CreateProcess
 
-`Start-Process` 走 ShellExecute，对这个带 `requireAdministrator` 清单的 exe，会先去问
-Shell / 提权通道，表现为弹「打开文件 - 安全警告」或长时间不起进程（脚本就卡在那一行）。
-`scripts/smoke-test.ps1` 已改成 `ProcessStartInfo(UseShellExecute=$false)`；手工测时在
-PowerShell 里直接 `.\target\release\snug.exe` 即可。
+旧版 `requireAdministrator` 清单下，通过 ShellExecute 启动曾出现安全警告或等待提权的现象。
+当前 GUI 已改为 `asInvoker`；`scripts/smoke-test.ps1` 使用
+`ProcessStartInfo(UseShellExecute=$false)` 明确继承普通权限。手工测试可在普通权限
+PowerShell 里直接执行 `.\target\release\snug.exe`。
 
 ## 开机自启（计划任务）怎么验
 
@@ -115,7 +117,7 @@ PowerShell 里直接 `.\target\release\snug.exe` 即可。
 # 1. 注册/核对：设置里的开关调的就是这一段（StartupService → schtasks /Create /XML）
 schtasks /Query /TN SnugWinAutoStart /XML |
     Select-String '<Command>|<Arguments>|<WorkingDirectory>|RunLevel'
-#    期望：Command=当前 exe、Arguments=--minimized、WorkingDirectory=exe 目录、RunLevel=HighestAvailable
+#    期望：Command=当前 exe、Arguments=--minimized、WorkingDirectory=exe 目录、RunLevel=LeastPrivilege
 
 # 2. 立刻跑一次（等价于"登录时触发"）
 schtasks /Run /TN SnugWinAutoStart
@@ -125,9 +127,10 @@ schtasks /Run /TN SnugWinAutoStart
 #    [Info] 虚拟屏驱动管道：就绪
 ```
 
-实测结论（2026-11-19）：**任务调度器直启这个 exe 是好用的**，登录触发 / 最高权限 /
+历史实测（2026-11-19，旧版权限策略）：**任务调度器直启这个 exe 是好用的**，登录触发 / 最高权限 /
 工作目录都对，起来后正常常驻、正常写日志。带 `--minimized` 时窗口创建在屏幕外
 （实测 `-32768,-32768`），不带时创建在 `76,76`（自启时会闪一下，这就是这个参数的意义）。
+此记录不代表当前最低权限任务已完成登录实测；当前版本还需按上面步骤重新验收。
 
 > 以前这里写过"从任务启动会秒退、连日志都不写"，那是**误判**，别再照着查。
 > 真正容易看错的是单实例：同一个数据目录下已有实例时，任务拉起的进程会按单实例锁
@@ -158,7 +161,8 @@ Start-Process msiexec.exe -Wait -ArgumentList '/x "{605D17E8-32FF-4B09-9247-122A
    检查，缺 BOM 直接失败——**用编辑工具改完这个脚本后要重新存成带 BOM 的 UTF-8**。
 2. 拉起 `powershell.exe` 时**不要**把父进程的 `PSModulePath` 传下去。父进程若是 PS7，
    5.1 会去 PS7 的模块目录找 `Microsoft.PowerShell.Utility` 并失败，`Get-FileHash` 之类
-   cmdlet 全部"不存在"（`driver.rs` 里 `.env_remove("PSModulePath")`）。
+   cmdlet 全部"不存在"。驱动入口现在把模块路径固定到系统 PowerShell，启动后再用
+   `$PSHOME\Modules` 收紧，同时使用受保护暂存目录作为管理员子进程的工作目录。
 3. 子进程输出是控制台代码页（简中 936），按 UTF-8 读进日志全是替换符。
    现在用 `-Command` 先把 `[Console]::OutputEncoding` 钉成 UTF-8 再跑脚本。
 4. 判断"驱动已装"必须按 HardwareID `virtualdisplaydriver`，不能按显示名——

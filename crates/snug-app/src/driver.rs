@@ -1,7 +1,7 @@
 //! 虚拟屏驱动的自动安装。
 //!
 //! 用户不该为了装个驱动先去别处找文件、也不该知道 `\\\\.\\pipe\\virtualdisplaydriver`
-//! 这种东西。程序本身清单就是 `requireAdministrator`，所以**能自己装**：
+//! 这种东西。GUI 通过同一 EXE 的一次性管理员入口完成安装：
 //!
 //! 1. 启动时探一下命名管道（`snug_win::vdd::is_driver_pipe_available`）；
 //! 2. 没有，就在后台释放 exe 内嵌的驱动包，跑 `Install-SnugDriver.ps1 -Action Install`；
@@ -121,6 +121,12 @@ fn install_bundled() -> bool {
             return false;
         }
     };
+    if !snug_win::is_elevated() {
+        return match crate::privileged::install_driver() {
+            Ok(()) => pipe_available(),
+            Err(error) => { crate::warn!("驱动：管理员安装任务失败：{error}"); false }
+        };
+    }
     let bundle = match BundledDriver::prepare() {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -137,7 +143,8 @@ fn install_bundled() -> bool {
     // 日志里就只剩「驱动：����λ��…」——真机上安装失败时用户完全看不出哪里出错。
     let escaped = script.to_string_lossy().replace('\'', "''");
     let command = format!(
-        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
+        "$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules'); \
+         [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
          & '{escaped}' -Action Install; exit $LASTEXITCODE"
     );
     let powershell = match powershell() {
@@ -147,14 +154,16 @@ fn install_bundled() -> bool {
             return false;
         }
     };
-    let output = std::process::Command::new(powershell)
+    let modules = powershell.parent().expect("system PowerShell has a parent").join("Modules");
+    let output = std::process::Command::new(&powershell)
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
         // **别把 PowerShell 7 的 `PSModulePath` 传下去。**
         // 真机踩到过：本程序的父进程若是 PS7（开发环境、或从 PS7 里启动的批处理），
         // 子进程 `powershell.exe`（5.1）会先在 PS7 的模块目录里找 `Microsoft.PowerShell.Utility`，
         // 那个模块是 PS7 专用的、5.1 加载不了，于是 `Get-FileHash` 这类 cmdlet 全部"不存在"，
-        // 安装脚本在校验哈希那一步直接失败。删掉这个变量，5.1 会用它自己的默认模块路径。
-        .env_remove("PSModulePath")
+        // 管理员子进程只从系统模块目录自动加载，避免默认用户模块目录参与查找。
+        .env("PSModulePath", modules)
+        .current_dir(&bundle.directory)
         .creation_flags_hidden()
         .output();
     match output {
@@ -191,6 +200,11 @@ fn install_bundled() -> bool {
     }
     crate::warn!("驱动：装完了但命名管道还没起来（可能重启 Windows 后才生效）");
     false
+}
+
+/// Entry used only by the fixed, short-lived elevated command path.
+pub(crate) fn install_privileged() -> bool {
+    snug_win::is_elevated() && install_bundled()
 }
 
 /// 解出子进程的控制台输出。
@@ -269,13 +283,13 @@ fn codepage_to_string(bytes: &[u8], code_page: u32) -> Option<String> {
 }
 
 /// 起一个后台线程做 [`ensure_installed`]，不挡启动。
-pub fn spawn_ensure_installed() {
+pub fn spawn_ensure_installed() -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("snug-driver-install".to_string())
         .spawn(|| {
             let _ = ensure_installed();
         })
-        .ok();
+        .map(|_| ())
 }
 
 /// 设置页显式请求安装/修复，不套用启动时“已安装就只等管道”的快速路径。

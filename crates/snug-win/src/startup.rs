@@ -2,7 +2,7 @@
 //!
 //! 用 `schtasks.exe` 而不是 COM 的 Task Scheduler：少一整套 COM 接口，
 //! 任务定义还是走 C# 原来那份 XML（`snug_core::update::build_task_xml`），
-//! 最高权限 + 登录触发 + `--minimized` 参数都不变。
+//! 登录触发 + `--minimized` 参数不变，GUI 使用最低权限，不再随登录自动提升。
 //!
 //! 四件事：查（`/Query`）、装（`/Create /XML`）、删（`/Delete /F`）、
 //! 以及"程序被挪了位置就把任务里的路径改过来"（`RefreshPathIfEnabled`）。
@@ -11,7 +11,7 @@
 //!
 //! 手动验证（需要时在真机上手动跑）：
 //! 1. 打开"任务计划程序"，应能看到名为 `SnugWinAutoStart` 的任务，触发器为"登录时"，
-//!    "使用最高权限运行"已勾选，操作为 `SnugWin.App.exe --minimized`；
+//!    "使用最高权限运行"未勾选，操作为 `snug.exe --minimized`；
 //! 2. 关掉自启后再打开，任务应被删掉；
 //! 3. 把 exe 换个目录启动，任务里的路径应自动跟着变。
 
@@ -215,13 +215,30 @@ pub struct StartupService<R: CommandRunner> {
     exe_path: PathBuf,
     /// 放临时 XML 的目录。
     temp_dir: PathBuf,
+    protected_staging: bool,
+}
+
+struct TaskXml {
+    path: PathBuf,
+    protected_directory: Option<PathBuf>,
+}
+
+impl Drop for TaskXml {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(directory) = &self.protected_directory {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
 }
 
 impl StartupService<SystemRunner> {
     /// 用当前进程的可执行文件。
     pub fn for_current_exe() -> Self {
         let exe = std::env::current_exe().unwrap_or_default();
-        Self::new(SystemRunner, TASK_NAME, exe, std::env::temp_dir())
+        let mut service = Self::new(SystemRunner, TASK_NAME, exe, std::env::temp_dir());
+        service.protected_staging = crate::elevation::is_elevated();
+        service
     }
 }
 
@@ -232,6 +249,7 @@ impl<R: CommandRunner> StartupService<R> {
             task: task.to_string(),
             exe_path: exe_path.into(),
             temp_dir: temp_dir.into(),
+            protected_staging: false,
         }
     }
 
@@ -264,13 +282,23 @@ impl<R: CommandRunner> StartupService<R> {
             .map(|dir| dir.to_string_lossy().to_string());
         let xml = build_task_xml(&exe, working_directory.as_deref());
 
-        let xml_path = self.temp_xml_path();
-        std::fs::write(&xml_path, utf16le_with_bom(&xml))
+        let temporary = if self.protected_staging {
+            let file_name = self.temp_xml_path().file_stem().unwrap_or_default().to_os_string();
+            let directory = crate::system_paths::system_directory().map_err(|error| StartupError::Io(error.to_string()))?
+                .join(file_name);
+            crate::system_paths::create_protected_directory(&directory).map_err(|error| StartupError::Io(error.to_string()))?;
+            TaskXml { path: directory.join("task.xml"), protected_directory: Some(directory) }
+        } else {
+            TaskXml { path: self.temp_xml_path(), protected_directory: None }
+        };
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary.path)
             .map_err(|error| StartupError::Io(error.to_string()))?;
+        file.write_all(&utf16le_with_bom(&xml)).map_err(|error| StartupError::Io(error.to_string()))?;
+        drop(file);
 
-        let result = self.run(create_args(&self.task, &xml_path));
-        // 用完就删，失败也无所谓（C# 也是 `try { File.Delete } catch { }`）。
-        let _ = std::fs::remove_file(&xml_path);
+        let result = self.run(create_args(&self.task, &temporary.path));
+        drop(temporary);
 
         let output = result?;
         if output.code != 0 {
@@ -293,10 +321,14 @@ impl<R: CommandRunner> StartupService<R> {
             return false;
         };
         let exe = self.exe_path.to_string_lossy().to_string();
-        if exe.is_empty() || !needs_refresh(&registered, &exe) {
+        let legacy_elevation = output.output.contains("<RunLevel>HighestAvailable</RunLevel>");
+        if exe.is_empty() || (!needs_refresh(&registered, &exe) && !legacy_elevation) {
             return false;
         }
-        self.set_enabled(true).is_ok()
+        match self.set_enabled(true) {
+            Ok(()) => true,
+            Err(error) => { crate::warn(&format!("无法迁移开机任务到普通权限；若旧任务拒绝修改，请在设置中以管理员重启一次，迁移后退出并普通启动：{error}")); false }
+        }
     }
 
     fn run(&self, args: Vec<String>) -> Result<CommandOutput, StartupError> {
@@ -565,6 +597,20 @@ mod tests {
         let runner = FakeRunner::with(vec![CommandOutput::new(0, "<Task/>", "")]);
         let service = StartupService::new(runner, TASK_NAME, r"C:\a\app.exe", temp_dir());
         assert!(!service.refresh_path_if_enabled(), "没有 <Command> 就什么都不做");
+    }
+
+    #[test]
+    fn refresh_migrates_legacy_elevated_tasks_even_if_the_path_is_unchanged() {
+        let directory = temp_dir();
+        let exe = directory.join("snug.exe");
+        std::fs::write(&exe, b"test").unwrap();
+        let xml = format!("<Task><RunLevel>HighestAvailable</RunLevel><Command>{}</Command></Task>", exe.display());
+        let runner = std::sync::Arc::new(FakeRunner::with(vec![CommandOutput::new(0, &xml, "")]));
+        let service = StartupService::new(SharedRunner(runner.clone()), TASK_NAME, &exe, &directory);
+        assert!(service.refresh_path_if_enabled());
+        assert_eq!(runner.calls()[1].1[0], "/Create");
+        std::fs::remove_file(exe).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

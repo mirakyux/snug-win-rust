@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn read_controllers_of_settings_page_is_readable_but_empty() {
+    fn read_controllers_of_settings_page_is_unknown_without_a_controlled_table() {
         let settings = FakeNode::new(0, "UU").with_children(vec![
             FakeNode::text("设置"),
             FakeNode::new(UIA_TABLE, "").with_children(vec![
@@ -678,7 +678,7 @@ mod tests {
             ]),
         ]);
         let table = read_controllers(&[Box::new(settings)]);
-        assert!(table.readable);
+        assert!(!table.readable);
         assert!(table.names.is_empty());
     }
 

@@ -9,6 +9,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::time::{Duration, Instant};
 
@@ -293,6 +294,8 @@ pub struct VddClient {
     name: String,
     connection: Option<Connection>,
     connector: Connector,
+    use_broker: bool,
+    broker_protocol: Option<VddProtocol>,
 }
 
 impl Default for VddClient {
@@ -303,17 +306,23 @@ impl Default for VddClient {
 
 impl VddClient {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), connection: None, connector: Box::new(connect) }
+        let mut client = Self::direct(name);
+        client.use_broker = client.name == DEFAULT_PIPE_NAME && !crate::elevation::is_elevated();
+        client
+    }
+
+    pub(crate) fn direct(name: impl Into<String>) -> Self {
+        Self { name: name.into(), connection: None, connector: Box::new(connect), use_broker: false, broker_protocol: None }
     }
 
     /// 单测入口：换掉真正去 `CreateFile` 的连接器。
     #[cfg(test)]
     fn with_connector(name: &str, connector: Connector) -> Self {
-        Self { name: name.to_string(), connection: None, connector }
+        Self { name: name.to_string(), connection: None, connector, use_broker: false, broker_protocol: None }
     }
 
     pub fn protocol(&self) -> Option<VddProtocol> {
-        self.connection.as_ref().map(|c| c.protocol)
+        if self.use_broker { self.broker_protocol } else { self.connection.as_ref().map(|c| c.protocol) }
     }
 
     pub fn is_legacy(&self) -> bool {
@@ -322,6 +331,9 @@ impl VddClient {
 
     /// 让驱动的显示器状态变成给定这一组。
     pub fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
+        if self.use_broker {
+            return self.broker(crate::vdd_broker::Request::Notify { monitors: monitors.to_vec() }).map(|_| ());
+        }
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&serialize_notify(monitors)),
             VddProtocol::Legacy => self.write_legacy_retry(&serialize_legacy_add(monitors)),
@@ -334,6 +346,11 @@ impl VddClient {
         remove_ids: &[u32],
         add_monitors: &[VddMonitor],
     ) -> Result<(), VddError> {
+        if self.use_broker {
+            return self.broker(crate::vdd_broker::Request::ReplaceLegacy {
+                remove_ids: remove_ids.to_vec(), monitors: add_monitors.to_vec(),
+            }).map(|_| ());
+        }
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&serialize_notify(add_monitors)),
             VddProtocol::Legacy => {
@@ -345,6 +362,9 @@ impl VddClient {
     }
 
     pub fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
+        if self.use_broker {
+            return self.broker(crate::vdd_broker::Request::Remove { ids: ids.to_vec() }).map(|_| ());
+        }
         let json = serialize_remove(ids);
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&json),
@@ -353,6 +373,10 @@ impl VddClient {
     }
 
     pub fn remove_all(&mut self) -> Result<(), VddError> {
+        if self.use_broker {
+            return Err(VddError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                "VDD broker does not allow removing displays without explicit owned IDs")));
+        }
         let json = serialize_remove_all();
         match self.ensure()? {
             VddProtocol::V2 => self.write_framed(&json),
@@ -362,6 +386,9 @@ impl VddClient {
 
     /// 请求当前状态（仅 v2 支持应答）。
     pub fn state(&mut self) -> Result<Option<Vec<VddMonitor>>, VddError> {
+        if self.use_broker {
+            return self.broker(crate::vdd_broker::Request::State).map(|reply| reply.monitors);
+        }
         match self.ensure()? {
             VddProtocol::Legacy => Ok(None),
             VddProtocol::V2 => {
@@ -389,6 +416,12 @@ impl VddClient {
                 Ok(parse_state_reply(text))
             }
         }
+    }
+
+    fn broker(&mut self, request: crate::vdd_broker::Request) -> Result<crate::vdd_broker::Reply, VddError> {
+        let reply = crate::vdd_broker::request(request)?;
+        self.broker_protocol = reply.legacy.map(|legacy| if legacy { VddProtocol::Legacy } else { VddProtocol::V2 });
+        Ok(reply)
     }
 
     /// 确认连接可用；不能用（探测到断线）就丢弃，重新 `CreateFile` 并重新探测协议。
@@ -454,7 +487,8 @@ fn connect(name: &str) -> Result<Connection, VddError> {
     let mut first_error: Option<std::io::Error> = None;
 
     loop {
-        match OpenOptions::new().read(true).write(true).open(&path) {
+        // A pipe-name squatter must not impersonate the elevated VDD helper.
+        match OpenOptions::new().read(true).write(true).security_qos_flags(0x0001_0000).open(&path) {
             Ok(file) => {
                 return Ok(Connection {
                     protocol: VddProtocol::V2,
@@ -464,7 +498,7 @@ fn connect(name: &str) -> Result<Connection, VddError> {
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
                     // 驱动只开 INBOUND 时，双向打开会被拒；退回只写。
-                    if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                    if let Ok(file) = OpenOptions::new().write(true).security_qos_flags(0x0001_0000).open(&path) {
                         return Ok(Connection {
                             protocol: VddProtocol::Legacy,
                             pipe: Box::new(PipeFile(file)),

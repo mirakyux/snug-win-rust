@@ -9,8 +9,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- 与 C# 版一致：创建虚拟显示器、改显示配置都需要管理员。 -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- GUI 与自动更新使用普通权限；仅驱动安装和受限 VDD 代理请求 UAC。 -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

@@ -8,7 +8,7 @@
 //!    上游 C# 的 `SnugWin-v…` 布局只作参考：Rust 版是并行重写版，用自己的发行名），
 //!    顺带找 `checksums.txt`；
 //! 3. 要求 `checksums.txt` 含有更新包的 SHA-256，再下载并校验 zip；
-//! 4. 在 System32 下创建受保护 staging 目录，解压并确认其中有普通文件 `snug.exe`；
+//! 4. 在当前 EXE 同级独占创建 staging 目录，解压并确认其中有普通文件 `snug.exe`；
 //! 5. 写一个 `apply-update.ps1`：等待当前进程退出、原子替换 EXE、校验并重启。
 //!
 //! **更新源可配置**：仓库坐标由编译期 `SNUG_RELEASES_REPO=owner/name` 决定
@@ -16,25 +16,25 @@
 //! 没配置时 [`AppUpdateService::is_configured`] 为 `false`，`check_for_update()`
 //! 直接返回 [`UpdateError::NotConfigured`]，**一个请求都不发**。
 //!
-//! 网络、解压、文件系统都经 trait 注入，单测只跑纯逻辑（版本比较、资产匹配、
-//! 校验和、脚本转义、错误分支），**不会真的下载或替换任何文件**。
+//! 网络和解压经 trait 注入。更新事务集成测试在独占临时目录执行真实 PowerShell 与
+//! File.Replace，只启动复制的系统 where.exe；不会下载、替换当前程序或安装驱动。
 //!
 //! 与 C# 的差别：
 //! - 解压用系统自带 `tar.exe`（Win10 1803+ 起是 bsdtar，认 zip），省掉一个 zip crate；
 //! - SHA-256 自己实现（见 [`sha256`]），不引入加密库，保证单 exe 零依赖；
 //! - 当前版本编译期取 `CARGO_PKG_VERSION`；
 //! - 发布仓库不写死：C# 里 URL 是常量，这里全部由 `owner/name` 推导。
-//! - 更新暂存目录直接创建在 System32 下，使用受限 ACL；失败时拒绝在普通临时目录降级。
+//! - 自动更新只在普通权限进程内执行；目录不可写或进程已提升时要求手动更新，不提升更新器。
 //!
 //! 手动验证（真机）：
 //! 1. 把版本号改小后启动，应提示有新版本；
-//! 2. 点更新 → System32 下的受保护暂存目录出现 zip 与 payload，校验通过；
+//! 2. 点更新 → 当前 EXE 同级的独占暂存目录出现 zip 与 payload，校验通过；
 //! 3. 程序退出后 PowerShell 脚本原子替换 EXE 并重新启动新版本；
 //! 4. 断网时应提示"无法获取最新版本信息"而不是崩溃。
 
 use std::path::{Path, PathBuf};
 
-use crate::system_paths::{create_protected_directory, powershell, system_directory};
+use crate::system_paths::{powershell, system_directory};
 use snug_core::update::{
     is_newer, normalize, parse_latest_release, try_find_sha256, ReleasePackageKind,
     UpdateReleaseInfo,
@@ -369,6 +369,8 @@ pub struct PreparedUpdate {
 pub enum UpdateError {
     /// 没配置发布仓库（编译期 `SNUG_RELEASES_REPO` 或显式传入）。此时**不发任何请求**。
     NotConfigured,
+    /// An updater must never carry an elevated token into a user-writable portable path.
+    ElevatedProcess,
     /// 网络或 HTTP 层失败。
     Network(String),
     /// API 与兜底都拿不到发布信息。
@@ -393,6 +395,7 @@ impl std::fmt::Display for UpdateError {
             Self::NotConfigured => f.write_str(
                 "未配置更新源：请在编译期设置 SNUG_RELEASES_REPO=owner/name（例如 acme/snug-rs）。",
             ),
+            Self::ElevatedProcess => f.write_str("自动更新仅支持普通权限进程，请以普通权限启动 Snug 或手动替换 EXE。"),
             Self::Network(message) => write!(f, "网络请求失败：{message}"),
             Self::NoRelease => f.write_str("无法获取最新版本信息，请检查网络连接或稍后再试。"),
             Self::MissingPackage { asset } => {
@@ -515,7 +518,17 @@ pub fn detect_package_kind(app_directory: &Path) -> ReleasePackageKind {
 
 /// Paths are passed as data in the child environment, never interpolated as PowerShell source.
 fn apply_script(target_pid: u32, relaunch_minimized: bool) -> String {
+    apply_script_with_options(target_pid, relaunch_minimized, 30_000, true)
+}
+
+fn apply_script_with_options(
+    target_pid: u32,
+    relaunch_minimized: bool,
+    exit_timeout_ms: u32,
+    show_error: bool,
+) -> String {
     let args = if relaunch_minimized { "'--minimized'" } else { "''" };
+    let show_error = if show_error { "$true" } else { "$false" };
     format!(
         r#"$ErrorActionPreference = 'Stop'
 function Assert-Hash([IO.Stream]$Stream, [string]$Expected) {{
@@ -541,8 +554,8 @@ try {{
     catch [ArgumentException] {{ $old = $null }}
     if ($old) {{
         try {{
-            if (-not $old.WaitForExit(30000)) {{
-                throw 'Snug did not exit within 30 seconds. The original executable was preserved.'
+            if (-not $old.WaitForExit({exit_timeout_ms})) {{
+                throw 'Snug did not exit before the update deadline. The original executable was preserved.'
             }}
         }} finally {{ $old.Dispose() }}
     }}
@@ -578,10 +591,12 @@ try {{
         }}
     }}
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'apply-error.txt'), $failure)
-    try {{
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        [Windows.Forms.MessageBox]::Show("Snug update failed. The previous version was restored.`r`n`r`n$($_.Exception.Message)", 'Snug Update') | Out-Null
-    }} catch {{}}
+    if ({show_error}) {{
+        try {{
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            [Windows.Forms.MessageBox]::Show("Snug update failed. See the retained update files for recovery details.`r`n`r`n$failure", 'Snug Update') | Out-Null
+        }} catch {{}}
+    }}
     exit 1
 }}
 
@@ -749,13 +764,27 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
 }
 
 impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
+    fn require_update_context(&self) -> Result<(), UpdateError> {
+        // Only explicitly injected test fixtures may bypass the native token check.
+        // AppUpdateService::new still follows the production rule in a test build.
+        #[cfg(test)]
+        if self.test_staging_parent.is_some() {
+            return Ok(());
+        }
+        let elevated = crate::elevation::try_is_elevated()
+            .map_err(|error| UpdateError::Io(format!("无法确认更新进程权限，已中止：{error}")))?;
+        require_standard_update_context(elevated)
+    }
+
     fn staging_path(&self, version: &str, unique: u128) -> std::io::Result<PathBuf> {
         let name = format!("{STAGING_PREFIX}-{}-{}", std::process::id(), staging_dir_name(version, unique));
         #[cfg(test)]
         if let Some(parent) = &self.test_staging_parent {
             return Ok(parent.join(name));
         }
-        Ok(system_directory()?.join(name))
+        let exe = std::env::current_exe()?;
+        let parent = exe.parent().ok_or_else(|| std::io::Error::other("找不到当前程序目录"))?;
+        Ok(parent.join(name))
     }
 
     #[cfg(test)]
@@ -826,6 +855,7 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
         check: &UpdateCheckResult,
         progress: &mut dyn FnMut(f64),
     ) -> Result<PreparedUpdate, UpdateError> {
+        self.require_update_context()?;
         let Some(download_url) = check.package_download_url.clone() else {
             return Err(UpdateError::MissingPackage { asset: check.package_asset_name.clone() });
         };
@@ -843,21 +873,13 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        // The directory is created atomically with its final DACL. Do not use
-        // create_dir_all here: both the script and verified payload are later consumed
-        // by an elevated process, so a user-writable staging path would re-open a TOCTOU.
+        // Stay in the ordinary GUI token. The sibling staging directory keeps File.Replace
+        // on the same volume, and create_dir refuses a pre-existing path instead of reusing it.
+        // A protected installation directory must fail here; never elevate as a fallback.
         let staging_root = self.staging_path(&check.latest_version, unique)
             .map_err(|error| UpdateError::Io(error.to_string()))?;
-        #[cfg(test)]
-        let create: fn(&Path) -> std::io::Result<()> = if self.test_staging_parent.is_some() {
-            |path| std::fs::create_dir(path)
-        } else {
-            create_protected_directory
-        };
-        #[cfg(not(test))]
-        let create = create_protected_directory;
-        create(&staging_root)
-            .map_err(|error| UpdateError::Io(format!("无法创建受保护的更新目录：{error}")))?;
+        std::fs::create_dir(&staging_root)
+            .map_err(|error| UpdateError::Io(format!("无法在程序目录创建更新目录，请手动替换 EXE：{error}")))?;
 
         let prepare = || -> Result<PreparedUpdate, UpdateError> {
             let zip_path = staging_root.join(asset);
@@ -903,6 +925,10 @@ impl<H: HttpClient, E: PackageExtractor> AppUpdateService<H, E> {
 }
 
 /// 写脚本并拉起绝对路径下的 PowerShell。父进程不等待替换结果；脚本保留失败记录。
+fn require_standard_update_context(elevated: bool) -> Result<(), UpdateError> {
+    if elevated { Err(UpdateError::ElevatedProcess) } else { Ok(()) }
+}
+
 fn volume_path(path: &Path) -> Result<String, UpdateError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{GetVolumeNameForVolumeMountPointW, GetVolumePathNameW};
@@ -928,12 +954,17 @@ pub fn launch_apply_script(
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+    // Reject before any script, cleanup or other file operation. Even error cleanup
+    // must not perform elevated filesystem operations on a portable mutable path.
+    let elevated = crate::elevation::try_is_elevated()
+        .map_err(|error| UpdateError::Io(format!("无法确认更新进程权限，已中止：{error}")))?;
+    require_standard_update_context(elevated)?;
     let result = (|| {
         let target = std::env::current_exe().map_err(|error| UpdateError::Io(error.to_string()))?;
         // File.Replace requires both files and the backup to be on one volume. Check
         // before exiting; never fall back to copying into the live EXE.
         if volume_path(&target)? != volume_path(&update.staging_root)? {
-            return Err(UpdateError::Io("自动更新要求程序与 Windows 位于同一个卷，请手动替换 EXE".into()));
+            return Err(UpdateError::Io("待替换程序与更新目录必须位于同一卷，请手动替换 EXE".into()));
         }
         let executable = powershell().map_err(|error| UpdateError::Io(error.to_string()))?;
         let script_path = update.staging_root.join("apply-update.ps1");
@@ -1166,11 +1197,11 @@ mod tests {
     }
 
     #[test]
-    fn production_staging_is_a_direct_system_directory_child() {
+    fn production_staging_is_a_sibling_of_the_running_executable() {
         let service = AppUpdateService::new(FakeHttp::new());
-        let path = service.staging_path("1.2.3", 7).expect("system staging path");
-        let system = system_directory().unwrap();
-        assert_eq!(path.parent(), Some(system.as_path()));
+        let path = service.staging_path("1.2.3", 7).expect("same-volume staging path");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(path.parent(), exe.parent());
         assert!(path.file_name().unwrap().to_string_lossy().starts_with(STAGING_PREFIX));
     }
 
@@ -1200,6 +1231,173 @@ mod tests {
         let plain = apply_script(1, false);
         assert!(plain.contains("$launchArgs = ''"));
         assert!(!plain.contains("--minimized"));
+    }
+
+    /// Executes the production script body against files owned exclusively by this test.
+    /// Tests never call launch_apply_script (whose target is the running application).
+    struct ApplyFixture {
+        root: PathBuf,
+        stage: PathBuf,
+        target: PathBuf,
+    }
+
+    impl ApplyFixture {
+        fn new(original: &[u8], payload: &[u8]) -> Self {
+            let root = temp_root();
+            let stage = root.join("stage");
+            std::fs::create_dir_all(stage.join("payload")).unwrap();
+            let target = root.join("renamed-target.exe");
+            std::fs::write(&target, original).unwrap();
+            std::fs::write(stage.join("payload").join(TARGET_EXE), payload).unwrap();
+            Self { root, stage, target }
+        }
+
+        fn run(&self, expected: &str, target_pid: u32) -> std::process::ExitStatus {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            let script = self.stage.join("apply-update.ps1");
+            std::fs::write(&script, utf8_with_bom(&apply_script_with_options(
+                target_pid, false, 50, false,
+            ))).unwrap();
+            let mut process = Command::new(powershell().unwrap())
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(script)
+                .env_remove("PSModulePath")
+                .env("SNUG_UPDATE_TARGET", &self.target)
+                .env("SNUG_UPDATE_SHA256", expected)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .expect("run the system PowerShell without elevation");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(status) = process.try_wait().unwrap() {
+                    return status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    panic!("isolated apply script did not finish before its test deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+
+        fn failure(&self) -> String {
+            std::fs::read_to_string(self.stage.join("apply-error.txt")).unwrap()
+        }
+    }
+
+    impl Drop for ApplyFixture {
+        fn drop(&mut self) {
+            // A successful transaction launches the copied where.exe, which exits immediately.
+            // Briefly retry cleanup while Windows releases its executable image mapping.
+            for _ in 0..40 {
+                if std::fs::remove_dir_all(&self.root).is_ok() || !self.root.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    fn harmless_executable() -> Vec<u8> {
+        std::fs::read(system_directory().unwrap().join("where.exe")).unwrap()
+    }
+
+    #[test]
+    fn apply_transaction_replaces_and_starts_only_the_isolated_target() {
+        let payload = harmless_executable();
+        let fixture = ApplyFixture::new(b"previous test version", &payload);
+        let status = fixture.run(&sha256_hex(&payload), i32::MAX as u32);
+        assert!(status.success(), "apply failed: {:?}", std::fs::read_to_string(fixture.stage.join("apply-error.txt")));
+        assert_eq!(sha256_file(&fixture.target).unwrap(), sha256_hex(&payload));
+        assert!(!fixture.stage.exists(), "successful apply must clean its staging directory");
+    }
+
+    #[test]
+    fn apply_transaction_rejects_a_mismatched_hash_and_preserves_the_original() {
+        let original = harmless_executable();
+        let fixture = ApplyFixture::new(&original, b"untrusted test payload");
+        assert!(!fixture.run(&sha256_hex(b"expected payload"), i32::MAX as u32).success());
+        assert_eq!(sha256_file(&fixture.target).unwrap(), sha256_hex(&original));
+        assert!(fixture.failure().contains("SHA-256 does not match"));
+        assert!(!fixture.stage.join("snug-previous.exe").exists(), "hash failure must precede replacement");
+    }
+
+    #[test]
+    fn apply_transaction_rolls_back_when_the_new_executable_cannot_start() {
+        let original = harmless_executable();
+        let payload = b"this is not a Windows executable";
+        let fixture = ApplyFixture::new(&original, payload);
+        assert!(!fixture.run(&sha256_hex(payload), i32::MAX as u32).success());
+        assert_eq!(sha256_file(&fixture.target).unwrap(), sha256_hex(&original));
+        let failure = fixture.failure();
+        assert!(!failure.contains("Rollback failed"), "{failure}");
+        assert!(!failure.contains("SHA-256 does not match"), "test must fail at process creation: {failure}");
+        assert!(!fixture.stage.join("payload").join(TARGET_EXE).exists(), "payload must have been consumed by the initial replacement");
+        assert!(!fixture.stage.join("snug-previous.exe").exists(), "backup is consumed by rollback");
+    }
+
+    #[test]
+    fn apply_transaction_preserves_a_target_locked_against_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let original = harmless_executable();
+        let fixture = ApplyFixture::new(&original, b"new test version");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ, deliberately deny delete/replacement.
+            .open(&fixture.target)
+            .unwrap();
+        assert!(!fixture.run(&sha256_hex(b"new test version"), i32::MAX as u32).success());
+        assert_eq!(sha256_file(&fixture.target).unwrap(), sha256_hex(&original));
+        assert!(fixture.stage.join("payload").join(TARGET_EXE).exists());
+        assert!(!fixture.stage.join("snug-previous.exe").exists());
+        assert!(!fixture.failure().contains("SHA-256 does not match"));
+        drop(locked);
+    }
+
+    #[test]
+    fn apply_transaction_keeps_original_when_the_running_process_does_not_exit() {
+        let original = harmless_executable();
+        let fixture = ApplyFixture::new(&original, b"new test version");
+        assert!(!fixture.run(&sha256_hex(b"new test version"), std::process::id()).success());
+        assert_eq!(sha256_file(&fixture.target).unwrap(), sha256_hex(&original));
+        let failure = fixture.failure();
+        assert!(failure.contains("did not exit before the update deadline"), "{failure}");
+        assert!(!fixture.stage.join("snug-previous.exe").exists());
+    }
+
+    #[test]
+    fn automatic_update_rejects_an_elevated_token() {
+        assert_eq!(require_standard_update_context(true), Err(UpdateError::ElevatedProcess));
+        assert_eq!(require_standard_update_context(false), Ok(()));
+        assert!(UpdateError::ElevatedProcess.to_string().contains("普通权限"));
+    }
+
+    #[test]
+    fn production_update_keeps_the_native_permission_guard_in_test_builds() {
+        let service = AppUpdateService::new(FakeHttp::new());
+        let elevated = crate::elevation::try_is_elevated().unwrap();
+        assert_eq!(service.require_update_context(), require_standard_update_context(elevated));
+        let injected = service_with(FakeHttp::new(), false, Some(test_repo()));
+        assert_eq!(injected.require_update_context(), Ok(()));
+        // In an elevated CI run, verify public launch fails without even writing a
+        // script or deleting a caller-supplied mutable directory during error cleanup.
+        if !elevated { return; }
+        let fixture = ApplyFixture::new(b"previous test version", b"unused payload");
+        let prepared = PreparedUpdate {
+            version: "test".into(),
+            staging_root: fixture.stage.clone(),
+            exe_sha256: sha256_hex(b"unused payload"),
+        };
+        assert_eq!(launch_apply_script(&prepared, false), Err(UpdateError::ElevatedProcess));
+        assert!(!fixture.stage.join("apply-update.ps1").exists());
+        assert!(fixture.stage.exists());
     }
 
     #[test]
@@ -1292,15 +1490,38 @@ mod tests {
     }
 
     fn temp_root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "snug-rs-update-test-{}",
-            std::time::SystemTime::now()
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..100 {
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "snug-rs-update-test-{}-{nonce}-{serial}", std::process::id(),
+            ));
+            // Timestamp alone need not be unique on Windows. Never silently reuse a
+            // sibling transaction's files when tests run concurrently or in two processes.
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create isolated update test directory: {error}"),
+            }
+        }
+        panic!("could not create a unique update test directory");
+    }
+
+    #[test]
+    fn update_test_directories_are_exclusive_under_concurrent_creation() {
+        let workers: Vec<_> = (0..8).map(|_| std::thread::spawn(|| {
+            (0..8).map(|_| temp_root()).collect::<Vec<_>>()
+        })).collect();
+        let paths: Vec<_> = workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len());
+        for path in paths {
+            std::fs::remove_dir(path).unwrap();
+        }
     }
 
     fn release_json(tag: &str) -> String {

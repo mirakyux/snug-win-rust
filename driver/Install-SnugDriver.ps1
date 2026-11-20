@@ -7,7 +7,7 @@
 #   3. 在 ProgramData 留一份归属记录：是我们装的才允许卸载，
 #      用户自己装过的驱动一律保留。
 #
-# 由 snug.exe 的设置页调用（本进程清单是 requireAdministrator，直接起 pwsh 即可），
+# 由 snug.exe 的固定管理员驱动入口调用（GUI 默认普通权限），
 # 也可以手动双击同目录的 install-driver.cmd。
 
 [CmdletBinding()]

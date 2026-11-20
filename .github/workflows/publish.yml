@@ -1,0 +1,69 @@
+name: Publish verified draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已完成 Windows 真机验收的草稿 tag，例如 v1.3.1'
+        required: true
+      exe_sha256:
+        description: '实际验收的 snug.exe SHA-256；必须与草稿附件完全一致'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-manual
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout, build scripts or third-party actions receive a write token.
+      - name: Validate and promote the tested draft without rebuilding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          ACCEPTED_SHA256: ${{ inputs.exe_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid tag' >&2; exit 1; }
+          [[ "$ACCEPTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || { echo 'Invalid SHA-256' >&2; exit 1; }
+          gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft | grep -Fxq true
+          zip="Snug-${RELEASE_TAG}-win-x64-selfcontained.zip"
+          mkdir verified
+          gh release download "$RELEASE_TAG" --dir verified --pattern snug.exe --pattern "$zip" --pattern checksums.txt
+          cd verified
+          actual=$(sha256sum snug.exe)
+          [[ "${actual%% *}" == "${ACCEPTED_SHA256,,}" ]] || { echo 'Tested EXE does not match draft attachment' >&2; exit 1; }
+          declare -A seen=()
+          while read -r hash file extra; do
+            [[ -n "$hash" ]] || continue
+            [[ "$hash" =~ ^[0-9a-fA-F]{64}$ && -z "${extra:-}" ]] || { echo 'Invalid checksum entry' >&2; exit 1; }
+            [[ "$file" == snug.exe || "$file" == "$zip" ]] || { echo 'Unexpected checksum file' >&2; exit 1; }
+            [[ -z "${seen[$file]:-}" ]] || { echo 'Duplicate checksum entry' >&2; exit 1; }
+            result=$(sha256sum -- "$file")
+            [[ "${result%% *}" == "${hash,,}" ]] || { echo 'Attachment checksum mismatch' >&2; exit 1; }
+            seen[$file]=1
+          done < checksums.txt
+          [[ "${#seen[@]}" == 2 ]] || { echo 'Missing EXE or ZIP checksum' >&2; exit 1; }
+          # A self-consistent ZIP checksum alone does not bind its inner EXE to the tested file.
+          python3 - "$zip" "$ACCEPTED_SHA256" <<'PY'
+          import hashlib
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              entries = archive.infolist()
+              if len(entries) != 1 or entries[0].filename != "snug.exe" or entries[0].is_dir():
+                  raise SystemExit("ZIP must contain only root snug.exe")
+              if entries[0].file_size > 12582912:
+                  raise SystemExit("ZIP payload exceeds release size budget")
+              actual = hashlib.sha256(archive.read(entries[0])).hexdigest()
+              if actual != sys.argv[2].lower():
+                  raise SystemExit("ZIP payload does not match tested EXE")
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false

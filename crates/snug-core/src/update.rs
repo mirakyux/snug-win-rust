@@ -227,7 +227,7 @@ pub fn build_task_xml(exe_path: &str, working_directory: Option<&str>) -> String
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
+      <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -408,13 +408,14 @@ mod tests {
         assert_eq!(info.normalized_version, "2.0.0");
     }
 
-    /// 转写自 C# `UpdateAndStartupTests.StartupTaskDefinition_BuildsValidHighestAvailableTaskXml`。
+    /// Unlike the upstream task, the GUI is never elevated automatically at logon.
     #[test]
     fn startup_task_definition_builds_expected_xml() {
         let xml = build_task_xml(r"C:\Tools\Snug & Win\SnugWin.App.exe", None);
 
         assert!(xml.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
-        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!xml.contains("HighestAvailable"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         // & 要转义，否则 XML 不合法。

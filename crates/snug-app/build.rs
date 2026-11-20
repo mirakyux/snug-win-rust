@@ -11,8 +11,8 @@
 //!   `CARGO_PKG_VERSION`，写进 `FILEVERSION` / `PRODUCTVERSION` / 字符串表。
 //! - 找不到 `rc.exe` 时只 `cargo:warning`，**不阻塞编译**：没有资源的 exe 依然能跑，
 //!   只是不是最终发布形态（exe 图标、清单里的 DPI 感知都会缺）。
-//! - 用 `rustc-link-arg-bins` 而不是 `rustc-link-arg`：只给 bin 目标加链接参数，
-//!   别把 `requireAdministrator` 清单塞进 `cargo test` 的测试 harness（那会弹 UAC）。
+//! - 用 `rustc-link-arg-bins` 限定到 bin 目标；Cargo 的 bin 测试 harness 也可能继承资源。
+//!   GUI 清单使用 asInvoker，仅固定驱动安装入口和受限 VDD 代理请求 UAC。
 //!
 //! 手动验证：`cargo build --release -p snug-app` 之后
 //! `mt.exe -inputresource:snug.exe;#1 -out:x.manifest` 抽清单、
@@ -77,7 +77,7 @@ fn main() {
         }
     }
 
-    // 只作用于 bin 目标：测试 harness 不带清单，`cargo test` 不会要管理员权限。
+    // bin 测试可能同样继承资源；不要假定本指令能排除测试 harness。
     println!("cargo:rustc-link-arg-bins={}", res_file.display());
 }
 

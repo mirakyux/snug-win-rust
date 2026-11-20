@@ -81,7 +81,7 @@ impl ControllerTable {
         Self { names: Vec::new(), readable: false }
     }
 
-    /// 读到了，但没有控制端（C# `Unrecognized`）。
+    /// 已读到“本机被控中”控制表，但没有远程控制端（C# `Unrecognized`）。
     pub fn unrecognized() -> Self {
         Self { names: Vec::new(), readable: true }
     }
@@ -159,7 +159,7 @@ pub const DISCONNECT_DEBOUNCE: f64 = 1.5;
 pub const QUIET_WINDOW: f64 = 5.0;
 
 /// 推流日志可能包含本地 GameViewer 活动，不能独自无限延长远程会话。
-/// 它只在最近一次远端证据后短暂维持连接；之后必须重新看到覆盖层或控制端。
+/// 它只在最近一次控制端证据后短暂维持未知状态；已确认的空控制表不接受日志续期。
 const CAPTURE_CONTINUITY_WINDOW: f64 = 15.0;
 
 /// 连接跟踪（对应 C# `ConnectionTracker`）。
@@ -222,7 +222,10 @@ impl ConnectionTracker {
         let capture_is_recent = self
             .last_remote_evidence_at
             .is_some_and(|last| now - last <= CAPTURE_CONTINUITY_WINDOW);
-        let present = remote_evidence || (signals.capture_active == Some(true) && capture_is_recent);
+        let present = remote_evidence
+            || (!signals.controllers.readable
+                && signals.capture_active == Some(true)
+                && capture_is_recent);
         let names = signals.controllers.names.clone();
         if present {
             self.last_present_at = Some(now);
@@ -560,14 +563,21 @@ pub struct ControllerTableParser;
 impl ControllerTableParser {
     pub fn parse_windows(windows: &[UuElement]) -> ControllerTable {
         let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut found_controlled_table = false;
         for window in windows {
             for table in local_tables(window) {
+                found_controlled_table = true;
                 for row in table.rows() {
                     rows.push(row.texts().into_iter().map(str::to_string).collect());
                 }
             }
         }
-        Self::parse_rows(rows)
+        if found_controlled_table {
+            Self::parse_rows(rows)
+        } else {
+            // A readable settings window says nothing about a hidden controlled page.
+            ControllerTable::unreadable()
+        }
     }
 
     pub fn parse_rows(rows: impl IntoIterator<Item = Vec<String>>) -> ControllerTable {
@@ -797,6 +807,65 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_empty_controller_table_overrides_a_lingering_capture_log() {
+        let mut tracker = ConnectionTracker::new();
+        tracker.update(&present_signals(), 0.0);
+        let disconnected_page = UUSignals {
+            overlay_visible: true,
+            controllers: ControllerTable::unrecognized(),
+            capture_active: Some(true),
+        };
+
+        assert_eq!(tracker.update(&disconnected_page, 1.0), None, "仍按原防抖等待");
+        assert_eq!(
+            tracker.update(&disconnected_page, 2.0),
+            Some(ConnectionEvent::Disconnected),
+            "已读到的空控制表优先于本地日志心跳"
+        );
+        assert_eq!(tracker.update(&disconnected_page, 3.0), None);
+        assert!(!tracker.is_connected(), "空表和心跳不能恢复远程会话");
+    }
+
+    #[test]
+    fn switching_to_the_settings_page_is_unknown_instead_of_an_empty_remote_table() {
+        let settings_tree = UuElement::other_node(vec![
+            UuElement::text_node("设置"),
+            UuElement::table_node(vec![UuElement::row_node(vec![
+                UuElement::text_node("隐藏至菜单栏"),
+            ])]),
+        ]);
+        let unknown = ControllerTableParser::parse_windows(&[settings_tree]);
+        assert!(!unknown.readable, "未找到被控表，不能宣称已经确认断开");
+
+        let mut tracker = ConnectionTracker::new();
+        tracker.update(&present_signals(), 0.0);
+        let temporarily_unobservable = UUSignals {
+            overlay_visible: false,
+            controllers: unknown,
+            capture_active: Some(true),
+        };
+        assert_eq!(tracker.update(&temporarily_unobservable, 10.0), None);
+        assert!(tracker.is_connected(), "未知信号可以使用有界心跳连续性");
+    }
+
+    #[test]
+    fn an_empty_controlled_page_is_readable_and_never_admits_a_session() {
+        let empty_controlled_page = UuElement::other_node(vec![
+            UuElement::text_node(PAGE_TITLE),
+            UuElement::table_node(Vec::new()),
+        ]);
+        let table = ControllerTableParser::parse_windows(&[empty_controlled_page]);
+        assert!(table.readable);
+        assert!(table.names.is_empty());
+        let mut session = RemoteSession::new();
+        for now in [0.0, 1.0, 10.0, 30.0] {
+            let signals = UUSignals { overlay_visible: true, controllers: table.clone(), capture_active: Some(true) };
+            assert!(session.update(&signals, now).is_empty());
+            assert!(!session.in_episode());
+        }
+    }
+
+    #[test]
     fn readable_remote_controller_table_admits_a_session_without_overlay() {
         let mut session = RemoteSession::new();
         let connected = UUSignals {
@@ -902,7 +971,7 @@ mod tests {
         ]);
         let unrecognized = ControllerTableParser::parse_windows(&[settings_tree]);
         assert!(unrecognized.names.is_empty());
-        assert!(unrecognized.readable);
+        assert!(!unrecognized.readable, "设置页不是已确认的空控制表");
 
         let controlled_tree = UuElement::other_node(vec![
             UuElement::text_node("本机被控中"),

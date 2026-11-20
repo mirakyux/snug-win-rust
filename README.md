@@ -59,13 +59,15 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
 | 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
 
-全仓 **514 条单测**（core 229 / win 219 / app 62 / 几何对拍 3 / SHA-256 对拍 1），
+全仓单测覆盖核心状态机、Win32 适配器、应用与更新事务（数量以当前测试摘要为准），
 `rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
 
 **开机自启**在设置里开（「开机静默自启动」）。它注册一条计划任务
-（`SnugWinAutoStart`，登录触发、最高权限、参数 `--minimized`）：开机后后台常驻托盘，
+（`SnugWinAutoStart`，登录触发、普通权限、参数 `--minimized`）：开机后后台常驻托盘，
 **不弹窗、不抢焦点**，手机屏就绪了才把界面摆上虚拟屏。换 exe 目录后会自动把任务里的
 路径改过去。
+
+主界面默认使用普通权限；驱动安装通过同一 EXE 的一次性 UAC 任务执行。当前驱动管道要求管理员权限，首次建屏会请求受限 VDD 代理的 UAC；取消或失败后本次运行不再重复请求，需重启 GUI 后再试。自动更新仅在普通权限下执行，使用 EXE 同级的独占暂存目录；受保护安装目录请手动替换 EXE。需要管理提升权限的应用窗口时，可在设置里显式选择“以管理员重启”，更新前应退出并普通启动。
 
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
 多屏形态（单窗口 + 顶部切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
