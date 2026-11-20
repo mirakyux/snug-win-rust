@@ -15,7 +15,7 @@
 //! `MenuItem` 没有 `set_visible`，这里改成"不可用时禁用"（`set_enabled`）。
 //!
 //! 双击托盘 = 打开设置（C# `_trayIcon.DoubleClick`）。
-//! 图标随连接状态切换 `snugwin-idle.ico` / `snugwin-connected.ico`（C# 同）。
+//! 图标随连接状态切换（沿用 C# 的两张 ICO，预先转成 32×32 RGBA）。
 //!
 //! 平台细节：`tray-icon` 在创建它的线程上建一个隐藏窗口，消息由 winit/eframe
 //! 的消息泵分发，所以**必须在主线程创建**（和 C# 里 NotifyIcon 属于 UI 线程同理）。
@@ -23,10 +23,12 @@
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// 静态空闲图标（未连接）。
-const IDLE_ICON: &[u8] = include_bytes!("../assets/snugwin-idle.ico");
-/// 已连接图标。
-const CONNECTED_ICON: &[u8] = include_bytes!("../assets/snugwin-connected.ico");
+const ICON_SIZE: u32 = 32;
+const ICON_BYTES: usize = (ICON_SIZE * ICON_SIZE * 4) as usize;
+/// 静态空闲图标（未连接），由 tools/generate_tray_icons.ps1 生成。
+const IDLE_ICON: &[u8; ICON_BYTES] = include_bytes!("../assets/snugwin-idle-32x32.rgba");
+/// 已连接图标，与旧版运行时 ICO 解码及缩放后的像素逐字节一致。
+const CONNECTED_ICON: &[u8; ICON_BYTES] = include_bytes!("../assets/snugwin-connected-32x32.rgba");
 
 /// 托盘上的一次用户操作。副作用由调用方落地（和 `settings` 的动作队列同风格）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +134,9 @@ impl Tray {
                 }
             } else if event.id == self.manual_id {
                 // muda 已经把勾选状态翻转过了，直接读当前值。
-                out.push(TrayCommand::SetManualOverride(self.manual_item.is_checked()));
+                out.push(TrayCommand::SetManualOverride(
+                    self.manual_item.is_checked(),
+                ));
             } else if event.id == self.quit_id {
                 out.push(TrayCommand::Quit);
             }
@@ -183,31 +187,12 @@ impl Tray {
     }
 }
 
-/// 把 .ico 解成托盘用的 RGBA。
+/// 直接使用预生成的托盘 RGBA，不在运行时解码 ICO 或缩放。
 ///
-/// Windows 托盘实际显示 16/20/24/32 像素那几帧，这里统一缩到 32×32：
+/// Windows 托盘实际显示 16/20/24/32 像素那几帧，这里统一使用 32×32：
 /// 直接送 256×256 会让部分 shell 缩放发糊。
-fn decode_icon(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico).ok()?;
-    let rgba = image.to_rgba8();
-    let (width, height) = (rgba.width(), rgba.height());
-    const TARGET: u32 = 32;
-    if width.min(height) > TARGET {
-        let scaled = image::imageops::resize(
-            &rgba,
-            TARGET,
-            TARGET,
-            image::imageops::FilterType::Lanczos3,
-        );
-        Some((scaled.into_raw(), TARGET, TARGET))
-    } else {
-        Some((rgba.into_raw(), width, height))
-    }
-}
-
 fn load_icon(bytes: &[u8]) -> Option<Icon> {
-    let (raw, width, height) = decode_icon(bytes)?;
-    Icon::from_rgba(raw, width, height).ok()
+    Icon::from_rgba(bytes.to_vec(), ICON_SIZE, ICON_SIZE).ok()
 }
 
 #[cfg(test)]
@@ -215,19 +200,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_bundled_icons_decode_to_rgba() {
+    fn both_bundled_icons_load_at_32_pixels() {
         for (name, bytes) in [("idle", IDLE_ICON), ("connected", CONNECTED_ICON)] {
-            let (raw, w, h) = decode_icon(bytes).unwrap_or_else(|| panic!("{name} 图标解码失败"));
-            assert!(w >= 16 && h >= 16, "{name} 尺寸过小：{w}×{h}");
-            assert_eq!(raw.len(), (w * h * 4) as usize, "{name} 像素数不匹配");
+            assert_eq!(bytes.len(), 32 * 32 * 4, "{name} 像素数不匹配");
             assert!(load_icon(bytes).is_some(), "{name} 送不进 tray-icon");
         }
     }
 
     #[test]
-    fn icons_are_scaled_down_to_32() {
-        let (_, w, h) = decode_icon(IDLE_ICON).expect("idle 图标");
-        assert!(w <= 32 && h <= 32, "尺寸 {w}×{h} 没有缩到 32 以内");
+    fn bundled_icons_keep_the_legacy_decoded_pixels() {
+        // image 0.25.10（当前 Cargo.lock）ICO 解码 + Lanczos3 的完整 RGBA 真值。
+        // tools/generate_tray_icons.ps1 -Check 还会逐字节对照原始 ICO 重算结果。
+        for (name, bytes, expected) in [
+            (
+                "idle",
+                IDLE_ICON,
+                "A9DDFF8AF9FD7ADD6E390D28EE8196768B7C1D6367B0313C941E17B4CADD5770",
+            ),
+            (
+                "connected",
+                CONNECTED_ICON,
+                "281C1C94B9EA8CA7FBA252956A519F4B8382860B468ED799E78D284EE5BEAFEF",
+            ),
+        ] {
+            assert_eq!(
+                snug_win::update::sha256_hex(bytes),
+                expected,
+                "{name} 像素改变"
+            );
+        }
     }
 
     #[test]

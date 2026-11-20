@@ -1464,7 +1464,7 @@ impl eframe::App for PhoneHomeApp {
                             for window in &app.windows {
                                 ui.horizontal(|ui| {
                                     ui.add_space(52.0);
-                                    let label = format!("❐ {}", window.label());
+                                    let label = format!("◻ {}", window.label());
                                     let width = (ui.available_width() - 48.0).max(80.0);
                                     if ui
                                         .add_sized(

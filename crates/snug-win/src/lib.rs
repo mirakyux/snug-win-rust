@@ -22,6 +22,7 @@ mod wide;
 pub mod window;
 pub mod apps;
 pub mod com;
+pub mod compression;
 pub mod screenshot;
 pub mod uu;
 pub mod elevation;

@@ -6,6 +6,7 @@
 mod bubble;
 mod controller;
 mod driver;
+mod embedded_fonts;
 mod library;
 mod logging;
 mod privileged;
@@ -141,7 +142,7 @@ fn main() -> eframe::Result<()> {
         "Snug",
         options,
         Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
+            install_fonts(&cc.egui_ctx)?;
             let repaint_ctx = cc.egui_ctx.clone();
             // 心跳线程：eframe 在窗口长期没输入时会停在 Wait 上，而我们要靠 `update()`
             // 去轮询托盘事件、退出请求、搬窗。真机上撞到过"隐藏窗口后一帧都不出"，
@@ -236,8 +237,8 @@ fn load_catalog_from(external: Option<&std::path::Path>) -> Option<PhoneCatalog>
     }
 }
 
-/// 用 Win32 系统字体渲染中文：egui 自带字体没有 CJK。
-fn install_cjk_font(ctx: &egui::Context) {
+/// 恢复原版 egui 字体后备，再优先选用系统中文字体（如果可用）。
+fn install_fonts(ctx: &egui::Context) -> std::io::Result<()> {
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyhl.ttc",
@@ -249,18 +250,15 @@ fn install_cjk_font(ctx: &egui::Context) {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts
-            .font_data
-            .insert("cjk".to_string(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().insert(0, "cjk".to_string());
-        }
+        let fonts = embedded_fonts::definitions(Some(bytes))?;
         ctx.set_fonts(fonts);
         crate::info!("已加载中文字体：{path}");
-        return;
+        return Ok(());
     }
     crate::warn!("没有找到可用的中文字体，界面中文可能显示为方块");
+    // Keep bundled Latin and symbol fallback available without OS fonts.
+    ctx.set_fonts(embedded_fonts::definitions(None)?);
+    Ok(())
 }
 
 /// 单实例：持有数据目录下的锁文件句柄。

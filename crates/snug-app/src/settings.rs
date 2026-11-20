@@ -1332,6 +1332,20 @@ impl SettingsWindow {
                 .small()
                 .weak(),
         );
+        ui.collapsing("随附字体许可与版权", |ui| {
+            for (name, license) in [
+                ("Hack-Regular", include_str!("../assets/fonts/licenses/Hack-Regular.txt")),
+                ("Ubuntu-Light", include_str!("../assets/fonts/licenses/UFL.txt")),
+                ("Google Noto Emoji — copyright and attribution", include_str!("../assets/fonts/licenses/Noto-Emoji-attribution.txt")),
+                ("Google Noto Emoji — SIL Open Font License 1.1", include_str!("../assets/fonts/licenses/OFL.txt")),
+                ("emoji-icon-font", include_str!("../assets/fonts/licenses/emoji-icon-font-mit-license.txt")),
+            ] {
+                ui.label(egui::RichText::new(name).strong());
+                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(license).small().monospace()).wrap());
+                });
+            }
+        });
         ui.add_space(6.0);
         if ui.button("访问 GitHub 仓库主页").clicked() {
             self.actions.push(SettingsAction::OpenRepository);
@@ -1344,6 +1358,15 @@ impl SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_page_bundles_full_font_licenses() {
+        assert!(include_str!("../assets/fonts/licenses/Hack-Regular.txt").contains("BITSTREAM VERA LICENSE"));
+        assert!(include_str!("../assets/fonts/licenses/UFL.txt").contains("UBUNTU FONT LICENCE Version 1.0"));
+        assert!(include_str!("../assets/fonts/licenses/OFL.txt").contains("SIL OPEN FONT LICENSE Version 1.1"));
+        assert!(include_str!("../assets/fonts/licenses/Noto-Emoji-attribution.txt").contains("Copyright 2013 Google Inc."));
+        assert!(include_str!("../assets/fonts/licenses/emoji-icon-font-mit-license.txt").contains("MIT License"));
+    }
 
     fn standard() -> AppConfig {
         AppConfig::default()
