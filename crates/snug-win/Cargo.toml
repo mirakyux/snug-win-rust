@@ -16,6 +16,7 @@ snug-core = { path = "../snug-core" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Devices_Display",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",

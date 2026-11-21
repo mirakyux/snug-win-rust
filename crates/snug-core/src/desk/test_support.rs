@@ -271,6 +271,8 @@ pub struct FakeWindows {
     asking: Mutex<Option<WindowInfo>>,
     zoom_delta_total: AtomicI32,
     min_logical_width: Mutex<f64>,
+    misplaced_moves_remaining: Mutex<usize>,
+    move_calls: Mutex<Vec<(WindowKey, Rect)>>,
     zoom_ok: AtomicBool,
     restore_calls: Mutex<Vec<(HashMap<WindowKey, Rect>, Option<WindowKey>)>>,
     full_screen_calls: Mutex<Vec<(WindowKey, bool)>>,
@@ -287,6 +289,8 @@ impl Default for FakeWindows {
             asking: Mutex::new(None),
             zoom_delta_total: AtomicI32::new(0),
             min_logical_width: Mutex::new(0.0),
+            misplaced_moves_remaining: Mutex::new(0),
+            move_calls: Mutex::new(Vec::new()),
             zoom_ok: AtomicBool::new(true),
             restore_calls: Mutex::new(Vec::new()),
             full_screen_calls: Mutex::new(Vec::new()),
@@ -338,6 +342,15 @@ impl FakeWindows {
         *self.min_logical_width.lock().expect("min width") = width;
     }
 
+    /// 让接下来的若干次窗口移动表面成功、但仍留在主屏。
+    pub fn misplace_moves(&self, count: usize) {
+        *self.misplaced_moves_remaining.lock().expect("misplaced moves") = count;
+    }
+
+    pub fn move_calls(&self) -> Vec<(WindowKey, Rect)> {
+        self.move_calls.lock().expect("move calls").clone()
+    }
+
     pub fn restore_calls(&self) -> Vec<(HashMap<WindowKey, Rect>, Option<WindowKey>)> {
         self.restore_calls.lock().expect("restore calls").clone()
     }
@@ -381,6 +394,14 @@ impl WindowControl for FakeWindows {
     fn move_window(&self, window: WindowKey, frame: Rect) -> Option<Rect> {
         let mut frames = self.frames.lock().expect("frames");
         frames.get(&window)?;
+        self.move_calls.lock().expect("move calls").push((window, frame));
+        let mut remaining = self.misplaced_moves_remaining.lock().expect("misplaced moves");
+        if *remaining > 0 {
+            *remaining -= 1;
+            let misplaced = Rect::new(0.0, 0.0, frame.width, frame.height);
+            frames.insert(window, misplaced);
+            return Some(misplaced);
+        }
         let min = *self.min_logical_width.lock().expect("min width");
         let width = frame.width.max(min * 2.0);
         let got = Rect::new(frame.x, frame.y, width, frame.height);

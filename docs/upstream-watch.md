@@ -27,15 +27,43 @@ GitHub API（`api.github.com`）直连可用，查提交列表用它最快。
 
 ## 最近一次检查
 
-**2026-11-19**：两个上游自 v1.3.0 / 2.6.1 起没有新的功能提交，不需要跟。
+**2026-11-22**：核对 Windows C# v1.3.2 和 macOS v2.7.4。吸收了建屏时的 EDID 身份绑定、窗口跨屏搬移中转重试及旧机型名兼容。
 
-- C# 版：最新仍是 `c223cd4`（`chore(release): prepare v1.3.0`，2026-11-18 15:24Z）。
-- macOS 版：最新 `43c9e24`，2.6.1 之后只有 README 与团队记忆相关的提交
-  （`b428f1ef` 加「自定义屏幕」小节、`d945aca2`/`43c9e24b` 是记忆笔记）。
-  README 里「设备 / 型号 / 方向 / 名字」这四项对应 C# 的添加屏面板——见下面功能表最后两行，
-  原先我们漏了「自定义分辨率」和「自定名字」，这轮补上。
+- C# 版：最新 `8cc51835`（v1.3.2），包含社区 PR、macOS v2.7.4 同步、EDID 归属、
+  UIA/会话与离线恢复调整。Rust 已按 VDD 的 EDID connector ID 精确认屏，身份缺失时不会猜选新显示器。
+  尚未上线的屏通过 `EnumDisplayDevicesW` 的 monitor interface 查回 PnP 父适配器和 EDID，
+  不将顶层硬件 ID 或子设备的注册表路径误当作 PnP 实例 ID。
+- 窗口首次移动后仍落在目标屏外时，先经主屏中转，再重试一次；仍失败则沿用现有原位恢复流程。
+  回归覆盖实际中转顺序、成功摆放和重复误放后的有限退出与原位恢复。
+- macOS 版：最新 `5b411227`，最新功能 release 为 v2.7.4。
+  v2.7.4 修复镜像屏的分辨率恢复；macOS 把镜像从属屏单独设模式/位置会破坏镜像布局。
+  Windows 当前通过 CCD source/GDI 模式管理；尚无证据证明有同样的 target 级副作用，因此不照搬过滤规则。
+- C# 的 `legacyNames` 兼容已为 Apple iPad 旧英文型号名登记，避免重载配置后机型名及设备类型过期。
+- C# 的离线恢复依赖目标身份、远端独占判断与有界重建。Rust 目前没有等价生命周期与独占能力，
+  仅复制重试循环可能改动错误的显示拓扑，暂不移植。
+- 常驻主屏、远端设备分类建屏、固定原生像素和“立即结束”属于产品行为改动，本次没有纳入。
+- 身份绑定保护针对建屏认领。已认领屏运行中被用户改成克隆拓扑时，现有按 GDI 名查屏的生命周期
+  仍缺少持续身份校验；不把本次改动视为完整的克隆屏保护。在线建屏、热插拔和 Windows 克隆拓扑仍需真机验收。
 
 **2026-11-18**：C# 版到 **v1.3.0**（`c223cd4`），macOS 版到 **2.6.1**（`c0ceccd`）。
+
+### 本轮修改与验证（2026-11-22）
+
+修改文件：`crates/snug-win/src/display.rs`、`crates/snug-win/Cargo.toml`、
+`crates/snug-core/src/desk/engine.rs`、`crates/snug-core/src/desk/test_support.rs`、
+`crates/snug-core/src/phone_models.rs`、`assets/phone-models.json`、
+`docs/display-parity.md`、`docs/upstream-watch.md`。
+删除了按显示名称、分辨率或“第一个新屏”猜测归属的兜底；窗口摆放失败复用既有原位恢复流程。
+没有引入新 crate，Windows 绑定只增加现有 `windows` crate 的设备安装 API feature。
+
+- Debug 和 Release 全仓测试各通过 557 项，跳过 1 项需管理员令牌的 staging ACL 测试。
+- 两种 profile 的 Clippy correctness / suspicious 硬门禁通过；仍有风格建议，不宣称 Clippy 零警告。
+- Release 构建无 rustc 警告；本地打包、Rust / PowerShell SHA-256 交叉校验及静态发布门禁通过（18 项，无跳过）。
+- `git diff --check` 通过。四个触及的 Rust 文件仍有 rustfmt 格式差异，本轮未整文件或全仓格式化。
+- 本地候选包：`dist/upstream-20261122/snug.exe`，8,883,712 B（8.47 MiB），资源版本仍为 1.0.0；未发布。
+  SHA-256：`e6b7428a6e1475a817ba75ca9f4fb15f0e172829fe70b6b821610a8fb0603a7a`。
+- 只读检查确认历史 Cherry EDID 和父适配器硬件 ID 符合校验链；当时无虚拟屏在线，不能据此证明在线认领、
+  未上线屏扩展或真实窗口搬移已验收。未执行建屏、撤屏、驱动重启或真实远控操作。
 
 ## 功能对照
 

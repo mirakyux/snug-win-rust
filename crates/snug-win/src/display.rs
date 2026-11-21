@@ -35,10 +35,15 @@ use windows::Win32::Graphics::Gdi::{
     DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-    REG_VALUE_TYPE,
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
+    KEY_READ, REG_BINARY, REG_MULTI_SZ, REG_VALUE_TYPE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_Device_IDW, CM_Get_Parent, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos, SetCursorPos,
+};
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 
 use crate::vdd::{is_driver_pipe_available, VddClient, VddError, VddMode, VddMonitor};
@@ -85,6 +90,8 @@ pub struct MonitorSnapshot {
     pub friendly_name: String,
     /// 适配器描述（用来区分是不是虚拟屏）。
     pub device_string: String,
+    /// virtual-display-rs monitor.id, recovered from a verified Cherry EDID when present.
+    pub virtual_display_id: Option<u32>,
     pub bounds: Rect,
     pub work_area: Rect,
     pub is_primary: bool,
@@ -271,29 +278,22 @@ pub fn cursor_rescue_point(cursor: Point, monitors: &[MonitorSnapshot]) -> Optio
     ))
 }
 
-/// 从在线列表里认出"刚建出来的那块屏"（C# `WaitForOnlineAsync` 的挑选顺序）。
+/// 从在线列表里认出与本次 Notify 对应的虚拟屏。
 ///
-/// 1. 新出现、且像虚拟屏（适配器名/友好名带 Virtual）或已具备基准分辨率；
-/// 2. 否则只要是新出现的就先认。
+/// 设备名、显示名称和分辨率可能被实体显示器或别的虚拟屏复用；EDID 序列号才是
+/// virtual-display-rs 写入的 Monitor.id。身份缺失或不唯一时 fail closed。
 pub fn pick_new_monitor(
     existing: &HashSet<String>,
     monitors: &[MonitorSnapshot],
-    base_width: i32,
-    base_height: i32,
-    has_mode: impl Fn(&str, i32, i32) -> bool,
+    driver_id: u32,
 ) -> Option<MonitorSnapshot> {
-    let fresh: Vec<&MonitorSnapshot> = monitors
+    let matches: Vec<&MonitorSnapshot> = monitors
         .iter()
         .filter(|m| !existing.contains(&normalized(&m.device_name)))
+        .filter(|m| m.virtual_display_id == Some(driver_id))
+        .take(2)
         .collect();
-    let virtual_like = fresh.iter().find(|m| {
-        contains_ignore_case(&m.device_string, "Virtual")
-            || contains_ignore_case(&m.friendly_name, "Virtual")
-            || has_mode(&m.device_name, base_width, base_height)
-    });
-    // C4：没有任何线索时退回"新出现的第一个"——建屏同时用户插了显示器会误认
-    // （C# 同样，见 docs/display-parity.md）。
-    virtual_like.or_else(|| fresh.first()).map(|m| (*m).clone())
+    (matches.len() == 1).then(|| matches[0].clone())
 }
 
 /// 建屏时下发给驱动的模式表（每个档位 60Hz，物理像素）。
@@ -332,7 +332,14 @@ pub trait DisplayApi: Send {
     /// 改 DPI 缩放（C# `SetDpiScalePercent`）。
     fn set_dpi_scale(&self, adapter_id: AdapterLuid, source_id: u32, percent: i32) -> bool;
     /// 把"已经到了但没启用"的虚拟屏扩展成桌面的一块（C# `TryAttachVirtualDisplay`）。
-    fn try_attach_virtual_display(&self, width: i32, height: i32, x: i32, y: i32) -> Option<String>;
+    fn try_attach_virtual_display(
+        &self,
+        display_id: u32,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+    ) -> Option<String>;
     fn cursor_position(&self) -> Option<Point>;
     fn move_cursor(&self, point: Point);
     /// 虚拟屏驱动的管道在不在。
@@ -576,7 +583,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 ));
                 continue;
             }
-            let Some(snapshot) = self.wait_for_online(&existing, base_width, base_height) else {
+            let Some(snapshot) = self.wait_for_online(&existing, candidate, base_width, base_height) else {
                 // C# `6f548dd`：超时后**不要** Remove 这个 id。那个 id 可能对应 C# 版
                 // 或别的程序建的屏（同机跑两版时很常见），误删会把别人的手机屏拆掉。
                 // 只跳过这个候选，换下一个。
@@ -608,17 +615,14 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
     fn wait_for_online(
         &self,
         existing: &HashSet<String>,
+        driver_id: u32,
         base_width: i32,
         base_height: i32,
     ) -> Option<MonitorSnapshot> {
         let start = Instant::now();
         while start.elapsed() < self.timings.online {
             let all = self.api.active_monitors();
-            if let Some(found) =
-                pick_new_monitor(existing, &all, base_width, base_height, |device, w, h| {
-                    self.api.has_display_mode(device, w, h)
-                })
-            {
+            if let Some(found) = pick_new_monitor(existing, &all, driver_id) {
                 return Some(found);
             }
 
@@ -629,16 +633,12 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             let right_edge = if right_edge.is_finite() { right_edge as i32 } else { 2560 };
             if self
                 .api
-                .try_attach_virtual_display(base_width, base_height, right_edge, 0)
+                .try_attach_virtual_display(driver_id, base_width, base_height, right_edge, 0)
                 .is_some()
             {
                 sleep_for(self.timings.attach_settle);
-                if let Some(attached) = self
-                    .api
-                    .active_monitors()
-                    .into_iter()
-                    .find(|m| !existing.contains(&normalized(&m.device_name)))
-                {
+                let attached_monitors = self.api.active_monitors();
+                if let Some(attached) = pick_new_monitor(existing, &attached_monitors, driver_id) {
                     return Some(attached);
                 }
             }
@@ -907,6 +907,7 @@ struct CcdSource {
     adapter_id: AdapterLuid,
     source_id: u32,
     friendly_name: String,
+    virtual_display_id: Option<u32>,
 }
 
 ///  undocumented 的 DPI 缩放请求包（`GetSourceDpiScale`，type = -3）。
@@ -976,6 +977,114 @@ fn query_active_paths() -> Option<Vec<DISPLAYCONFIG_PATH_INFO>> {
     None
 }
 
+const CHERRY_MONITOR_INTERFACE_PREFIX: &str = r"\\?\DISPLAY#CHY0000#";
+const CHERRY_MONITOR_INTERFACE_SUFFIX: &str = "#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+const VIRTUAL_DISPLAY_ADAPTER_HARDWARE_ID: &str = r"ROOT\VIRTUALDISPLAYDRIVER";
+
+/// 将 OS 给出的 Cherry monitor interface path 转成 Enum\DISPLAY 下的实例路径。
+fn cherry_monitor_registry_instance(path: &str) -> Option<String> {
+    let prefix = path.get(..CHERRY_MONITOR_INTERFACE_PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(CHERRY_MONITOR_INTERFACE_PREFIX) {
+        return None;
+    }
+    let path = path.get(CHERRY_MONITOR_INTERFACE_PREFIX.len()..)?;
+    let suffix_start = path.len().checked_sub(CHERRY_MONITOR_INTERFACE_SUFFIX.len())?;
+    if !path.get(suffix_start..)?.eq_ignore_ascii_case(CHERRY_MONITOR_INTERFACE_SUFFIX) {
+        return None;
+    }
+    let instance = &path[..suffix_start];
+    if instance.is_empty() || instance.contains(['#', '\\', '/']) {
+        return None;
+    }
+    Some(format!(r"DISPLAY\CHY0000\{instance}"))
+}
+
+/// EDID 中的 serial 是 virtual-display-rs 写入的 `Monitor.id`。
+fn virtual_display_id_from_edid(edid: &[u8]) -> Option<u32> {
+    const EDID_HEADER: [u8; 8] = [0, 255, 255, 255, 255, 255, 255, 0];
+    if edid.len() < 128
+        || !edid.starts_with(&EDID_HEADER)
+        || edid[8..12] != [0x0d, 0x19, 0, 0]
+        || edid[..128].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+    {
+        return None;
+    }
+    Some(u32::from_le_bytes(edid[12..16].try_into().ok()?))
+}
+
+fn registry_value(path: &str, value_name: windows::core::PCWSTR) -> Option<(REG_VALUE_TYPE, Vec<u8>)> {
+    unsafe {
+        let mut key = HKEY(std::ptr::null_mut());
+        let wide_path = to_wide(path);
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(wide_path.as_ptr()), None, KEY_READ, &mut key)
+            .0
+            != 0
+        {
+            return None;
+        }
+        let mut data = vec![0u8; 4096];
+        let mut size = data.len() as u32;
+        let mut kind = REG_VALUE_TYPE(0);
+        let result = RegQueryValueExW(
+            key,
+            value_name,
+            None,
+            Some(&mut kind),
+            Some(data.as_mut_ptr()),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(key);
+        if result.0 != 0 || size as usize > data.len() {
+            return None;
+        }
+        data.truncate(size as usize);
+        Some((kind, data))
+    }
+}
+
+fn virtual_display_id_from_device_path(path: &str) -> Option<u32> {
+    let instance = cherry_monitor_registry_instance(path)?;
+    virtual_display_id_from_instance_id(&instance)
+}
+
+fn virtual_display_id_from_instance_id(instance: &str) -> Option<u32> {
+    let wide_instance = to_wide(instance);
+    let mut node = 0u32;
+    if unsafe {
+        CM_Locate_DevNodeW(&mut node, PCWSTR(wide_instance.as_ptr()), CM_LOCATE_DEVNODE_NORMAL)
+    }
+    .0
+        != 0
+    {
+        return None;
+    }
+
+    let mut parent = 0u32;
+    if unsafe { CM_Get_Parent(&mut parent, node, 0) }.0 != 0 {
+        return None;
+    }
+    let mut parent_id = [0u16; 512];
+    if unsafe { CM_Get_Device_IDW(parent, &mut parent_id, 0) }.0 != 0 {
+        return None;
+    }
+    let parent_id = from_wide(&parent_id);
+    let hardware_key = format!(r"SYSTEM\CurrentControlSet\Enum\{parent_id}");
+    let (kind, hardware_ids) = registry_value(&hardware_key, w!("HardwareID"))?;
+    if kind != REG_MULTI_SZ
+        || !multi_sz(&hardware_ids)
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(VIRTUAL_DISPLAY_ADAPTER_HARDWARE_ID))
+    {
+        return None;
+    }
+
+    let edid_key = format!(r"SYSTEM\CurrentControlSet\Enum\{instance}\Device Parameters");
+    let (kind, edid) = registry_value(&edid_key, w!("EDID"))?;
+    (kind == REG_BINARY)
+        .then(|| virtual_display_id_from_edid(&edid))
+        .flatten()
+}
+
 /// 真机显示子系统（C# `DisplayConfigService`）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WinDisplay;
@@ -994,6 +1103,16 @@ impl WinDisplay {
         let Some(paths) = query_active_paths() else {
             return map;
         };
+        let mut source_path_counts = HashMap::new();
+        for path in &paths {
+            *source_path_counts
+                .entry((
+                    path.sourceInfo.adapterId.LowPart,
+                    path.sourceInfo.adapterId.HighPart,
+                    path.sourceInfo.id,
+                ))
+                .or_insert(0usize) += 1;
+        }
 
         for path in &paths {
             let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
@@ -1014,11 +1133,23 @@ impl WinDisplay {
             target.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
             target.header.adapterId = path.targetInfo.adapterId;
             target.header.id = path.targetInfo.id;
-            let friendly = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0 {
-                from_wide(&target.monitorFriendlyDeviceName)
+            let (friendly, virtual_display_id) = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0 {
+                (
+                    from_wide(&target.monitorFriendlyDeviceName),
+                    virtual_display_id_from_device_path(&from_wide(&target.monitorDevicePath)),
+                )
             } else {
-                gdi_name.clone()
+                (gdi_name.clone(), None)
             };
+            let source_is_unique = source_path_counts
+                .get(&(
+                    path.sourceInfo.adapterId.LowPart,
+                    path.sourceInfo.adapterId.HighPart,
+                    path.sourceInfo.id,
+                ))
+                .copied()
+                == Some(1);
+            let virtual_display_id = if source_is_unique { virtual_display_id } else { None };
 
             let adapter_id =
                 AdapterLuid::new(path.sourceInfo.adapterId.LowPart, path.sourceInfo.adapterId.HighPart);
@@ -1026,6 +1157,7 @@ impl WinDisplay {
                 adapter_id,
                 source_id: path.sourceInfo.id,
                 friendly_name: friendly,
+                virtual_display_id,
             });
         }
         map
@@ -1143,12 +1275,14 @@ impl DisplayApi for WinDisplay {
                 .get(&normalized(&device_name))
                 .cloned()
                 .unwrap_or_default();
+            let virtual_display_id = source.and_then(|source| source.virtual_display_id);
 
             monitors.push(MonitorSnapshot {
                 stable_id: stable_id(&device_name, adapter_id, source_id),
                 device_name,
                 friendly_name,
                 device_string,
+                virtual_display_id,
                 bounds,
                 work_area,
                 is_primary,
@@ -1277,7 +1411,14 @@ impl DisplayApi for WinDisplay {
         true
     }
 
-    fn try_attach_virtual_display(&self, width: i32, height: i32, x: i32, y: i32) -> Option<String> {
+    fn try_attach_virtual_display(
+        &self,
+        display_id: u32,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+    ) -> Option<String> {
         let mut index = 0u32;
         loop {
             let mut device = DISPLAY_DEVICEW::default();
@@ -1289,22 +1430,43 @@ impl DisplayApi for WinDisplay {
 
             let device_name = from_wide(&device.DeviceName);
             let device_string = from_wide(&device.DeviceString);
-            if !contains_ignore_case(&device_string, "Virtual Display") {
+            // 顶层 DeviceID 是硬件 ID，不是 ROOT\DISPLAY\000x 这样的 PnP 实例 ID。
+            let adapter_hardware_id = from_wide(&device.DeviceID);
+            if !adapter_hardware_id.eq_ignore_ascii_case(VIRTUAL_DISPLAY_ADAPTER_HARDWARE_ID)
+                || !contains_ignore_case(&device_string, "Virtual Display")
+            {
                 continue;
             }
             if device.StateFlags.0 & DISPLAY_DEVICE_ACTIVE.0 != 0 {
                 continue;
             }
 
-            // 确认这块适配器下确实挂着一个显示器。
+            // 只有本驱动适配器、且 EDID serial 与请求的 connector ID 一致时才扩展。
             let wide_name = to_wide(&device_name);
-            let mut attached = DISPLAY_DEVICEW::default();
-            attached.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            if !unsafe {
-                EnumDisplayDevicesW(PCWSTR(wide_name.as_ptr()), 0, &mut attached, 0)
+            let mut has_requested_display = false;
+            let mut child_index = 0u32;
+            loop {
+                let mut attached = DISPLAY_DEVICEW::default();
+                attached.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                if !unsafe {
+                    EnumDisplayDevicesW(
+                        PCWSTR(wide_name.as_ptr()),
+                        child_index,
+                        &mut attached,
+                        EDD_GET_DEVICE_INTERFACE_NAME,
+                    )
+                }
+                .as_bool()
+                {
+                    break;
+                }
+                child_index += 1;
+                if virtual_display_id_from_device_path(&from_wide(&attached.DeviceID)) == Some(display_id) {
+                    has_requested_display = true;
+                    break;
+                }
             }
-            .as_bool()
-            {
+            if !has_requested_display {
                 continue;
             }
 
@@ -1908,29 +2070,54 @@ mod tests {
     }
 
     #[test]
-    fn pick_new_monitor_prefers_virtual_then_any_new() {
+    fn pick_new_monitor_requires_unique_matching_driver_identity() {
         let existing: HashSet<String> = [normalized(r"\\.\DISPLAY1")].into_iter().collect();
-        let stranger = snapshot(r"\\.\DISPLAY2", "Some TV", Rect::ZERO, Rect::ZERO, false, mode(1920, 1080));
-        let phone = snapshot(r"\\.\DISPLAY3", "Virtual Display", Rect::ZERO, Rect::ZERO, false, mode(1080, 1900));
+        let stranger = snapshot(r"\\.\DISPLAY2", "Some TV", Rect::ZERO, Rect::ZERO, false, mode(1080, 1900));
+        let mut phone = snapshot(r"\\.\DISPLAY3", "Virtual Display", Rect::ZERO, Rect::ZERO, false, mode(1920, 1080));
+        phone.virtual_display_id = Some(2);
 
-        let picked = pick_new_monitor(&existing, &[stranger.clone(), phone.clone()], 1080, 1900, |_, _, _| false)
-            .expect("应该认出虚拟屏");
+        let picked = pick_new_monitor(&existing, &[stranger.clone(), phone.clone()], 2)
+            .expect("应按 EDID connector ID 识别虚拟屏，而不是同分辨率实体屏");
         assert_eq!(picked.device_name, phone.device_name);
+        assert!(pick_new_monitor(&existing, &[stranger.clone()], 2).is_none());
+        assert!(pick_new_monitor(&existing, &[phone.clone()], 1).is_none());
+        let mut duplicate = phone.clone();
+        duplicate.device_name = r"\\.\DISPLAY4".into();
+        assert!(pick_new_monitor(&existing, &[phone, duplicate], 2).is_none());
+        assert!(pick_new_monitor(&existing, &[], 2).is_none());
+    }
 
-        // 都不像虚拟屏时，认出「具备基准分辨率」的那块。
-        let picked = pick_new_monitor(&existing, &[stranger.clone(), phone.clone()], 1080, 1900, |device, w, h| {
-            device == phone.device_name && w == 1080 && h == 1900
-        })
-        .expect("按分辨率认出");
-        assert_eq!(picked.device_name, phone.device_name);
+    #[test]
+    fn cherry_monitor_interface_path_resolves_only_expected_instance_shape() {
+        assert_eq!(
+            cherry_monitor_registry_instance(
+                r"\\?\DISPLAY#CHY0000#5&123&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+            ),
+            Some(r"DISPLAY\CHY0000\5&123&0&UID4352".to_string())
+        );
+        assert!(cherry_monitor_registry_instance(
+            r"\\?\DISPLAY#DEL0001#5&123#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+        )
+        .is_none());
+        assert!(cherry_monitor_registry_instance(
+            r"\\?\DISPLAY#CHY0000#bad/path#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+        )
+        .is_none());
+    }
 
-        // 什么线索都没有也要退回"新出现的第一个"。
-        let picked = pick_new_monitor(&existing, &[stranger.clone()], 1080, 1900, |_, _, _| false)
-            .expect("兜底");
-        assert_eq!(picked.device_name, stranger.device_name);
+    #[test]
+    fn virtual_display_id_requires_cherry_edid_header_and_checksum() {
+        let mut edid = [0u8; 128];
+        edid[..12].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 0, 0x0d, 0x19, 0, 0]);
+        edid[12..16].copy_from_slice(&2u32.to_le_bytes());
+        edid[127] = edid[..127].iter().fold(0u8, |sum, byte| sum.wrapping_sub(*byte));
+        assert_eq!(virtual_display_id_from_edid(&edid), Some(2));
 
-        // 没有新屏。
-        assert!(pick_new_monitor(&existing, &[], 1080, 1900, |_, _, _| false).is_none());
+        edid[20] ^= 1;
+        assert_eq!(virtual_display_id_from_edid(&edid), None);
+        edid[20] ^= 1;
+        edid[8] ^= 1;
+        assert_eq!(virtual_display_id_from_edid(&edid), None);
     }
 
     #[test]
@@ -1988,7 +2175,7 @@ mod tests {
                 return;
             };
             let (width, height) = self.online_mode.unwrap_or((1080, 1900));
-            let monitor = snapshot(
+            let mut monitor = snapshot(
                 &device,
                 "Virtual Display",
                 Rect::new(1920.0, 0.0, width as f64, height as f64),
@@ -1996,6 +2183,7 @@ mod tests {
                 false,
                 DisplayModeInfo { width, height, refresh_rate: 60.0, dpi_scale_percent: 100 },
             );
+            monitor.virtual_display_id = Some(id);
             self.monitors.retain(|m| m.device_name != device);
             self.monitors.push(monitor);
         }
@@ -2047,11 +2235,18 @@ mod tests {
             true
         }
 
-        fn try_attach_virtual_display(&self, width: i32, height: i32, x: i32, y: i32) -> Option<String> {
+        fn try_attach_virtual_display(
+            &self,
+            display_id: u32,
+            width: i32,
+            height: i32,
+            x: i32,
+            y: i32,
+        ) -> Option<String> {
             let mut world = self.0.lock().unwrap();
             world.attaches.push((width, height, x, y));
             let device = world.pending_attach.take()?;
-            let monitor = snapshot(
+            let mut monitor = snapshot(
                 &device,
                 "Virtual Display",
                 Rect::new(x as f64, y as f64, width as f64, height as f64),
@@ -2059,6 +2254,7 @@ mod tests {
                 false,
                 DisplayModeInfo { width, height, refresh_rate: 60.0, dpi_scale_percent: 100 },
             );
+            monitor.virtual_display_id = Some(display_id);
             world.monitors.push(monitor);
             Some(device)
         }
@@ -2730,6 +2926,7 @@ mod tests {
             device_name: device_name.to_string(),
             friendly_name: friendly_name.to_string(),
             device_string: friendly_name.to_string(),
+            virtual_display_id: None,
             bounds,
             work_area,
             is_primary,

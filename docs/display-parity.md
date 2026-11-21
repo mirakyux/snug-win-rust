@@ -27,7 +27,11 @@
    留下挂起模式；若随后的 `SetDisplayConfig(EXTEND)` 也失败，挂起变更留到下次。
 6. **SetModeAsync**：C# 用 `StableId` 匹配 `displayId`；手机屏 id 是候选编号 0..3，
    理论上可能与真实屏的 StableId 撞号而改错屏。
-7. **WaitForOnline**：没有任何线索时退回「新出现的第一个显示器」；建屏同时用户插屏会误认。
+7. **WaitForOnline（已收紧）**：验证 Cherry monitor interface、PnP 父适配器 HardwareID 与有效 EDID serial；
+   serial 必须等于本次 connector ID，且 CCD source 唯一。不确定时跳过候选，不用分辨率或“第一个新屏”猜，
+   避免把用户刚接入的实体显示器当成 Snug 屏。
+   未上线屏的扩展路径同样使用 monitor interface 校验。此保护只覆盖建屏认领；
+   运行中 `find_monitor_of` / `set_width` 仍依赖缓存的 GDI 名，用户随后切换克隆拓扑时的持续保护尚未完成。
 
 ## 与 C# 完全等价、但实现不同的地方
 

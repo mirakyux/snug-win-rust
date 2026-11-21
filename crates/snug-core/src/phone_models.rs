@@ -159,6 +159,9 @@ impl PhoneScreenSpec {
 pub struct PhoneModel {
     pub brand: String,
     pub name: String,
+    /// 机型更名后仍用于解析已保存配置的旧名称。
+    #[serde(default, rename = "legacyNames", skip_serializing_if = "Vec::is_empty")]
+    pub legacy_names: Vec<String>,
     pub screen: PhoneScreenSpec,
     /// 来自机型库的哪一段（`phone` / `tablet` / `computer`）。
     #[serde(default)]
@@ -282,6 +285,8 @@ struct RawBrand {
 struct RawModel {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default, rename = "legacyNames")]
+    legacy_names: Vec<String>,
     #[serde(default)]
     screen: Option<Vec<i32>>,
     #[serde(default)]
@@ -301,20 +306,50 @@ impl PhoneCatalog {
             .map_err(|e| PhoneCatalogError(format!("解不开：{e}")))?;
 
         let mut seen_models = std::collections::HashSet::new();
+        let mut current_model_ids = std::collections::HashSet::new();
+        let mut seen_legacy_names = std::collections::HashSet::new();
         let mut brands = Vec::new();
 
         // 上游 v2.6 的 device-models.json 是分段结构，优先按段解析。
         if file.has_sections() {
-            parse_section(file.phone, DeviceKind::Phone, &mut seen_models, &mut brands)?;
-            parse_section(file.tablet, DeviceKind::Tablet, &mut seen_models, &mut brands)?;
-            parse_section(file.computer, DeviceKind::Computer, &mut seen_models, &mut brands)?;
+            parse_section(
+                file.phone,
+                DeviceKind::Phone,
+                &mut seen_models,
+                &mut current_model_ids,
+                &mut seen_legacy_names,
+                &mut brands,
+            )?;
+            parse_section(
+                file.tablet,
+                DeviceKind::Tablet,
+                &mut seen_models,
+                &mut current_model_ids,
+                &mut seen_legacy_names,
+                &mut brands,
+            )?;
+            parse_section(
+                file.computer,
+                DeviceKind::Computer,
+                &mut seen_models,
+                &mut current_model_ids,
+                &mut seen_legacy_names,
+                &mut brands,
+            )?;
             return Ok(Self { brands });
         }
 
         // 老的 phone-models.json 只有 brands，全部按手机处理。
         let raw_brands =
             file.brands.ok_or_else(|| PhoneCatalogError("缺少 phone / brands 字段".to_string()))?;
-        parse_section(Some(raw_brands), DeviceKind::Phone, &mut seen_models, &mut brands)?;
+        parse_section(
+            Some(raw_brands),
+            DeviceKind::Phone,
+            &mut seen_models,
+            &mut current_model_ids,
+            &mut seen_legacy_names,
+            &mut brands,
+        )?;
         Ok(Self { brands })
     }
 
@@ -349,7 +384,14 @@ impl PhoneCatalog {
     /// 启动时按机型名核对机型库，命中就用库里的数值（机型库改名/删除时沿用存下的）。
     pub fn resolve(&self, choice: PhoneChoice) -> PhoneChoice {
         if let Some(model_id) = choice.model.as_deref()
-            && let Some(model) = self.find_model(model_id)
+            && let Some(model) = self.find_model(model_id).or_else(|| {
+                let legacy_id = normalize(model_id);
+                self.models().find(|model| {
+                    model.legacy_names.iter().any(|name| {
+                        normalize(&format!("{} {name}", model.brand)) == legacy_id
+                    })
+                })
+            })
         {
             return PhoneChoice::from_model(model);
         }
@@ -402,6 +444,8 @@ fn parse_section(
     section: Option<Vec<RawBrand>>,
     kind: DeviceKind,
     seen_models: &mut std::collections::HashSet<String>,
+    current_model_ids: &mut std::collections::HashSet<String>,
+    seen_legacy_names: &mut std::collections::HashSet<String>,
     output: &mut Vec<Brand>,
 ) -> Result<(), PhoneCatalogError> {
     let Some(raw_brands) = section else { return Ok(()) };
@@ -433,9 +477,30 @@ fn parse_section(
             }
             let screen = PhoneScreenSpec::new(screen_pair[0], screen_pair[1], entry.points)
                 .with_notch(entry.notch);
+            let model_name = entry.name.unwrap_or_default();
+            let mut legacy_names = Vec::with_capacity(entry.legacy_names.len());
+            for raw_name in entry.legacy_names {
+                let name = raw_name.trim().to_string();
+                if name.is_empty() {
+                    return Err(PhoneCatalogError(format!(
+                        "{brand_name} {model_name}：旧机型名不能为空"
+                    )));
+                }
+                let legacy_id = normalize(&format!("{brand_name} {name}"));
+                if normalize(&format!("{brand_name} {model_name}")) == legacy_id
+                    || current_model_ids.contains(&legacy_id)
+                    || !seen_legacy_names.insert(legacy_id)
+                {
+                    return Err(PhoneCatalogError(format!(
+                        "{brand_name} {name}：旧机型名重复或与现有机型冲突"
+                    )));
+                }
+                legacy_names.push(name);
+            }
             let model = PhoneModel {
                 brand: brand_name.clone(),
-                name: entry.name.unwrap_or_default(),
+                name: model_name,
+                legacy_names,
                 screen,
                 kind,
             };
@@ -448,6 +513,14 @@ fn parse_section(
             if !seen_models.insert(normalize(&format!("{}/{}", kind.label(), model.id()))) {
                 return Err(PhoneCatalogError(format!("{}：重复了", model.id())));
             }
+            let model_id = normalize(&model.id());
+            if seen_legacy_names.contains(&model_id) {
+                return Err(PhoneCatalogError(format!(
+                    "{}：机型名与已登记的旧机型名冲突",
+                    model.id()
+                )));
+            }
+            current_model_ids.insert(model_id);
             models.push(model);
         }
 
@@ -562,6 +635,58 @@ mod tests {
         assert_eq!(resolved.screen, PhoneScreenSpec::new(1320, 2868, Some(440)));
         assert_eq!(resolved.model.as_deref(), Some("Apple iPhone 17 Pro Max"));
         assert_eq!(resolved.kind, DeviceKind::Phone);
+    }
+
+    #[test]
+    fn legacy_model_name_resolves_to_the_current_catalog_entry() {
+        let catalog = PhoneCatalog::from_json(
+            r#"{"tablet":[{"name":"Apple","models":[{"name":"iPad mini（第 6 代）","legacyNames":["iPad mini (6th generation)"],"screen":[1488,2266],"points":744}]}]}"#,
+        )
+        .expect("catalog with a rename mapping");
+        let choice = PhoneChoice {
+            model: Some(" Apple   iPad mini (6th generation) ".to_string()),
+            screen: PhoneScreenSpec::new(1200, 2000, None),
+            kind: DeviceKind::Phone,
+        };
+
+        let resolved = catalog.resolve(choice);
+        assert_eq!(resolved.model.as_deref(), Some("Apple iPad mini（第 6 代）"));
+        assert_eq!(resolved.screen, PhoneScreenSpec::new(1488, 2266, Some(744)));
+        assert_eq!(resolved.kind, DeviceKind::Tablet);
+    }
+
+    #[test]
+    fn bundled_catalog_migrates_upstream_ipad_model_names() {
+        let catalog = PhoneCatalog::from_json(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/phone-models.json"
+        )))
+        .expect("bundled catalog");
+        let choice = PhoneChoice {
+            model: Some("Apple iPad mini (6th generation)".to_string()),
+            screen: PhoneScreenSpec::new(1488, 2266, Some(744)),
+            kind: DeviceKind::Phone,
+        };
+
+        let resolved = catalog.resolve(choice);
+        assert_eq!(resolved.model.as_deref(), Some("Apple iPad mini（第 6 代）"));
+        assert_eq!(resolved.kind, DeviceKind::Tablet);
+        assert_eq!(resolved.screen, PhoneScreenSpec::new(1488, 2266, Some(744)));
+    }
+
+    #[test]
+    fn legacy_model_names_must_be_non_empty_and_unique() {
+        let empty = r#"{"phone":[{"name":"Apple","models":[{"name":"iPhone","legacyNames":["   "],"screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(empty).unwrap_err().0.contains("旧机型名不能为空"));
+
+        let duplicate = r#"{"phone":[{"name":"Apple","models":[{"name":"New A","legacyNames":["Old Name"],"screen":[10,20]},{"name":"New B","legacyNames":[" old   name "],"screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(duplicate).unwrap_err().0.contains("旧机型名重复"));
+
+        let collides_with_current = r#"{"phone":[{"name":"Apple","models":[{"name":"New Name","legacyNames":["Current"],"screen":[10,20]},{"name":"Current","screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(collides_with_current).unwrap_err().0.contains("机型名与已登记的旧机型名冲突"));
+
+        let collides_with_previous_current = r#"{"phone":[{"name":"Apple","models":[{"name":"Current","screen":[10,20]},{"name":"New Name","legacyNames":[" current "],"screen":[10,20]}]}]}"#;
+        assert!(PhoneCatalog::from_json(collides_with_previous_current).unwrap_err().0.contains("旧机型名重复"));
     }
 
     #[test]

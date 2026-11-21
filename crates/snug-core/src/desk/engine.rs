@@ -1413,7 +1413,40 @@ impl DeskCore {
 
         started = std::time::Instant::now();
         let area = self.shared.displays.window_area_of(id)?;
-        let got = self.shared.windows.move_window(placement.window.key, area)?;
+        let screen_bounds = self.shared.displays.bounds_of(id)?;
+        let mut got = self.shared.windows.move_window(placement.window.key, area)?;
+        if !Self::window_origin_on_screen(got, screen_bounds) {
+            self.warn(format!(
+                "{} 首次未能落到目标屏（实际 {}），经主屏中转再放",
+                placement.window.label(),
+                got.short()
+            ));
+            let main = self.shared.displays.main_area()?;
+            let relay_x = if got.width <= main.width {
+                main.x + (main.width - got.width) / 2.0
+            } else {
+                main.x
+            };
+            let relay_y = if got.height <= main.height {
+                main.y + (main.height - got.height) / 2.0
+            } else {
+                main.y
+            };
+            self.shared.windows.move_window(
+                placement.window.key,
+                Rect::new(relay_x, relay_y, got.width, got.height),
+            )?;
+            got = self.shared.windows.move_window(placement.window.key, area)?;
+            if !Self::window_origin_on_screen(got, screen_bounds) {
+                self.warn(format!(
+                    "{} 重试后仍未落到目标屏（实际 {}，目标 {}），放弃摆放",
+                    placement.window.label(),
+                    got.short(),
+                    screen_bounds.short()
+                ));
+                return None;
+            }
+        }
         let ms_move = started.elapsed().as_secs_f64() * 1000.0;
 
         placement.settled = Some(got);
@@ -1491,6 +1524,13 @@ impl DeskCore {
         ));
         placement.width = next_width;
         self.fill_steps(placement, id, steps + 1)
+    }
+
+    fn window_origin_on_screen(frame: Rect, bounds: Rect) -> bool {
+        frame.x >= bounds.min_x() - 2.0
+            && frame.x < bounds.max_x() + 2.0
+            && frame.y >= bounds.min_y() - 2.0
+            && frame.y < bounds.max_y() + 2.0
     }
 
     /// 后排一次"去问 UIA 要关闭按钮位置"（真机 0.6–1.5 秒，不能挡在铺好状态前面）。
@@ -3004,6 +3044,56 @@ mod tests {
         assert_eq!(harness.windows.zoom_delta_total(), 0, "字号应缩回");
         assert_eq!(harness.windows.frame_of(key), Some(original), "窗口应回原位");
         assert!(!harness.paths.phone_record_file().exists(), "还原记录应被清掉");
+    }
+
+    #[test]
+    fn pull_relays_through_main_screen_after_window_manager_misplaces_target_move() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 800.0, 600.0));
+        harness.windows.misplace_moves(1);
+        ready_screen(&harness);
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+
+        let phone = harness.displays.bounds_of(1001).expect("virtual phone bounds");
+        let frame = harness.windows.frame_of(key).expect("placed window");
+        assert!(
+            frame.x >= phone.min_x() - 2.0
+                && frame.x < phone.max_x() + 2.0
+                && frame.y >= phone.min_y() - 2.0
+                && frame.y < phone.max_y() + 2.0,
+            "retry should place the window on the requested virtual display: {frame:?} vs {phone:?}"
+        );
+        assert!(harness.desk.state().placed.is_some());
+        let moves = harness.windows.move_calls();
+        assert_eq!(moves.len(), 3, "一次目标移动、一次主屏中转、一次目标重试");
+        let main = harness.displays.main_area().expect("main area");
+        assert!(DeskCore::window_origin_on_screen(moves[1].1, main));
+        assert_eq!(moves[0].1, moves[2].1, "中转后重试相同的目标区域");
+    }
+
+    #[test]
+    fn pull_restores_original_when_relay_retry_still_misses_phone_screen() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        let original = Rect::new(100.0, 100.0, 800.0, 600.0);
+        harness.windows.insert(key, original);
+        // 目标移动、中转和重试都留在主屏；之后允许正常恢复原始位置。
+        harness.windows.misplace_moves(3);
+        ready_screen(&harness);
+
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+
+        assert!(harness.desk.state().placed.is_none());
+        assert!(harness.desk.state().notice.is_some());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+        let moves = harness.windows.move_calls();
+        assert_eq!(moves.len(), 4, "三次尝试后只应再恢复原始位置");
+        assert_eq!(moves[3].1, original);
+        assert!(!harness.paths.phone_record_file().exists(), "恢复后清除还原记录");
     }
 
     /// 第二次铺同一个 App 不该重走换档阶梯（真机上一次铺垫 4.9 秒，几乎全是换档）。
