@@ -35,7 +35,7 @@ param(
     # 发行包目录。
     [string]$DistDir,
     # 期望固化在 exe 里的更新源（`owner/name`）；给了才检查这一项。
-    [string]$ReleasesRepo
+    [string]$ReleasesRepo = $(if ($env:SNUG_RELEASES_REPO) { $env:SNUG_RELEASES_REPO } else { 'mirakyux/snug-win-rust' })
 )
 
 Set-StrictMode -Version Latest
@@ -143,7 +143,7 @@ Write-Host ("  exe 资源   : FileVersion={0}  ProductVersion={1}" -f $fileVersi
 if ([string]::IsNullOrWhiteSpace($fileVersion)) {
     Fail 'exe 没有版本资源（FileVersion 为空）——build.rs 没找到 rc.exe？'
 } else {
-    # 资源里可能是 1.3.0 或 1.3.0.0，发布名按三段。
+    # 资源里可能是 1.0.0 或 1.0.0.0，发布名按三段。
     $normalized = $fileVersion
     if ($normalized -match '^(\d+\.\d+\.\d+)\.0$') { $normalized = $Matches[1] }
     if ($normalized -notmatch '^\d+\.\d+\.\d+$') {
@@ -354,14 +354,13 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
 
 Head '== 更新源 =='
 if (-not $ReleasesRepo) {
-    Skip '未给 -ReleasesRepo：没核对 exe 里的更新源（没配时"检查更新"按钮不可用，见 docs/release.md）'
+    Skip '未给 -ReleasesRepo：未核对 EXE 里的更新源'
 } else {
-    # 仓库坐标是编译期 option_env!("SNUG_RELEASES_REPO") 固化的普通字符串，
-    # 在二进制里就是一段 ASCII，直接按字节找即可（不用解析 PE 数据段）。
+    # 编译器将选定的仓库坐标写入 EXE，可直接检查该 ASCII 字符串。
     if ($exeContent.Contains($ReleasesRepo, [System.StringComparison]::Ordinal)) {
         Pass "exe 里固化了更新源 $ReleasesRepo"
     } else {
-        Fail "exe 里找不到更新源 '$ReleasesRepo'——构建时没设 SNUG_RELEASES_REPO？"
+        Fail "exe 里找不到预期更新源 '$ReleasesRepo'，请检查构建时的仓库配置"
     }
 }
 

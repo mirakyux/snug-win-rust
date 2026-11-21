@@ -1,22 +1,21 @@
-# 本轮真机验收单（v1.3.0 功能面收尾）
+# Windows 真机与更新验收
 
-重启程序后照着勾。每条都写了**该看到什么日志**，看不到就是没生效。
-
-> 前提：现在跑的是旧进程。要让新构建生效，得**退出再启动**（托盘 → 退出，或数据目录放
-> `quit.request`）。新 exe 在退出后才能覆盖，或直接用
-> `cargo build --release -p snug-app --offline --target-dir target\release-check` 的产物。
+先退出正在运行的旧进程。数据目录设置为 `SNUGWIN_HOME` 的隔离实例不会迁移或修改全局自启任务。
+部分行为需要连接 UU 远程和真实安装虚拟显示器驱动，按下表记录观察结果。
 
 ## 0. 先跑静态门禁（不用启动程序）
 
 ```powershell
-pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe
+pwsh -File scripts\fetch-driver.ps1
+cargo build --release -p snug-app --offline --target-dir target\release-check
+pwsh -File scripts\build-release.ps1 -Exe target\release-check\release\snug.exe -ReleasesRepo mirakyux/snug-win-rust
+pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe -ReleasesRepo mirakyux/snug-win-rust
 ```
 
-它只查「发出去的那个 exe 是不是发布形态」：版本与 `Cargo.toml` 一致、体积在 12 MiB 内、
-清单是 `asInvoker` + PerMonitorV2 + UTF-8、`dumpbin` 里只有系统 DLL、
-dist 的 zip 与 checksums 对得上。**全 PASS 再往下点**；SKIP 的项要看清原因。
+静态检查包括版本、体积、应用清单、系统 DLL 依赖、更新源，以及 `dist` 中的 ZIP 和校验和。
+检查结果出现 `SKIP` 时，核对跳过原因。
 
-它不验证任何行为——下面八组才是行为验收。
+完成静态检查后再启动 EXE 确认运行行为。第 9 项在 Release 公开后执行。
 
 ## 1. UU 开屏不误报，断开后撤屏
 
@@ -111,7 +110,14 @@ dist 的 zip 与 checksums 对得上。**全 PASS 再往下点**；SKIP 的项�
 | 退出后再启动 | 日志里**不会**出现"清理残留手机屏"（没有残留）；如果出现过，说明上次没撤干净 |
 | 强杀进程后重启 | 日志 `已按归属记录清理残留手机屏：#N`，只清自己建的，不动 C# 版建的屏 |
 
-## 已知不做的（不是 bug）
+## 9. 正式更新源
+
+| 操作 | 期望 |
+| --- | --- |
+| 正式发布后运行同一份 EXE，在「关于与更新」页点击「检查更新」 | 显示「已是最新版本」，版本与公开 Release 标签一致 |
+| 在用户可写的隔离目录运行更低版本，使用同一更新源检查 | 显示已发布的新版本，提供应用内安装入口 |
+
+## 验收范围说明
 
 - **多屏不是同时 4 块**：同一时刻只建当前选中那块（见 `multi-screen.md`）。
 - **计划任务/开机自启**不在本轮范围。

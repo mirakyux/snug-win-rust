@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag（留空则用根 Cargo.toml 的版本，如 v1.3.0）'
+        description: '要发布的 tag（留空则用根 Cargo.toml 的版本，如 v1.0.0）'
         required: false
 
 permissions:
@@ -58,21 +58,16 @@ jobs:
           "tag=$tag"         >> $env:GITHUB_OUTPUT
           Write-Host "version=$version tag=$tag"
 
-      - name: Configure update source (optional)
-        # 编译期 SNUG_RELEASES_REPO 决定"检查更新"用哪个仓库。仓库变量没配就**不设**，
-        # 否则 option_env! 会拿到空串，更新器会当成"配了一个空仓库"。
+      - name: Configure update source
         shell: pwsh
         env:
           RELEASE_REPO_INPUT: ${{ vars.SNUG_RELEASES_REPO }}
         run: |
           $repo = ([string]$env:RELEASE_REPO_INPUT).Trim()
-          if ([string]::IsNullOrWhiteSpace($repo)) {
-            Write-Host "未配置仓库变量 SNUG_RELEASES_REPO：本次构建的「检查更新」不可用"
-          } else {
-            if ($repo -notmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') { throw 'SNUG_RELEASES_REPO 必须为 owner/name' }
-            "SNUG_RELEASES_REPO=$repo" >> $env:GITHUB_ENV
-            Write-Host "更新源 = $repo"
-          }
+          if (-not $repo) { $repo = $env:GITHUB_REPOSITORY }
+          if ($repo -notmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') { throw 'SNUG_RELEASES_REPO 必须为 owner/name' }
+          "SNUG_RELEASES_REPO=$repo" >> $env:GITHUB_ENV
+          Write-Host "更新源 = $repo"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -116,9 +111,7 @@ jobs:
       - name: Package assets
         shell: pwsh
         run: |
-          $cliArgs = @('-File', 'scripts\build-release.ps1', '-Exe', 'target\release\snug.exe')
-          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
-          pwsh @cliArgs
+          pwsh -File scripts\build-release.ps1 -Exe target\release\snug.exe -ReleasesRepo $env:SNUG_RELEASES_REPO
           if ($LASTEXITCODE -ne 0) { throw "打包失败 ($LASTEXITCODE)" }
           Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
 
@@ -126,10 +119,7 @@ jobs:
         # 放在打包之后：门禁里有一项是核对 dist 里那个 zip 的结构与校验和。
         shell: pwsh
         run: |
-          $exe = 'target\release\snug.exe'
-          $cliArgs = @('-File', 'scripts\preflight.ps1', '-Exe', $exe)
-          if ($env:SNUG_RELEASES_REPO) { $cliArgs += @('-ReleasesRepo', $env:SNUG_RELEASES_REPO) }
-          pwsh @cliArgs
+          pwsh -File scripts\preflight.ps1 -Exe target\release\snug.exe -ReleasesRepo $env:SNUG_RELEASES_REPO
           if ($LASTEXITCODE -ne 0) { throw "preflight 未通过 ($LASTEXITCODE)" }
 
       - name: Generate release notes
@@ -142,7 +132,7 @@ jobs:
           $tag = $env:RELEASE_TAG
 
           # 自上一个 tag 以来的提交，作为「本版变化」的原始素材。
-          $prev = git describe --tags --abbrev=0 --exclude "$tag" "$tag^" 2>$null
+          $prev = git describe --tags --abbrev=0 --exclude "$tag" HEAD 2>$null
           if ($LASTEXITCODE -eq 0 -and $prev) {
             $commits = @(git log --pretty=format:'- %s (`%h`)' "$prev..HEAD")
             $header = "自 ``$prev`` 以来的提交："

@@ -33,9 +33,9 @@ param(
     [string]$OutDir,
     # 跳过 SHA-256 交叉校验（只在明确知道自己在干什么时用）。
     [switch]$SkipRustCrossCheck,
-    # 期望固化在 exe 里的更新源（`owner/name`）。默认取构建时的
-    # SNUG_RELEASES_REPO；给了就核对 exe 里真的有它，避免发出去的包"检查更新"不可用。
-    [string]$ReleasesRepo = $env:SNUG_RELEASES_REPO
+    # 期望固化在 exe 里的更新源（`owner/name`）。默认取 SNUG_RELEASES_REPO，
+    # 传入时核对 EXE 是否包含该仓库坐标。
+    [string]$ReleasesRepo = $(if ($env:SNUG_RELEASES_REPO) { $env:SNUG_RELEASES_REPO } else { 'mirakyux/snug-win-rust' })
 )
 
 Set-StrictMode -Version Latest
@@ -193,7 +193,7 @@ if (-not $SkipRustCrossCheck) {
 }
 
 # ---------------------------------------------------------------------------
-# 更新源：仓库坐标是编译期 SNUG_RELEASES_REPO，没配的话"检查更新"不可用
+# 更新源：核对预期的仓库坐标
 # ---------------------------------------------------------------------------
 
 if ($ReleasesRepo) {
@@ -203,11 +203,10 @@ if ($ReleasesRepo) {
     if ($haystack.Contains($ReleasesRepo)) {
         Write-Host ("更新源       : {0}（已固化在 exe 里）" -f $ReleasesRepo)
     } else {
-        throw "exe 里找不到更新源 '$ReleasesRepo'：构建时没设 SNUG_RELEASES_REPO？" +
-            "（这样发出去的包「检查更新」会不可用；要么重新构建，要么去掉 -ReleasesRepo 明确接受）"
+        throw "exe 里找不到预期更新源 '$ReleasesRepo'，请检查构建时的仓库配置"
     }
 } else {
-    Write-Host '更新源       : 未配置（检查更新不可用；见 docs/release.md）' -ForegroundColor Yellow
+    Write-Host '更新源       : 未检查（传入 -ReleasesRepo 可核对 EXE 的更新源）' -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------

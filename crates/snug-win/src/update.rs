@@ -11,10 +11,9 @@
 //! 4. 在当前 EXE 同级独占创建 staging 目录，解压并确认其中有普通文件 `snug.exe`；
 //! 5. 写一个 `apply-update.ps1`：等待当前进程退出、原子替换 EXE、校验并重启。
 //!
-//! **更新源可配置**：仓库坐标由编译期 `SNUG_RELEASES_REPO=owner/name` 决定
-//! （见 [`DEFAULT_RELEASES_REPO`]），API/网页/下载地址全部由 [`ReleaseRepo`] 拼；
-//! 没配置时 [`AppUpdateService::is_configured`] 为 `false`，`check_for_update()`
-//! 直接返回 [`UpdateError::NotConfigured`]，**一个请求都不发**。
+//! 默认检查 Rust 版仓库的 GitHub Releases。定制构建可以通过编译期
+//! `SNUG_RELEASES_REPO=owner/name` 指定仓库，参见 [`DEFAULT_RELEASES_REPO`]。
+//! API、网页和下载地址均由 [`ReleaseRepo`] 生成。
 //!
 //! 网络和解压经 trait 注入。更新事务集成测试在独占临时目录执行真实 PowerShell 与
 //! File.Replace，只启动复制的系统 where.exe；不会下载、替换当前程序或安装驱动。
@@ -23,7 +22,6 @@
 //! - 解压用系统自带 `tar.exe`（Win10 1803+ 起是 bsdtar，认 zip），省掉一个 zip crate；
 //! - SHA-256 自己实现（见 [`sha256`]），不引入加密库，保证单 exe 零依赖；
 //! - 当前版本编译期取 `CARGO_PKG_VERSION`；
-//! - 发布仓库不写死：C# 里 URL 是常量，这里全部由 `owner/name` 推导。
 //! - 自动更新只在普通权限进程内执行；目录不可写或进程已提升时要求手动更新，不提升更新器。
 //!
 //! 手动验证（真机）：
@@ -40,11 +38,7 @@ use snug_core::update::{
     UpdateReleaseInfo,
 };
 
-/// 编译期配置的发布仓库（`owner/name`）。
-///
-/// 用法：`SNUG_RELEASES_REPO=owner/name cargo build --release`。
-/// 没配置时更新器不会去猜仓库，也不会发任何请求——[`UpdateError::NotConfigured`] 直接返回。
-/// 这样换首发仓库、或 fork 后自建发布，都只改环境变量，不用改源码。
+/// 默认发布仓库，定制构建可用编译期 `SNUG_RELEASES_REPO` 覆盖。
 pub const DEFAULT_RELEASES_REPO: Option<&str> = option_env!("SNUG_RELEASES_REPO");
 /// 校验和文件名。
 pub const CHECKSUMS_ASSET: &str = "checksums.txt";
@@ -102,9 +96,12 @@ impl ReleaseRepo {
         Some(Self { owner: owner.to_string(), name: name.to_string() })
     }
 
-    /// 取编译期配置的仓库（[`DEFAULT_RELEASES_REPO`]）；没配置或格式不对都是 `None`。
+    /// 解析编译期选定的仓库。显式覆盖的格式无效时返回 `None`。
     pub fn from_default() -> Option<Self> {
-        Self::parse(DEFAULT_RELEASES_REPO?)
+        let spec = DEFAULT_RELEASES_REPO
+            .filter(|repo| !repo.is_empty())
+            .unwrap_or("mirakyux/snug-win-rust");
+        Self::parse(spec)
     }
 
     pub fn slug(&self) -> String {
@@ -367,7 +364,7 @@ pub struct PreparedUpdate {
 /// 更新流程里的失败原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
-    /// 没配置发布仓库（编译期 `SNUG_RELEASES_REPO` 或显式传入）。此时**不发任何请求**。
+    /// 没有有效的发布仓库。此时不会发起请求。
     NotConfigured,
     /// An updater must never carry an elevated token into a user-writable portable path.
     ElevatedProcess,
@@ -392,9 +389,7 @@ pub enum UpdateError {
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotConfigured => f.write_str(
-                "未配置更新源：请在编译期设置 SNUG_RELEASES_REPO=owner/name（例如 acme/snug-rs）。",
-            ),
+            Self::NotConfigured => f.write_str("没有配置有效的发布仓库，无法检查更新。"),
             Self::ElevatedProcess => f.write_str("自动更新仅支持普通权限进程，请以普通权限启动 Snug 或手动替换 EXE。"),
             Self::Network(message) => write!(f, "网络请求失败：{message}"),
             Self::NoRelease => f.write_str("无法获取最新版本信息，请检查网络连接或稍后再试。"),
@@ -728,7 +723,7 @@ pub struct AppUpdateService<H: HttpClient, E: PackageExtractor = TarExtractor> {
 
 impl<H: HttpClient> AppUpdateService<H, TarExtractor> {
     /// 生产用构造：版本取 [`APP_VERSION`]，包形态按 Rust 版当自包含，
-    /// 仓库取编译期 `SNUG_RELEASES_REPO`（没配就是 `None`，更新功能明确不可用）。
+    /// 仓库取 [`DEFAULT_RELEASES_REPO`]。
     pub fn new(http: H) -> Self {
         Self {
             http,
@@ -1029,14 +1024,10 @@ mod tests {
     }
 
     #[test]
-    fn default_repo_comes_from_the_build_time_env() {
-        // 测试构建通常没设 SNUG_RELEASES_REPO：生产构造必须如实报告“未配置”，
-        // 而不是偷偷用一个写死的仓库。
+    fn production_service_uses_official_repo_unless_overridden_at_build_time() {
         let service = AppUpdateService::new(FakeHttp::new());
-        assert_eq!(
-            service.is_configured(),
-            DEFAULT_RELEASES_REPO.and_then(ReleaseRepo::parse).is_some()
-        );
+        let expected = DEFAULT_RELEASES_REPO.filter(|repo| !repo.is_empty()).unwrap_or("mirakyux/snug-win-rust");
+        assert_eq!(service.repo(), ReleaseRepo::parse(expected).as_ref());
     }
 
     #[test]
@@ -1620,14 +1611,14 @@ mod tests {
 
     #[test]
     fn unconfigured_update_source_sends_no_request() {
-        // 没配 SNUG_RELEASES_REPO 时不能去猜仓库、更不能真的发请求。
+        // 显式关闭更新后不应发起任何请求。
         let http = FakeHttp::new();
         let requests = http.request_log();
         let service = service_with(http, true, None);
         assert!(!service.is_configured());
         let error = service.check_for_update().expect_err("未配置就该直接失败");
         assert_eq!(error, UpdateError::NotConfigured);
-        assert!(error.to_string().contains("SNUG_RELEASES_REPO"));
+        assert!(error.to_string().contains("发布仓库"));
         let sent = requests.lock().unwrap();
         assert!(sent.is_empty(), "不该发任何 HTTP 请求：{sent:?}");
     }

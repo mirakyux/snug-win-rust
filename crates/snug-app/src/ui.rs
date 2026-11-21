@@ -327,8 +327,7 @@ impl PhoneHomeApp {
 
     /// 后台查一次新版（C# `OnCheckUpdate`：`await _updates.CheckAsync()` 之后刷界面）。
     ///
-    /// 发布仓库由编译期 `SNUG_RELEASES_REPO` 决定；没配置时更新器直接返回
-    /// `NotConfigured`，**一个请求都不发**——这样界面不会拿 C# 版的仓库去查。
+    /// 默认检查 Rust 版的 GitHub Releases，定制构建可覆盖更新源。
     fn start_update_check(&mut self) {
         use crate::settings::UpdateUiState;
 
@@ -336,7 +335,7 @@ impl PhoneHomeApp {
             snug_win::update::CurlHttpClient::default(),
         );
         if !service.is_configured() {
-            crate::warn!("设置：更新检查不可用——构建时没有设置 SNUG_RELEASES_REPO");
+            crate::warn!("设置：更新检查不可用，构建时指定的发布仓库无效");
             self.settings
                 .set_update_state(UpdateUiState::CheckFailed("未配置发布仓库".to_string()));
             return;

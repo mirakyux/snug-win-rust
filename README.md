@@ -1,20 +1,27 @@
-# snug-rs
+# Snug for Windows
 
-SnugWin 的 Rust 重写。原项目是 [zephyr4123/snug](https://github.com/zephyr4123/snug)（macOS，Swift）
-与社区移植版 [nicocart/snug-win](https://github.com/nicocart/snug-win)（Windows，C# / .NET 10 / WPF），
-两者均为 MIT 许可。本仓库保留原作者的版权声明，只把 Windows 侧实现换成 Rust，
-目标是一个**单 exe、零运行时依赖**的版本。
+Snug 是配合网易 UU 远程使用的 Windows 工具。它在电脑上创建虚拟手机屏，把选中的窗口放到屏上，方便在手机上操作。
 
-当前版本 **1.3.0**，对齐 C# 原版 v1.3.0 的功能面。改动明细见 [CHANGELOG.md](CHANGELOG.md)。
+这是独立维护的 Rust 重写版，从 **v1.0.0** 开始发布，交付含驱动的单个 EXE。它源自 macOS 的
+[Snug](https://github.com/zephyr4123/snug) 和 Windows 的 C# 移植版
+[SnugWin](https://github.com/nicocart/snug-win)，保留两者的来源与版权声明。版本变更见 [更新记录](CHANGELOG.md)。
 
 ## 下载
 
-到 [Releases](../../releases) 下载 `snug.exe`（本次优化构建 8.45 MiB，8,862,720 B）。这是便携单文件，
-可放在当前用户可写目录直接运行，不需安装器、旁置 `driver\` / `assets\`，也不会默认请求 UAC。
-程序内含官方驱动安装包、安装脚本和完整机型库。
+从 [GitHub Releases](https://github.com/mirakyux/snug-win-rust/releases/latest) 下载 `snug.exe`。
+把文件放在当前用户可写的目录，双击即可启动。程序内嵌虚拟显示器驱动安装包、安装脚本和机型库。
 
-双击 `snug.exe` 即可启动普通权限 GUI。若虚拟显示器驱动缺失，首次驱动安装会单独请求一次 UAC；
-已有驱动且管道可用时不会请求。驱动安装脚本校验安装包和证书哈希，保留已装的同款驱动；正常结束后清理临时释放文件。
+主界面以普通权限运行。缺少虚拟显示器驱动时，首次安装会单独请求管理员权限。已安装的驱动若只允许管理员访问，首次建屏时程序会请求提升驱动代理的权限。
+
+## 更新
+
+在设置的「关于与更新」页点击「检查更新」，或开启「启动时自动检查新版本」。程序默认查询本仓库的 GitHub Releases。
+找到更高版本后，可以从程序内下载并重启更新。自动安装需要普通权限且 EXE 所在目录可写。
+
+如果曾运行本地开发版 `1.3.0`，请先退出旧进程，再用发布版 `v1.0.0` 的 `snug.exe` 替换原文件。
+自动更新只识别更高的版本号，无法用旧开发版切换到独立发布序列。
+
+C# 版与 Rust 版各有自己的更新渠道。两版共用默认数据目录和开机启动任务，请退出其中一个版本后再运行另一个。
 
 ## 为什么重写
 
@@ -92,16 +99,14 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 
 ## 发版
 
-**手动触发**：GitHub → Actions → `Release` → Run workflow。
-工作流会用根 `Cargo.toml` 的版本推导 tag（也可手填），依次准备驱动、跑全仓单测、
-release 构建、`scripts/build-release.ps1` 打包和 `scripts/preflight.ps1` 静态门禁，
-然后建 GitHub Release，上传单 exe、自动更新 zip 与 `checksums.txt`。
+在 GitHub Actions 中运行 `Release`。工作流依据 `Cargo.toml` 的版本构建和打包，通过检查后创建 Release 草稿。
+验收同一份 EXE 后，运行 `Publish verified draft` 校验并公开草稿。发布页提供单个含驱动的 EXE，以及应用内更新所需的 ZIP 和校验和。
 
 本地等价流程与资产命名规则见 [docs/release.md](docs/release.md)。
 
 ## 文档
 
-- [docs/acceptance.md](docs/acceptance.md) — 真机验收单（八组）
+- [docs/acceptance.md](docs/acceptance.md) — 真机与更新验收
 - [docs/release.md](docs/release.md) — 发版流程（版本号、门禁、资产名、更新源）
 - [docs/real-machine-test.md](docs/real-machine-test.md) — 真机测试记录
 - [docs/display-parity.md](docs/display-parity.md) — 虚拟屏链路与原版逐行对拍

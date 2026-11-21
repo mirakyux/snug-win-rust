@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '已完成 Windows 真机验收的草稿 tag，例如 v1.3.1'
+        description: '已完成 Windows 真机验收的草稿 tag，例如 v1.0.0'
         required: true
       exe_sha256:
         description: '实际验收的 snug.exe SHA-256；必须与草稿附件完全一致'
