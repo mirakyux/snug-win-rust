@@ -124,6 +124,8 @@ pub enum SettingsAction {
     ReenterScreen,
     /// 首页的「预览界面」（C# `OpenScreenPreview`）。
     OpenPreview,
+    /// 用户明确确认后收起本次手机屏，不关闭应用或修改自动开屏配置。
+    DismissScreen,
 }
 
 /// 运行态快照：由 app 层喂进来，界面只读（对应 C# 里从 `_controller` 读的那些字段）。
@@ -392,6 +394,8 @@ pub struct SettingsWindow {
     /// 机型选择器里的自定义分辨率（C# `CustomWidthBox` / `CustomHeightBox`）。
     custom_width: String,
     custom_height: String,
+    /// 只在设置页内确认本次收屏，避免与自动开屏总开关混淆。
+    confirm_dismiss: bool,
 }
 
 impl Default for SettingsWindow {
@@ -422,6 +426,7 @@ impl SettingsWindow {
             model_search: String::new(),
             custom_width: String::new(),
             custom_height: String::new(),
+            confirm_dismiss: false,
         }
     }
 
@@ -455,6 +460,7 @@ impl SettingsWindow {
         self.open = true;
         self.baseline = None;
         self.last_hint = None;
+        self.confirm_dismiss = false;
     }
 
     /// 用代码切页（C# `SelectTab`）。
@@ -509,10 +515,8 @@ impl SettingsWindow {
         std::mem::take(&mut self.actions)
     }
 
-    /// 画一帧。`cfg` 是本模块唯一会改的外部状态。
-    /// 画一帧设置窗。调用方把它放进**独立的 OS 窗口**里（`show_viewport_immediate`），
-    /// 所以这里是整块面板而不是主窗口里的浮动 `egui::Window`——原版 C# 的设置窗也是
-    /// 独立的 WPF 窗口，出现在主屏上，不是塞在手机屏那块虚拟屏里。
+    /// 设置画在当前手机屏窗口里。窄屏占满页面，宽屏保留桌面设置窗。
+    /// `cfg` 是本模块唯一会改的外部状态；调用方在设置打开时不再绘制资源库。
     pub fn show(&mut self, ctx: &egui::Context, cfg: &mut AppConfig) -> SettingsOutcome {
         if !self.open {
             return SettingsOutcome::Idle;
@@ -522,9 +526,12 @@ impl SettingsWindow {
             self.baseline = Some(before.clone());
         }
 
-        let mut titlebar_open = self.open;
-        let mut back_clicked = false;
-        egui::Window::new("SnugWin 设置")
+        if ctx.screen_rect().width() < 720.0 {
+            self.show_mobile(ctx, cfg);
+        } else {
+            let mut titlebar_open = self.open;
+            let mut back_clicked = false;
+            egui::Window::new("Snug 设置")
             .open(&mut titlebar_open)
             .collapsible(false)
             .resizable(true)
@@ -547,7 +554,8 @@ impl SettingsWindow {
                 ui.add_space(2.0);
                 self.layout(ui, cfg);
             });
-        self.open = titlebar_open && !back_clicked;
+            self.open = titlebar_open && !back_clicked;
+        }
 
         if !self.open {
             self.baseline = None;
@@ -568,6 +576,227 @@ impl SettingsWindow {
     }
 
     // -----------------------------------------------------------------------
+
+    fn show_mobile(&mut self, ctx: &egui::Context, cfg: &mut AppConfig) {
+        let palette = crate::theme::palette(ctx.style().visuals.dark_mode);
+        egui::TopBottomPanel::top("snug-mobile-settings-header")
+            .frame(
+                egui::Frame::default()
+                    .fill(palette.bg)
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let home = self.tab == SettingsTab::Home;
+                    if ui
+                        .add_sized(
+                            [96.0, 48.0],
+                            egui::Button::new(if home { "‹ 应用" } else { "‹ 设置" }),
+                        )
+                        .clicked()
+                    {
+                        if home {
+                            self.open = false;
+                        } else {
+                            self.tab = SettingsTab::Home;
+                            self.last_hint = None;
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(if home { "设置" } else { self.tab.nav_title() })
+                            .size(22.0)
+                            .strong(),
+                    );
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(palette.bg).inner_margin(16.0))
+            .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(48.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("snug-mobile-settings", self.tab.index()))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        match self.tab {
+                            SettingsTab::Home => self.page_home_mobile(ui, cfg),
+                            SettingsTab::Screens => self.page_screens(ui, cfg),
+                            SettingsTab::Gestures => self.page_gestures(ui, cfg),
+                            SettingsTab::Diagnostics => self.page_diagnostics(ui, cfg),
+                            SettingsTab::About => self.page_about(ui, cfg),
+                        }
+                    });
+            });
+    }
+
+    fn page_home_mobile(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
+        let palette = crate::theme::palette(ui.visuals().dark_mode);
+        ui.label(egui::RichText::new(&self.status.status_summary).color(palette.accent));
+        if !self.status.pipe_available {
+            ui.label("虚拟显示器驱动未就绪，可在「驱动与日志」中安装或修复。");
+        }
+        ui.add_space(12.0);
+        Self::card(ui, "屏幕与显示", |ui| {
+            let count = cfg.effective_screens().len();
+            if Self::mobile_link(
+                ui,
+                "多屏与设备",
+                &format!("{} 块已配置 · {}", count, model_text(&cfg.phone)),
+            ) {
+                self.tab = SettingsTab::Screens;
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("应用内字号").strong());
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        cfg.zoom_steps > 0,
+                        egui::Button::new("−").min_size(egui::vec2(48.0, 48.0)),
+                    )
+                    .clicked()
+                {
+                    cfg.zoom_steps -= 1;
+                }
+                ui.label(zoom_label(cfg.zoom_steps));
+                if ui
+                    .add_enabled(
+                        cfg.zoom_steps < 4,
+                        egui::Button::new("+").min_size(egui::vec2(48.0, 48.0)),
+                    )
+                    .clicked()
+                {
+                    cfg.zoom_steps += 1;
+                }
+            });
+            ui.label(
+                egui::RichText::new("对支持缩放的应用窗口生效")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("外观").strong());
+            ui.horizontal_wrapped(|ui| {
+                for (mode, label) in [
+                    (AppThemeMode::Light, "浅色"),
+                    (AppThemeMode::Dark, "深色"),
+                    (AppThemeMode::Auto, "跟随系统"),
+                ] {
+                    if ui
+                        .add(
+                            egui::Button::new(label)
+                                .selected(cfg.theme == mode)
+                                .min_size(egui::vec2(60.0, 48.0)),
+                        )
+                        .clicked()
+                    {
+                        cfg.theme = mode;
+                    }
+                }
+            });
+        });
+        ui.add_space(12.0);
+        Self::card(ui, "连接与启动", |ui| {
+            if Self::labeled_checkbox(
+                ui,
+                &mut cfg.phone_screen,
+                "连接后自动开屏",
+                "收起本次手机屏不会关闭此项",
+            ) {
+                self.actions
+                    .push(SettingsAction::SetPhoneScreen(cfg.phone_screen));
+            }
+            if Self::labeled_checkbox(
+                ui,
+                &mut self.autostart,
+                "登录后后台启动",
+                "以普通权限常驻托盘，不抢占桌面",
+            ) {
+                self.actions
+                    .push(SettingsAction::SetAutoStart(self.autostart));
+            }
+            Self::labeled_checkbox(
+                ui,
+                &mut cfg.screenshot,
+                "底栏显示截图按钮",
+                "截取当前窗口，可继续裁剪或复制",
+            );
+        });
+        ui.add_space(12.0);
+        for (tab, title, detail) in [
+            (SettingsTab::Gestures, "手势与触控", "滚动、长按和选后复制"),
+            (
+                SettingsTab::Diagnostics,
+                "驱动与日志",
+                "驱动修复、权限与高级诊断",
+            ),
+            (SettingsTab::About, "关于与更新", "版本、更新与开源许可"),
+        ] {
+            if Self::mobile_link(ui, title, detail) {
+                self.tab = tab;
+            }
+            ui.add_space(8.0);
+        }
+        ui.add_space(12.0);
+        if self.confirm_dismiss {
+            ui.label(egui::RichText::new("收起手机屏？").strong());
+            ui.label(
+                "窗口将还原到电脑原来的位置。应用不会关闭，Snug 继续运行，可从胶囊或托盘重新进入。",
+            );
+            ui.add_space(8.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 52.0],
+                    egui::Button::new("收起并还原窗口"),
+                )
+                .clicked()
+            {
+                self.actions.push(SettingsAction::DismissScreen);
+                self.confirm_dismiss = false;
+                self.open = false;
+            }
+            if ui
+                .add_sized([ui.available_width(), 48.0], egui::Button::new("继续使用"))
+                .clicked()
+            {
+                self.confirm_dismiss = false;
+            }
+        } else if self.status.phone_screen_ready {
+            if ui
+                .add_sized(
+                    [ui.available_width(), 52.0],
+                    egui::Button::new("收起手机屏"),
+                )
+                .clicked()
+            {
+                self.confirm_dismiss = true;
+            }
+            ui.label(
+                egui::RichText::new("窗口还原，Snug 继续运行")
+                    .small()
+                    .weak(),
+            );
+        } else if self.status.can_reenter {
+            if ui
+                .add_sized(
+                    [ui.available_width(), 52.0],
+                    egui::Button::new("重新进入手机屏"),
+                )
+                .clicked()
+            {
+                self.actions.push(SettingsAction::ReenterScreen);
+            }
+        }
+        self.page_footer(ui, cfg);
+    }
+
+    fn mobile_link(ui: &mut egui::Ui, title: &str, detail: &str) -> bool {
+        ui.add_sized(
+            [ui.available_width(), 68.0],
+            egui::Button::new(format!("{title}  ›\n{detail}")).wrap(),
+        )
+        .clicked()
+    }
     // 布局
     // -----------------------------------------------------------------------
 
@@ -631,19 +860,17 @@ impl SettingsWindow {
             ui.label(egui::RichText::new(&self.status.status_summary).strong());
         });
         ui.label(egui::RichText::new(elevation_text(self.status.elevated)).small().weak());
-        if !self.status.elevated && ui.small_button("以管理员重启").clicked() {
-            self.actions.push(SettingsAction::RestartElevated);
-        }
     }
 
     /// 一页的公共收尾：影响提示 + 自动化都关掉的提醒。
     fn page_footer(&mut self, ui: &mut egui::Ui, cfg: &AppConfig) {
+        let palette = crate::theme::palette(ui.visuals().dark_mode);
         if let Some(hint) = self.last_hint {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(hint)
                     .small()
-                    .color(egui::Color32::from_rgb(0x93, 0xC5, 0xFD)),
+                    .color(palette.accent),
             );
         }
         if let Some(hint) = both_off_hint(cfg, self.autostart) {
@@ -651,7 +878,7 @@ impl SettingsWindow {
             ui.label(
                 egui::RichText::new(hint)
                     .small()
-                    .color(egui::Color32::from_rgb(0xFC, 0xD3, 0x4D)),
+                    .color(palette.warn),
             );
         }
     }
@@ -773,9 +1000,6 @@ impl SettingsWindow {
                 } else if can_reenter && ui.button("进入手机屏").clicked() {
                     self.actions.push(SettingsAction::ReenterScreen);
                 }
-                if !elevated && ui.button("提权重启").clicked() {
-                    self.actions.push(SettingsAction::RestartElevated);
-                }
             });
         });
         ui.add_space(8.0);
@@ -870,7 +1094,7 @@ impl SettingsWindow {
                 ui,
                 &mut self.autostart,
                 "开机静默自启动（后台常驻托盘）",
-                "通过 Windows 任务计划以最高权限启动，登录桌面不再弹 UAC 提示",
+                "以普通权限常驻托盘，登录桌面不弹窗、不抢焦点",
             ) {
                 self.actions.push(SettingsAction::SetAutoStart(self.autostart));
             }
@@ -882,14 +1106,6 @@ impl SettingsWindow {
                 "一键截取手机屏窗口到剪贴板，点击缩略图可 8 把手裁剪",
             );
 
-            if Self::labeled_checkbox(
-                ui,
-                &mut self.manual_override,
-                "手动强制开启手机屏（测试 / 自动探测兜底）",
-                "跳过 UU远程 信号检测，直接在本地桌面旁模拟启用竖屏手机屏",
-            ) {
-                self.actions.push(SettingsAction::SetManualOverride(self.manual_override));
-            }
         });
 
         self.page_footer(ui, cfg);
@@ -931,7 +1147,7 @@ impl SettingsWindow {
                     ui.label(
                         egui::RichText::new(&badge)
                             .size(13.0)
-                            .color(egui::Color32::from_rgb(0x8A, 0xB4, 0xF8)),
+                            .color(crate::theme::palette(ui.visuals().dark_mode).accent),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -945,7 +1161,7 @@ impl SettingsWindow {
                 });
                 ui.label(egui::RichText::new(&spec).small().weak());
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .checkbox(&mut screen.enabled, "启用")
                         .on_hover_text("关掉后这台设备不建虚拟屏")
@@ -978,7 +1194,7 @@ impl SettingsWindow {
         ui.separator();
         ui.add_space(6.0);
         ui.label(egui::RichText::new("添加一块屏").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("类型");
             for (kind, label) in [
                 (snug_core::DeviceKind::Phone, "手机"),
@@ -988,7 +1204,7 @@ impl SettingsWindow {
                 ui.selectable_value(&mut self.new_screen_kind, kind, label);
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("方向");
             for (orientation, label) in [
                 (snug_core::ScreenOrientation::Portrait, "竖屏"),
@@ -1016,7 +1232,8 @@ impl SettingsWindow {
                 .unwrap_or_else(|| "（选择机型）".to_string());
             egui::ComboBox::from_id_salt("snug-new-screen-model")
                 .selected_text(selected_label)
-                .width(280.0)
+                .width(ui.available_width().min(280.0))
+                .truncate()
                 .show_ui(ui, |ui| {
                     if let Some(catalog) = &self.catalog {
                         for model in catalog.models() {
@@ -1025,7 +1242,9 @@ impl SettingsWindow {
                                 "{} {}（{} × {}）",
                                 model.brand, model.name, model.screen.width, model.screen.height
                             );
-                            ui.selectable_value(&mut selected, Some(id), label);
+                            if ui.add(egui::Button::new(label).selected(selected.as_ref() == Some(&id)).wrap()).clicked() {
+                                selected = Some(id);
+                            }
                         }
                     }
                 });
@@ -1033,14 +1252,13 @@ impl SettingsWindow {
         }
 
         // 名字（C# `AddScreenNameBox`）：留空就按机型与方向自动取。
-        ui.horizontal(|ui| {
-            ui.label("名字");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_screen_name)
-                    .hint_text("留空 = 按机型自动取名")
-                    .desired_width(240.0),
-            );
-        });
+        ui.label("名字");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.new_screen_name)
+                .hint_text("留空 = 按机型自动取名")
+                .desired_width(ui.available_width())
+                .min_size(egui::vec2(0.0, 48.0)),
+        );
 
         let can_add = screens.len() < ScreenConfig::LIMIT && self.new_screen_model.is_some();
         if ui
@@ -1087,12 +1305,13 @@ impl SettingsWindow {
                 let mut custom_apply = false;
                 let mut cancel = false;
                 Self::card(ui, "选择机型", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.model_search)
-                                .hint_text("🔍 搜索品牌 / 型号")
-                                .desired_width(f32::INFINITY),
-                        );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.model_search)
+                            .hint_text("搜索品牌 / 型号")
+                            .desired_width(ui.available_width())
+                            .min_size(egui::vec2(0.0, 48.0)),
+                    );
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("取消").clicked() {
                             cancel = true;
                         }
@@ -1123,7 +1342,7 @@ impl SettingsWindow {
                                     "{} {}（{} × {}）",
                                     model.brand, model.name, model.screen.width, model.screen.height
                                 );
-                                if ui.selectable_label(false, label).clicked() {
+                                if ui.add(egui::Button::new(label).wrap()).clicked() {
                                     chosen = Some(PhoneChoice::from_model(model));
                                 }
                             }
@@ -1136,23 +1355,19 @@ impl SettingsWindow {
                     if needle.is_empty() || shown == 0 {
                         ui.separator();
                         ui.label(egui::RichText::new("自定义分辨率").strong());
-                        ui.horizontal(|ui| {
-                            ui.label("宽");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.custom_width)
-                                    .desired_width(70.0)
-                                    .hint_text("1080"),
-                            );
-                            ui.label("高");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.custom_height)
-                                    .desired_width(70.0)
-                                    .hint_text("2400"),
-                            );
-                            if ui.button("应用自定义").clicked() {
-                                custom_apply = true;
-                            }
+                        ui.columns(2, |columns| {
+                            columns[0].label("宽");
+                            let width = columns[0].available_width();
+                            columns[0].add(egui::TextEdit::singleline(&mut self.custom_width)
+                                .desired_width(width).min_size(egui::vec2(0.0, 48.0)).hint_text("1080"));
+                            columns[1].label("高");
+                            let width = columns[1].available_width();
+                            columns[1].add(egui::TextEdit::singleline(&mut self.custom_height)
+                                .desired_width(width).min_size(egui::vec2(0.0, 48.0)).hint_text("2400"));
                         });
+                        if ui.add_sized([ui.available_width(), 48.0], egui::Button::new("应用自定义")).clicked() {
+                            custom_apply = true;
+                        }
                         ui.label(
                             egui::RichText::new("两个都要填；横向填的宽高会自动摆成竖屏")
                                 .small()
@@ -1256,12 +1471,21 @@ impl SettingsWindow {
         ui.label(egui::RichText::new("virtual-display-rs 0.3.1 驱动通道").strong());
         ui.label(egui::RichText::new(pipe_text(self.status.pipe_available)).small().weak());
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("安装 / 修复驱动").clicked() {
                 self.actions.push(SettingsAction::InstallDriver);
             }
             if ui.button("打开日志目录").clicked() {
                 self.actions.push(SettingsAction::OpenLogDirectory);
+            }
+        });
+        ui.collapsing("高级与权限", |ui| {
+            ui.label(elevation_text(self.status.elevated));
+            if !self.status.elevated && ui.button("以管理员身份重启").clicked() {
+                self.actions.push(SettingsAction::RestartElevated);
+            }
+            if Self::labeled_checkbox(ui, &mut self.manual_override, "手动强制开启手机屏", "跳过自动探测，仅用于连接识别失败时的兜底") {
+                self.actions.push(SettingsAction::SetManualOverride(self.manual_override));
             }
         });
         ui.add_space(10.0);
@@ -1290,10 +1514,10 @@ impl SettingsWindow {
                 .weak(),
         );
         if let Some(progress) = self.update.progress() {
-            ui.add(egui::ProgressBar::new(progress).desired_width(320.0));
+            ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width().min(320.0)));
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.update.check_enabled(), egui::Button::new("检查更新"))
                 .clicked()
@@ -1372,6 +1596,208 @@ mod tests {
         AppConfig::default()
     }
 
+    // Before GPU tessellation a galley's mesh bounds can be empty. Logical text
+    // bounds still describe its real layout and provide valid pointer targets.
+    fn drawn_bounds(shape: &egui::Shape) -> egui::Rect {
+        match shape {
+            egui::Shape::Text(text) => text.galley.rect.translate(text.pos.to_vec2()),
+            _ => shape.visual_bounding_rect(),
+        }
+    }
+
+    fn draw_settings_at(
+        width: f32,
+        window: &mut SettingsWindow,
+        cfg: &mut AppConfig,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut result = egui::FullOutput::default();
+        for _ in 0..3 {
+            result = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 760.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    window.show(ctx, cfg);
+                },
+            );
+        }
+        result
+    }
+
+    fn click_settings_label(
+        ctx: &egui::Context,
+        output: &egui::FullOutput,
+        label: &str,
+        window: &mut SettingsWindow,
+        cfg: &mut AppConfig,
+    ) -> egui::FullOutput {
+        let target = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(drawn_bounds(&shape.shape).center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing visible control {label}"));
+        let mut output = egui::FullOutput::default();
+        for pressed in [true, false] {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 1800.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    window.show(ctx, cfg);
+                },
+            );
+        }
+        output
+    }
+
+    #[test]
+    fn mobile_settings_home_stays_inside_phone_width() {
+        for width in [320.0, 400.0, 540.0] {
+            let mut window = SettingsWindow::new();
+            window.open();
+            let output = draw_settings_at(width, &mut window, &mut standard());
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .all(|shape| drawn_bounds(&shape.shape).right() <= width + 1.0),
+                "settings must not draw a desktop-width window at {width} points"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_settings_pages_and_model_picker_do_not_overflow_with_long_labels() {
+        for width in [320.0, 400.0, 540.0] {
+            for tab in SettingsTab::ALL {
+                let mut cfg = standard();
+                let mut window = SettingsWindow::new();
+                window.open();
+                window.select_tab(tab);
+                window.set_update_state(UpdateUiState::Downloading {
+                    version: "1.0.1".into(),
+                    progress: 0.42,
+                });
+                window.set_catalog(Some(PhoneCatalog::from_json(
+                    r#"{"phone":[{"name":"Apple","models":[{"name":"A model with a deliberately long readable name to exercise narrow layout","screen":[1080,2400]}]}]}"#,
+                ).expect("model catalog")));
+                window.new_screen_model = window
+                    .catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.models().next())
+                    .map(|model| model.id());
+                if tab == SettingsTab::Screens {
+                    window.open_model_picker(0, Some(&cfg.phone));
+                }
+                let output = draw_settings_at(width, &mut window, &mut cfg);
+                let overflow = output
+                    .shapes
+                    .iter()
+                    .map(|shape| drawn_bounds(&shape.shape).right())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    overflow <= width + 1.0,
+                    "{tab:?} drew to {overflow} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_settings_back_returns_to_home_before_closing() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut cfg = standard();
+        let mut window = SettingsWindow::new();
+        window.open();
+        window.select_tab(SettingsTab::Gestures);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 1800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    window.show(ctx, &mut cfg);
+                },
+            );
+        }
+        click_settings_label(&ctx, &output, "‹ 设置", &mut window, &mut cfg);
+        assert!(window.is_open());
+        assert_eq!(window.tab(), SettingsTab::Home);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show(ctx, &mut cfg);
+        });
+        click_settings_label(&ctx, &output, "‹ 应用", &mut window, &mut cfg);
+        assert!(!window.is_open());
+    }
+
+    #[test]
+    fn mobile_dismiss_requires_confirmation_and_preserves_automatic_screen_setting() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut cfg = standard();
+        let mut window = SettingsWindow::new();
+        window.status.phone_screen_ready = true;
+        window.open();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 1800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    window.show(ctx, &mut cfg);
+                },
+            );
+        }
+        let auto_screen = cfg.phone_screen;
+        click_settings_label(&ctx, &output, "收起手机屏", &mut window, &mut cfg);
+        assert!(
+            window.take_actions().is_empty(),
+            "opening confirmation must not dismiss"
+        );
+        assert!(window.is_open());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            window.show(ctx, &mut cfg);
+        });
+        click_settings_label(&ctx, &output, "收起并还原窗口", &mut window, &mut cfg);
+        assert_eq!(window.take_actions(), vec![SettingsAction::DismissScreen]);
+        assert!(!window.is_open());
+        assert_eq!(cfg.phone_screen, auto_screen);
+    }
     #[test]
     fn zoom_index_and_label_clamp() {
         for steps in 0..=4 {

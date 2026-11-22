@@ -23,6 +23,7 @@ use snug_core::{AppConfig, Paths, PhoneCatalog, ScreenFit};
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let preview_requested = arguments.iter().any(|argument| argument == "--preview");
     match privileged::dispatch(&arguments) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
@@ -155,10 +156,10 @@ fn main() -> eframe::Result<()> {
                 |line: &str| crate::info!("desk: {line}"),
             )?;
             crate::info!("控制器已启动（手机屏 {}）", if pipe_ready { "可用" } else { "不可用" });
-            if !pipe_ready && let Err(error) = driver::spawn_ensure_installed() {
+            if !pipe_ready && !preview_requested && let Err(error) = driver::spawn_ensure_installed() {
                 crate::warn!("驱动安装后台任务无法启动：{error}");
             }
-            Ok(Box::new(ui::PhoneHomeApp::new(
+            let mut app = ui::PhoneHomeApp::new(
                 config,
                 catalog,
                 paths.clone(),
@@ -166,7 +167,11 @@ fn main() -> eframe::Result<()> {
                 start_minimized,
                 controller,
                 ui_heartbeat,
-            )))
+            );
+            if preview_requested {
+                app.open_preview(&cc.egui_ctx);
+            }
+            Ok(Box::new(app))
         }),
     );
 

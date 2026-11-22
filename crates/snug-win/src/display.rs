@@ -202,20 +202,25 @@ fn fnv_write(mut hash: u32, value: u32) -> u32 {
     hash
 }
 
-/// 屏幕上能放窗口的区域：工作区去掉底部 Home Bar（C# `PhoneDisplayService.WindowAreaOf`）。
-pub fn window_area(monitor: &MonitorSnapshot, logical_width: i32) -> Rect {
-    let scale = f64::max(1.0, monitor.mode.width as f64 / logical_width.max(1) as f64);
-    // C# `Math.Round(...)` 是银行家舍入，不是远离零。
-    let home_bar_px = round_ties_even(ScreenFit::home_bar_height(logical_width.max(1) as f64) * scale);
+/// 工作区去掉触控底栏。UI 按整屏物理短边缩放到 400 点，底栏按同一尺度留出 60 点。
+pub fn window_area(monitor: &MonitorSnapshot, _logical_width: i32) -> Rect {
+    let requested_bar = ScreenFit::home_bar_height_of(snug_core::Size::new(
+        monitor.mode.width.max(0) as f64,
+        monitor.mode.height.max(0) as f64,
+    ));
     let work = monitor.work_area;
-    Rect::new(work.x, work.y, work.width, f64::max(100.0, work.height - home_bar_px))
+    let work_height = work.height.max(0.0);
+    // 正常保留至少 100 像素给应用；工作区极矮时优先不越界，底栏使用剩余空间。
+    let bar_height = requested_bar.clamp(0.0, (work_height - 100.0).max(0.0));
+    Rect::new(work.x, work.y, work.width, work_height - bar_height)
 }
 
-/// Home Bar 区域：工作区里窗口区域剩下的那一条（C# `HomeBarAreaOf`）。
+/// 触控底栏是工作区里窗口区域剩下的那一条，不额外扩张到工作区外。
 pub fn home_bar_area(monitor: &MonitorSnapshot, area: Rect) -> Rect {
     let work = monitor.work_area;
-    let bar_height = f64::max(28.0, work.max_y() - area.max_y());
-    Rect::new(work.x, area.max_y(), work.width, bar_height)
+    let bottom = work.y + work.height.max(0.0);
+    let top = area.max_y().clamp(work.y, bottom);
+    Rect::new(work.x, top, work.width, bottom - top)
 }
 
 /// 主屏工作区：优先非手机屏的主显示器，否则第一块非手机屏。
@@ -510,9 +515,20 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         match self.ipc.remove(&owned_ids) {
             Ok(()) => {
                 sleep_for(self.timings.cleanup_settle);
-                store.clear_all();
-                // C# 文案：`已按归属记录清理残留手机屏：#{string.Join(", #", ownedIds)}`。
-                crate::info(&cleanup_log_line(&owned_ids));
+                let monitors = self.api.active_monitors();
+                let mut removed = Vec::new();
+                for id in owned_ids {
+                    // IPC 接受删除不等于显示器已下线；无可核对编号的虚拟屏也不能猜成已清理。
+                    if retirement_is_online(&monitors, id, None) {
+                        crate::warn(&format!("残留手机屏 #{id} 尚未确认下线，保留归属记录"));
+                    } else {
+                        store.release_owned(id);
+                        removed.push(id);
+                    }
+                }
+                if !removed.is_empty() {
+                    crate::info(&cleanup_log_line(&removed));
+                }
             }
             Err(error) => crate::warn(&format!(
                 "启动清理残留虚拟屏时异常：{error}（保留归属记录）"
@@ -687,48 +703,48 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 撤屏（C# `RetireAsync`）：等它真的下线，顺手把走丢的光标捞回来。
     fn retire(&mut self, display_id: u32) -> bool {
-        let device_name = {
-            let mut maps = lock_maps(&self.maps);
-            maps.fits.remove(&display_id);
-            maps.device_names.remove(&display_id)
-        };
-        // C2：与 C# 一样，先删本地状态再发删除；若 remove 失败，屏还在但应用
-        // 已经忘了它（孤儿屏，直到下次启动 CleanupOrphans 才清）。照抄不修。
-        match self.ipc.remove(&[display_id]) {
-            Ok(()) => {
-                // C# v1.3.0：IPC 接受删除就销账（不等 10s 下线轮询；若最终没下线，
-                // 这块屏会变成没人认领的孤儿——C# 同款行为）。
-                if let Some(store) = &self.owned {
-                    store.release_owned(display_id);
-                }
-            }
-            Err(error) => {
-                // C# `Log.Warn($"移除手机屏 #{displayId} 失败：{ex.Message}")`
-                crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}"));
-            }
-        }
-
-        let Some(device_name) = device_name else {
+        let device_name = lock_maps(&self.maps).device_names.get(&display_id).cloned();
+        let online = retirement_is_online(
+            &self.api.active_monitors(), display_id, device_name.as_deref(),
+        );
+        if !online {
+            self.finish_retirement(display_id);
+            self.restore_cursor_if_stranded();
             return true;
-        };
+        }
+        let owned = self.owned.as_ref().is_some_and(|store| store.load_ids().contains(&display_id));
+        if device_name.is_none() && !owned {
+            // 无内存映射或持久归属时，不能因碰巧匹配编号而删除别的程序的屏。
+            return false;
+        }
+        if let Err(error) = self.ipc.remove(&[display_id]) {
+            crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}（保留归属与映射）"));
+            return false;
+        }
         let start = Instant::now();
-        let mut gone = false;
-        while start.elapsed() < self.timings.offline {
-            let still_there = self
-                .api
-                .active_monitors()
-                .iter()
-                .any(|m| normalized(&m.device_name) == normalized(&device_name));
-            if !still_there {
-                gone = true;
-                break;
+        loop {
+            if !retirement_is_online(
+                &self.api.active_monitors(), display_id, device_name.as_deref(),
+            ) {
+                self.finish_retirement(display_id);
+                self.restore_cursor_if_stranded();
+                return true;
+            }
+            if start.elapsed() >= self.timings.offline {
+                return false;
             }
             sleep_for(self.timings.offline_poll);
         }
-        if gone {
-            self.restore_cursor_if_stranded();
+    }
+
+    fn finish_retirement(&self, display_id: u32) {
+        let mut maps = lock_maps(&self.maps);
+        maps.fits.remove(&display_id);
+        maps.device_names.remove(&display_id);
+        drop(maps);
+        if let Some(store) = &self.owned {
+            store.release_owned(display_id);
         }
-        gone
     }
 
     /// 光标停在被撤掉的屏上时挪到主屏中央（C# `RestoreCursorIfStranded`）。
@@ -844,13 +860,20 @@ fn find_monitor_of<A: DisplayApi>(
 }
 
 fn is_online_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>, display_id: u32) -> bool {
-    let Some(device_name) = lock_maps(maps).device_names.get(&display_id).cloned() else {
-        return false;
-    };
-    let wanted = normalized(&device_name);
-    api.active_monitors()
-        .iter()
-        .any(|m| normalized(&m.device_name) == wanted)
+    let device_name = lock_maps(maps).device_names.get(&display_id).cloned();
+    retirement_is_online(&api.active_monitors(), display_id, device_name.as_deref())
+}
+
+fn retirement_is_online(monitors: &[MonitorSnapshot], display_id: u32, device_name: Option<&str>) -> bool {
+    monitors.iter().any(|monitor| {
+        match monitor.virtual_display_id {
+            Some(id) => id == display_id,
+            None => match device_name {
+                Some(name) => normalized(&monitor.device_name) == normalized(name),
+                None => is_virtual_monitor(monitor),
+            },
+        }
+    })
 }
 
 fn width_of_display<A: DisplayApi>(
@@ -1929,7 +1952,7 @@ mod tests {
 
     #[test]
     fn window_area_removes_home_bar_at_200_percent() {
-        // 1080×1900 物理像素 = 540 点 * 2 倍；Home Bar 28 点 → 56 像素。
+        // 1080 短边 / 400 触控设计点 × 60 点底栏 = 162 物理像素，与系统 DPI 无关。
         let monitor = snapshot(
             r"\\.\DISPLAY2",
             "Virtual Display",
@@ -1939,12 +1962,12 @@ mod tests {
             DisplayModeInfo { width: 1080, height: 1900, refresh_rate: 60.0, dpi_scale_percent: 200 },
         );
         let area = window_area(&monitor, 540);
-        assert_eq!(area, Rect::new(1920.0, 0.0, 1080.0, 1812.0));
-        assert_eq!(home_bar_area(&monitor, area), Rect::new(1920.0, 1812.0, 1080.0, 56.0));
+        assert_eq!(area, Rect::new(1920.0, 0.0, 1080.0, 1706.0));
+        assert_eq!(home_bar_area(&monitor, area), Rect::new(1920.0, 1706.0, 1080.0, 162.0));
     }
 
     #[test]
-    fn window_area_keeps_at_least_100_points_and_28_point_bar() {
+    fn window_area_keeps_100_pixels_without_extending_bar_past_short_work_area() {
         let monitor = snapshot(
             r"\\.\DISPLAY3",
             "Virtual Display",
@@ -1953,11 +1976,51 @@ mod tests {
             false,
             DisplayModeInfo { width: 540, height: 960, refresh_rate: 60.0, dpi_scale_percent: 100 },
         );
-        let area = window_area(&monitor, 1000); // 缩放按 1.0 兜底
+        let area = window_area(&monitor, 1000);
         assert_eq!(area.height, 100.0);
         let bar = home_bar_area(&monitor, area);
-        assert_eq!(bar.height, 28.0, "Home Bar 最少 28 点");
+        assert_eq!(bar.height, 20.0, "工作区不足时压缩底栏，不越过工作区");
         assert_eq!(bar.y, 100.0);
+        assert_eq!(bar.max_y(), monitor.work_area.max_y());
+    }
+
+    #[test]
+    fn touch_bar_uses_short_side_in_both_orientations_independently_of_native_dpi() {
+        for (width, height, dpi, expected) in [
+            (1080, 1920, 200, 162.0),
+            (1920, 1080, 200, 162.0),
+            (525, 950, 200, 79.0),
+            (1920, 1080, 100, 162.0),
+        ] {
+            let bounds = Rect::new(-500.0, 120.0, width as f64, height as f64);
+            let monitor = snapshot(
+                r"\\.\DISPLAY3", "Virtual Display", bounds, bounds, false,
+                DisplayModeInfo { width, height, refresh_rate: 60.0, dpi_scale_percent: dpi },
+            );
+            let area = window_area(&monitor, width / 2);
+            let bar = home_bar_area(&monitor, area);
+            assert_eq!(bar.height, expected, "{width}x{height} at {dpi}%");
+            assert_eq!(area.max_y(), bar.min_y());
+            assert_eq!(bar.max_y(), bounds.max_y());
+            assert_eq!(area.height + bar.height, bounds.height);
+        }
+    }
+
+    #[test]
+    fn touch_bar_partition_stays_inside_tiny_and_empty_work_areas() {
+        for height in [0.0, 40.0, 100.0, 120.0, 159.0, 160.0, 300.0] {
+            let work = Rect::new(-120.0, -80.0, 540.0, height);
+            let monitor = snapshot(
+                r"\\.\DISPLAY3", "Virtual Display", work, work, false, mode(540, 960),
+            );
+            let area = window_area(&monitor, 540);
+            let bar = home_bar_area(&monitor, area);
+            assert!(area.height >= 0.0 && bar.height >= 0.0);
+            assert!(area.height >= 100.0_f64.min(height));
+            assert_eq!(area.max_y(), bar.min_y());
+            assert_eq!(bar.max_y(), work.max_y());
+            assert_eq!(area.height + bar.height, height);
+        }
     }
 
     #[test]
@@ -2159,6 +2222,8 @@ mod tests {
         /// 每次 Notify/ReplaceLegacy 带上去的显示名（v2 协议字段 `name`）。
         notified_names: Vec<Vec<String>>,
         removed: Vec<u32>,
+        remove_error: bool,
+        keep_online_on_remove: HashSet<u32>,
         remove_all_calls: usize,
         legacy: bool,
         online_ids: HashSet<u32>,
@@ -2322,8 +2387,13 @@ mod tests {
         fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
             let mut world = self.0.lock().unwrap();
             world.removed.extend_from_slice(ids);
+            if world.remove_error {
+                return Err(VddError::Io(std::io::ErrorKind::BrokenPipe.into()));
+            }
             for &id in ids {
-                world.driver_offline(id);
+                if !world.keep_online_on_remove.contains(&id) {
+                    world.driver_offline(id);
+                }
             }
             Ok(())
         }
@@ -2663,6 +2733,80 @@ mod tests {
     }
 
     #[test]
+    fn retire_failure_keeps_the_screen_queryable_and_owned_for_retry() {
+        let path = owned_path("retire-error");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        shared.lock().unwrap().remove_error = true;
+        assert!(!screen.retire(id));
+        assert!(is_online_of(&screen.api, &screen.maps, id));
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(id));
+        assert!(!lock_maps(&screen.maps).fits.contains_key(&id));
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn acknowledged_retire_keeps_ownership_until_the_monitor_really_goes_offline() {
+        let path = owned_path("retire-delayed");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        shared.lock().unwrap().keep_online_on_remove.insert(id);
+        screen.timings.offline = Duration::ZERO;
+        assert!(!screen.retire(id));
+        assert!(is_online_of(&screen.api, &screen.maps, id));
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+
+        shared.lock().unwrap().driver_offline(id);
+        assert!(screen.retire(id));
+        assert_eq!(shared.lock().unwrap().removed, vec![id], "下线后只销账，不再发 IPC");
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        assert!(!lock_maps(&screen.maps).device_names.contains_key(&id));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_orphan_without_memory_mapping_uses_verified_driver_id() {
+        let path = owned_path("retire-orphan");
+        OwnedDisplayStore::new(&path).record_owned(0);
+        let mut world = world_with_phone(&[0]);
+        world.driver_online(0);
+        world.keep_online_on_remove.insert(0);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.timings.offline = Duration::ZERO;
+        assert!(is_online_of(&screen.api, &screen.maps, 0));
+        assert!(!screen.retire(0), "缺少 map 不能被当成已离线");
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        shared.lock().unwrap().keep_online_on_remove.clear();
+        assert!(screen.retire(0));
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unknown_virtual_identity_preserves_ownership_and_never_deletes_unowned_monitors() {
+        let path = owned_path("retire-unidentified");
+        OwnedDisplayStore::new(&path).record_owned(0);
+        let mut world = world_with_phone(&[0]);
+        world.driver_online(0);
+        world.monitors.last_mut().unwrap().virtual_display_id = None;
+        world.keep_online_on_remove.insert(0);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.timings.offline = Duration::ZERO;
+        assert!(is_online_of(&screen.api, &screen.maps, 0));
+        assert!(!screen.retire(0));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(!screen.retire(1), "不能删除没有内存映射和归属记录的编号");
+        assert_eq!(shared.lock().unwrap().removed, vec![0]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn set_mode_only_touches_what_changed() {
         let (mut screen, shared) = screen(world_with_phone(&[0]));
         screen.create(ScreenFit::standard()).expect("建屏成功");
@@ -2815,6 +2959,27 @@ mod tests {
             "管道恢复后还要靠这本账清理，不能清空"
         );
 
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cleanup_keeps_only_the_ownership_of_monitors_still_online() {
+        let path = owned_path("cleanup-partial");
+        let store = OwnedDisplayStore::new(&path);
+        store.record_owned(0);
+        store.record_owned(1);
+        let mut world = world_with_phone(&[0, 1]);
+        world.driver_online(0);
+        world.driver_online(1);
+        world.keep_online_on_remove.insert(1);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.cleanup_orphans();
+        assert_eq!(store.load_ids(), vec![1]);
+        assert!(is_online_of(&screen.api, &screen.maps, 1));
+        assert!(!is_online_of(&screen.api, &screen.maps, 0));
+        shared.lock().unwrap().keep_online_on_remove.clear();
+        screen.cleanup_orphans();
+        assert!(store.load_ids().is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

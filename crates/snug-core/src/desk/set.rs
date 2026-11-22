@@ -121,7 +121,7 @@ impl DeskSet {
         self.wishes = wishes.clone();
         let next_keys: Vec<String> = wishes.iter().map(|wish| DeskHub::key(&wish.id)).collect();
 
-        // 1) 消失的屏：先入队撤屏，再把 core 从共享队列里摘掉。
+        // 1) 消失的屏：先入队撤屏，再从活跃集合摘掉；未下线的 core 留给定时善后。
         let stale: Vec<String> = self
             .desks
             .keys()
@@ -275,12 +275,14 @@ impl DeskSet {
         for desk in self.desks.values() {
             desk.settle_displays();
         }
+        self.lane.run(|hub: &mut DeskHub| hub.settle_retired());
     }
 
     pub fn displays_changed(&self) {
         for desk in self.desks.values() {
             desk.displays_changed();
         }
+        self.lane.run(|hub: &mut DeskHub| hub.settle_retired());
     }
 
     pub fn show_list(&self, screen_id: Option<&str>) {
@@ -594,6 +596,57 @@ mod tests {
         assert!(harness.set.state_of("c").is_none());
         assert!(!harness.displays.is_online(c_display), "撤掉的 desk 要把屏也撤了");
         assert_eq!(harness.displays.screen_count(), 1);
+    }
+
+    #[test]
+    fn removed_desk_retries_failed_retirement_without_an_active_wish() {
+        let mut harness = DeskSetHarness::new();
+        harness.set.set_remote(true);
+        harness.set.set_wishes(vec![harness.wish("a")]);
+        harness.set.idle();
+        let display = harness.set.state_of("a").unwrap().display_id.unwrap();
+        harness.displays.fail_retires(1);
+
+        harness.set.set_wishes(Vec::new());
+        harness.set.idle();
+        assert!(harness.set.is_empty());
+        assert!(harness.displays.is_online(display));
+        assert_eq!(harness.displays.retire_calls(), 1);
+
+        // 普通心跳不应无间隔重发删除命令，也不依赖屏幕拓扑产生变化。
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert_eq!(harness.displays.retire_calls(), 1);
+        harness.timeline.advance(5.0);
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert!(!harness.displays.is_online(display));
+        assert_eq!(harness.displays.retire_calls(), 2);
+        harness.timeline.advance(5.0);
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert_eq!(harness.displays.retire_calls(), 2, "成功后释放善后记录");
+    }
+
+    #[test]
+    fn reconnecting_same_wish_does_not_discard_old_screen_retirement() {
+        let mut harness = DeskSetHarness::new();
+        harness.set.set_remote(true);
+        harness.set.set_wishes(vec![harness.wish("a")]);
+        harness.set.idle();
+        let old = harness.set.state_of("a").unwrap().display_id.unwrap();
+        harness.displays.fail_retires(1);
+        harness.set.set_wishes(Vec::new());
+        harness.set.idle();
+        harness.set.set_wishes(vec![harness.wish("a")]);
+        harness.set.idle();
+        let new = harness.set.state_of("a").unwrap().display_id.unwrap();
+        assert_ne!(old, new);
+        harness.timeline.advance(5.0);
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert!(!harness.displays.is_online(old));
+        assert!(harness.displays.is_online(new));
     }
 
     #[test]

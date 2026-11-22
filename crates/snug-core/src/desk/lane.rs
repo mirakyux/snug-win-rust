@@ -10,6 +10,7 @@
 //! 这里不吞 panic——动作里 panic 说明是代码 bug，工作线程随之退出（测试会直接暴露），
 //! 不做"带病继续"的掩盖。
 
+use std::io::Write;
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
@@ -18,6 +19,11 @@ use std::thread::JoinHandle;
 /// 界面里"点了没反应"最常见的原因就是队列积压或单个动作过慢（改显示配置、枚举窗口），
 /// 正常动作都是毫秒级，超过 3 秒一定有问题。真机联调时把 stderr 重定向到文件即可看到。
 const SLOW_THRESHOLD: f64 = 3.0;
+
+/// 启动终端退出后 stderr 可能已经断开；诊断输出失败不能终止桌面工作线程。
+fn write_diagnostic(writer: &mut impl Write, message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{message}");
+}
 
 enum LaneJob<T> {
     Run {
@@ -71,13 +77,19 @@ impl<T: Send + 'static> SerialLane<T> {
                             // 还得靠时间戳猜是哪一个。
                             let waited = queued_at.elapsed().as_secs_f64();
                             if waited > SLOW_THRESHOLD {
-                                eprintln!("[lane] 动作排队 {waited:.1}s 才轮到（{}）", where_of(site));
+                                write_diagnostic(
+                                    &mut std::io::stderr().lock(),
+                                    format_args!("[lane] 动作排队 {waited:.1}s 才轮到（{}）", where_of(site)),
+                                );
                             }
                             let started = std::time::Instant::now();
                             run(&mut state);
                             let took = started.elapsed().as_secs_f64();
                             if took > SLOW_THRESHOLD {
-                                eprintln!("[lane] 单个动作执行了 {took:.1}s（{}）", where_of(site));
+                                write_diagnostic(
+                                    &mut std::io::stderr().lock(),
+                                    format_args!("[lane] 单个动作执行了 {took:.1}s（{}）", where_of(site)),
+                                );
                             }
                             if let Some(done) = done {
                                 let _ = done.send(());
@@ -217,6 +229,31 @@ mod tests {
             sink.store(state.len(), Ordering::SeqCst);
         });
         assert_eq!(seen.load(Ordering::SeqCst), 100);
+        lane.stop();
+    }
+
+    #[test]
+    fn broken_diagnostic_pipe_does_not_stop_later_jobs() {
+        struct ClosedPipe;
+        impl Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lane = SerialLane::spawn(0u32);
+        lane.run(|state| {
+            write_diagnostic(&mut ClosedPipe, format_args!("slow diagnostic"));
+            *state += 1;
+        });
+        let (done, received) = channel();
+        lane.run(move |state| {
+            *state += 1;
+            let _ = done.send(*state);
+        });
+        assert_eq!(received.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), 2);
         lane.stop();
     }
 

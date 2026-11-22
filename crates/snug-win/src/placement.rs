@@ -27,6 +27,8 @@ pub const WS_EX_TRANSPARENT: i32 = 0x0000_0020;
 pub const WS_EX_NOACTIVATE: i32 = 0x0800_0000;
 /// 工具窗口：不进任务栏、不参与 Alt+Tab（`WS_EX_TOOLWINDOW`）。
 pub const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
+/// 置顶窗口（`WS_EX_TOPMOST`）；由 `SetWindowPos` 管理。
+const WS_EX_TOPMOST: i32 = 0x0000_0008;
 
 /// `SetWindowPos` 的 `HWND_TOPMOST`。
 pub const HWND_TOPMOST: isize = -1;
@@ -117,7 +119,35 @@ pub fn needs_reposition(
     current != Some(target)
 }
 
-/// 把摆放请求应用到真实窗口。返回 `false` 表示句柄已经失效。
+fn matches_style(current: i32, request: &PlacementRequest) -> bool {
+    current == desired_ex_style(current, request.no_activate, request.passthrough)
+        && (current & WS_EX_TOPMOST != 0) == request.topmost
+}
+
+/// 只读核对窗口是否仍然可见、处于目标矩形，并保留请求的置顶与输入样式。
+///
+/// 矩形没变也可能被隐藏或取消置顶；界面不能只凭上次摆放的缓存跳过修复。
+/// `tolerance` 是物理像素容差，不枚举窗口或显示器。
+pub fn matches(hwnd: u64, request: &PlacementRequest, tolerance: f64) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let window = HWND(hwnd as usize as *mut core::ffi::c_void);
+    unsafe {
+        if !IsWindow(Some(window)).as_bool() || !IsWindowVisible(window).as_bool() {
+            return false;
+        }
+        if !matches_style(GetWindowLongPtrW(window, GWL_EXSTYLE) as i32, request) {
+            return false;
+        }
+    }
+    current_window_rect(window).is_some_and(|(x, y, width, height)| {
+        Rect::new(x as f64, y as f64, width as f64, height as f64)
+            .matches(request.bounds, tolerance)
+    })
+}
+
+/// 把摆放请求应用到真实窗口。句柄无效或 Win32 摆放失败时返回 `false`。
 pub fn apply(hwnd: u64, request: &PlacementRequest) -> bool {
     if hwnd == 0 {
         return false;
@@ -133,6 +163,9 @@ pub fn apply(hwnd: u64, request: &PlacementRequest) -> bool {
         let style_changed = desired != current_ex;
         if style_changed {
             SetWindowLongPtrW(window, GWL_EXSTYLE, desired as isize);
+            if GetWindowLongPtrW(window, GWL_EXSTYLE) as i32 != desired {
+                return false;
+            }
         }
 
         let target = placement_rect(request.bounds);
@@ -141,7 +174,7 @@ pub fn apply(hwnd: u64, request: &PlacementRequest) -> bool {
 
         if needs_reposition(
             was_visible,
-            style_changed,
+            style_changed || !matches_style(current_ex, request),
             request.focus_if_activated,
             current_rect,
             target,
@@ -150,7 +183,7 @@ pub fn apply(hwnd: u64, request: &PlacementRequest) -> bool {
             let flags = windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(
                 set_window_pos_flags(request.no_activate),
             );
-            let _ = SetWindowPos(
+            if SetWindowPos(
                 window,
                 Some(insert),
                 target.0,
@@ -158,7 +191,11 @@ pub fn apply(hwnd: u64, request: &PlacementRequest) -> bool {
                 target.2,
                 target.3,
                 flags,
-            );
+            )
+            .is_err()
+            {
+                return false;
+            }
         }
 
         if !request.no_activate && request.focus_if_activated {
@@ -260,7 +297,38 @@ mod tests {
     }
 
     #[test]
+    fn matching_rect_still_repositions_when_topmost_or_input_styles_are_lost() {
+        let bounds = Rect::new(100.0, 200.0, 540.0, 960.0);
+        let request = PlacementRequest::new(bounds);
+        let target = placement_rect(bounds);
+        let expected = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+        assert!(matches_style(expected, &request));
+        assert!(!needs_reposition(
+            true,
+            !matches_style(expected, &request),
+            false,
+            Some(target),
+            target
+        ));
+        for lost in [WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST] {
+            let changed = !matches_style(expected & !lost, &request);
+            assert!(
+                changed,
+                "missing style {lost:#x} must invalidate the placement"
+            );
+            assert!(needs_reposition(true, changed, false, Some(target), target));
+        }
+        assert!(!matches_style(expected | WS_EX_TRANSPARENT, &request));
+
+        let mut non_topmost = request;
+        non_topmost.topmost = false;
+        assert!(!matches_style(expected, &non_topmost));
+        assert!(matches_style(expected & !WS_EX_TOPMOST, &non_topmost));
+    }
+
+    #[test]
     fn apply_rejects_a_dead_handle() {
         assert!(!apply(0, &PlacementRequest::new(Rect::ZERO)));
+        assert!(!matches(0, &PlacementRequest::new(Rect::ZERO), 2.0));
     }
 }

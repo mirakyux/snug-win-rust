@@ -114,7 +114,7 @@ impl ControllerDiagnosis {
         match self {
             Self::NoVisibleWindow => "GameViewer 没有可见顶层窗口（在托盘时属正常）",
             Self::ComFailed => "UIA COM 初始化失败",
-            Self::UiaUnreadable => "UIA 遍历未读出内容（可能超预算或窗口刚关闭）",
+            Self::UiaUnreadable => "UIA 未读到可识别的被控端列表（界面未匹配、窗口不可读或读取超限）",
         }
     }
 }

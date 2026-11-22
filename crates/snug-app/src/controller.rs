@@ -218,14 +218,9 @@ impl Controller {
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let pending: Arc<std::sync::Mutex<Vec<DeskAction>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        // 先把上次没撤干净的虚拟屏清掉（C# `CleanupOrphansAsync`）。真机上撞到过：
-        // 进程被强杀后虚拟屏留在桌面上，下次启动必须先收尸。
-        displays.cleanup_orphans();
-        // 再还上次没还回去的窗口（C# `AppController.Start` 里 `_desks.Recover()` 在
-        // 第一条 `SetWishes` 之前），否则崩溃/强杀之后那些窗口会留在虚拟屏坐标上。
-        if let Ok(desks) = desks.lock() {
-            desks.recover();
-        }
+        // 清理可能等待系统 UAC：放到控制线程，在第一条 wish 前完成，
+        // 不让它挡住主线程上的界面与托盘创建。
+        let startup_displays = displays.clone();
         // 注意：这里**不**按 `config.phone_screen` 直接开屏。C# 的 `SetWishes` 由
         // `OnTick` 每秒按会话算一次（见下面 worker），启动时没有任何 wish、
         // 屏幕要等第一段远程会话才建。移植时漏了这一层，真机表现是"退出远控后
@@ -285,6 +280,10 @@ impl Controller {
         let worker = match std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
+                startup_displays.cleanup_orphans();
+                if let Ok(desks) = desks_worker.lock() {
+                    desks.recover();
+                }
                 // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
                 // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
                 use snug_win::display::DisplayApi;
@@ -450,6 +449,10 @@ impl Controller {
                     }
                     if now - last_topology_check >= 2.0 {
                         last_topology_check = now;
+                        // 删除请求失败时拓扑不会变化，善后仍需定时推进。
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.settle_displays();
+                        }
                         let topology: Vec<(u32, i32, i32, i32, i32)> = display
                             .active_monitors()
                             .iter()
@@ -692,13 +695,17 @@ impl Controller {
     /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
     pub fn show_list_of(&self, screen_id: Option<&str>) {
         if let Some(id) = self.resolve_screen(screen_id) {
+            crate::info!("应用列表：请求显示（屏 {id}）");
             self.enqueue(move |desks| desks.show_list(Some(&id)));
+        } else {
+            crate::warn!("应用列表：当前没有可用屏幕");
         }
     }
 
     /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
     pub fn return_to_placed_of(&self, screen_id: Option<&str>) {
         if let Some(id) = self.resolve_screen(screen_id) {
+            crate::info!("应用列表：返回当前窗口（屏 {id}）");
             self.enqueue(move |desks| desks.return_to_placed(Some(&id)));
         }
     }

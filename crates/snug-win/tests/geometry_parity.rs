@@ -6,6 +6,8 @@
 //! 为什么要有这层：`screen_fit` / `crop` / `placement` 的边界（四舍五入、夹取、
 //! 容差、1 像素）最容易“自己写测试自己过”——测试和实现是同一个人的两个假设。
 //! 跟原版 C# 对拍才能证明移植没走样。
+//! 手机触控版的底栏有意改为 400 点短边设计下的 60 点，不再与 C# 的 28 点相等；
+//! BAR 行继续核对原窗口倍率和旧真值的口径，新底栏由 core/display 与 UI 尺度回归覆盖。
 //!
 //! v1.3 起 `ScreenFit` 多了设备种类与方向：`screen_fit.tsv` 里除原有的
 //! FIT/SIZE/PIXEL/RATIO/FITTO/BAR 记录外，还有 DEVICE/DEVSIZE/DEVPIXEL/DEVDI/
@@ -126,7 +128,7 @@ fn optional_number(field: &str) -> Option<f64> {
 }
 
 #[test]
-fn screen_fit_matches_the_csharp_reference() {
+fn screen_fit_matches_the_csharp_reference_except_touch_bar() {
     let Some(text) = reference_file("screen_fit.tsv") else { return };
     let mut checked = 0usize;
     let mut device_rows = 0usize;
@@ -198,9 +200,9 @@ fn screen_fit_matches_the_csharp_reference() {
                 let screen_width = number(fields[1]);
                 close(ScreenFit::scale(screen_width), number(fields[2]), "scale");
                 close(
-                    ScreenFit::home_bar_height(screen_width),
+                    (28.0 * ScreenFit::scale(screen_width)).round(),
                     number(fields[3]),
-                    "home_bar_height",
+                    "legacy home_bar fixture (intentional mobile UI deviation)",
                 );
             }
             // ---- v1.3：设备种类 × 方向（FromDevice） ----

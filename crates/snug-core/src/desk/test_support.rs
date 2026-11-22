@@ -679,6 +679,8 @@ pub struct FakeMultiDisplays {
     overlapped: AtomicBool,
     create_delay_micros: AtomicU64,
     fail_creates: AtomicUsize,
+    fail_retires: AtomicUsize,
+    retire_calls: AtomicUsize,
     main: Rect,
 }
 
@@ -698,12 +700,22 @@ impl Default for FakeMultiDisplays {
             overlapped: AtomicBool::new(false),
             create_delay_micros: AtomicU64::new(0),
             fail_creates: AtomicUsize::new(0),
+            fail_retires: AtomicUsize::new(0),
+            retire_calls: AtomicUsize::new(0),
             main: Rect::new(0.0, 0.0, 1920.0, 1040.0),
         }
     }
 }
 
 impl FakeMultiDisplays {
+    pub fn fail_retires(&self, times: usize) {
+        self.fail_retires.store(times, Ordering::SeqCst);
+    }
+
+    pub fn retire_calls(&self) -> usize {
+        self.retire_calls.load(Ordering::SeqCst)
+    }
+
     pub fn fail_creates(&self, times: usize) {
         self.fail_creates.store(times, Ordering::SeqCst);
     }
@@ -776,6 +788,11 @@ impl PhoneDisplays for FakeMultiDisplays {
     }
 
     fn retire(&self, display_id: u32) -> bool {
+        self.retire_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_retires.load(Ordering::SeqCst) > 0 {
+            self.fail_retires.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
         self.screens.lock().expect("screens").remove(&display_id).is_some()
     }
 

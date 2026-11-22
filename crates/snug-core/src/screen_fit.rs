@@ -17,6 +17,8 @@ use crate::geometry::Size;
 use crate::phone_models::{DeviceKind, ScreenOrientation};
 
 pub const DESIGN_WIDTH: f64 = 540.0;
+/// 手机触控界面的短边设计宽度；与窗口档位的 540 点基准分别维护。
+pub const TOUCH_DESIGN_WIDTH: f64 = 400.0;
 /// 横屏设备的最短长边（保证铺满后仍有 800 点可用宽）。
 pub const MIN_LONG_SIDE: i32 = 800;
 /// 竖屏设备的最短短边。
@@ -45,7 +47,8 @@ const ASSUMED_POINTS: f64 = 400.0;
 const ASSUMED_TABLET_POINTS: f64 = 800.0;
 /// 平板基准宽比逻辑宽度小一点，铺满后留出工具栏。
 const TABLET_SCALE: f64 = 1.24;
-const BASE_HOME_BAR_HEIGHT: f64 = 28.0;
+/// 48 点触控按钮与上下各 6 点留白。
+const BASE_HOME_BAR_HEIGHT: f64 = 60.0;
 
 /// 一款设备的屏幕规格（`assets/phone-models.json` 里的一条）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,14 +342,14 @@ impl ScreenFit {
         screen.width.min(screen.height) / DESIGN_WIDTH
     }
 
-    /// 底部指示条高度，随屏幕宽度等比放大。
+    /// 底部触控栏高度，按 400 点触控设计宽度等比放大。
     pub fn home_bar_height(screen_width: f64) -> f64 {
-        round_away_zero(BASE_HOME_BAR_HEIGHT * Self::scale(screen_width))
+        round_away_zero(BASE_HOME_BAR_HEIGHT * screen_width / TOUCH_DESIGN_WIDTH)
     }
 
-    /// 按屏幕尺寸算底部指示条高度（C# `HomeBarHeight(SizeD)`）。
+    /// 按短边算底部触控栏高度，横竖屏使用相同的触控尺度。
     pub fn home_bar_height_of(screen: Size) -> f64 {
-        round_away_zero(BASE_HOME_BAR_HEIGHT * Self::scale_of(screen))
+        Self::home_bar_height(screen.width.min(screen.height))
     }
 
     /// 桌面预览的缩放布局（C# `ComputePreviewLayout`）：返回设计宽、设计高、缩放系数。
@@ -445,11 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn scale_and_home_bar_height_match_spec() {
+    fn scale_and_touch_home_bar_use_distinct_design_widths() {
         assert_eq!(ScreenFit::scale(540.0), 1.0);
         assert_eq!(ScreenFit::scale(1080.0), 2.0);
-        assert_eq!(ScreenFit::home_bar_height(540.0), 28.0);
-        assert_eq!(ScreenFit::home_bar_height(1080.0), 56.0);
+        assert_eq!(ScreenFit::home_bar_height(400.0), 60.0);
+        assert_eq!(ScreenFit::home_bar_height(540.0), 81.0);
+        assert_eq!(ScreenFit::home_bar_height(1080.0), 162.0);
     }
 
     #[test]
@@ -633,6 +637,7 @@ mod tests {
     #[test]
     fn scale_of_uses_the_shorter_side() {
         assert_eq!(ScreenFit::scale_of(Size::new(1080.0, 1920.0)), 2.0);
-        assert_eq!(ScreenFit::home_bar_height_of(Size::new(1080.0, 1920.0)), 56.0);
+        assert_eq!(ScreenFit::home_bar_height_of(Size::new(1080.0, 1920.0)), 162.0);
+        assert_eq!(ScreenFit::home_bar_height_of(Size::new(1920.0, 1080.0)), 162.0);
     }
 }

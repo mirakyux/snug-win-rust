@@ -38,7 +38,7 @@ pub use screenshot::{WinScreenshot, WinScreens};
 pub use uu::{UuProbe, UuSensor, UuSignalSet};
 pub use display::{AdapterLuid, MonitorSnapshot, WinDisplay, WinPhoneDisplays};
 pub use elevation::{is_elevated, restart_elevated};
-pub use placement::{PlacementRequest, apply as apply_placement};
+pub use placement::{PlacementRequest, apply as apply_placement, matches as placement_matches};
 pub use startup::{StartupError, StartupService};
 pub use touch::{HookEngine, TouchHook, WinInput};
 pub use uia::{Uia, UiaCloseButtons};

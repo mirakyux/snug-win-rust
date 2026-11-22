@@ -13,12 +13,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use snug_core::Point;
+use snug_core::{Point, Rect};
+use snug_win::display::DisplayApi;
 
 /// 气泡在屏幕上停留多久（C# `DispatcherTimer` 5.5 秒）。
 const LINGER: Duration = Duration::from_millis(5_500);
-/// 气泡尺寸（点）。C# 里最小 160×36 物理像素。
-const BUBBLE_SIZE: egui::Vec2 = egui::vec2(104.0, 38.0);
+/// 气泡尺寸（点）：120 点复制区 + 64 点取消区、8 点间隔及左右各 16 点边距。
+const BUBBLE_SIZE: egui::Vec2 = egui::vec2(224.0, 64.0);
+const COPY_SIZE: egui::Vec2 = egui::vec2(120.0, 48.0);
+const CANCEL_SIZE: egui::Vec2 = egui::vec2(64.0, 48.0);
+
+/// 先放在选区上方；靠近上边缘时改放下方，再夹进当前显示器工作区。
+fn bubble_origin(at: Point, ppp: f64, work_area: Option<Rect>) -> Point {
+    let width = f64::from(BUBBLE_SIZE.x) * ppp;
+    let height = f64::from(BUBBLE_SIZE.y) * ppp;
+    let gap = 18.0 * ppp;
+    let mut point = Point::new(at.x - width / 2.0, at.y - height - gap);
+    if let Some(work) = work_area {
+        if point.y < work.min_y() {
+            point.y = at.y + gap;
+        }
+        point.x = point.x.clamp(work.min_x(), work.min_x().max(work.max_x() - width));
+        point.y = point.y.clamp(work.min_y(), work.min_y().max(work.max_y() - height));
+    }
+    point
+}
 
 /// 气泡与主窗口共享的状态。deferred viewport 的回调要求 `'static`，
 /// 所以点没点、要不要收起来都放这里。
@@ -39,6 +58,8 @@ pub struct CopyBubble {
     deadline: Option<Instant>,
     /// 这次气泡是不是已经处理过点击了。
     handled: bool,
+    /// 同一次弹出只查一次显示器边界，不在每帧枚举 CCD/PnP。
+    origin: Option<Point>,
 }
 
 impl Default for CopyBubble {
@@ -58,6 +79,7 @@ impl CopyBubble {
             visible: false,
             deadline: None,
             handled: false,
+            origin: None,
         }
     }
 
@@ -72,6 +94,7 @@ impl CopyBubble {
         self.shared.dismissed.store(false, Ordering::Relaxed);
         self.visible = true;
         self.handled = false;
+        self.origin = None;
         self.deadline = Some(Instant::now() + LINGER);
     }
 
@@ -80,6 +103,7 @@ impl CopyBubble {
         self.visible = false;
         self.deadline = None;
         self.handled = false;
+        self.origin = None;
         *self.shared.at.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -97,13 +121,17 @@ impl CopyBubble {
         }
         let at = (*self.shared.at.lock().unwrap_or_else(|e| e.into_inner()))?;
 
-        // 物理像素 → 点。气泡很小，用主视口的缩放比就够。
+        // 物理像素 → 点；与主视口一致，气泡本身仍由独立 viewport 承担。
         let ppp = ctx.pixels_per_point().max(0.5) as f64;
-        let width = BUBBLE_SIZE.x as f64 * ppp;
-        let height = BUBBLE_SIZE.y as f64 * ppp;
-        let x = at.x - width / 2.0;
-        // 放在选区上方 18 物理像素处（C# `selectionPoint.Y - pxH - 18 * dpiRatio`）。
-        let y = at.y - height - 18.0 * ppp;
+        let origin = *self.origin.get_or_insert_with(|| {
+            let monitors = snug_win::WinDisplay::new().active_monitors();
+            let work_area = monitors
+                .iter()
+                .find(|monitor| monitor.bounds.contains(at))
+                .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
+                .map(|monitor| monitor.work_area);
+            bubble_origin(at, ppp, work_area)
+        });
 
         let shared = self.shared.clone();
         let builder = egui::ViewportBuilder::default()
@@ -112,27 +140,29 @@ impl CopyBubble {
             .with_resizable(false)
             .with_always_on_top()
             .with_inner_size(BUBBLE_SIZE)
-            .with_position([(x / ppp) as f32, (y / ppp) as f32]);
+            .with_position([(origin.x / ppp) as f32, (origin.y / ppp) as f32]);
 
         let mut outcome = None;
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("snug-copy-bubble"),
             builder,
             move |ctx, _class| {
+                let p = crate::theme::palette(ctx.style().visuals.dark_mode);
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(28, 30, 36))
-                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)))
-                            .inner_margin(egui::Margin::symmetric(6, 4))
-                            .corner_radius(8.0),
+                            .fill(p.card)
+                            .stroke(egui::Stroke::new(1.0_f32, p.text_weak))
+                            .inner_margin(egui::Margin::symmetric(16, 8))
+                            .corner_radius(12.0),
                     )
                     .show(ctx, |ui| {
                         ui.horizontal_centered(|ui| {
-                            if ui.small_button("复制").clicked() {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if ui.add_sized(COPY_SIZE, egui::Button::new("复制")).clicked() {
                                 shared.clicked.store(true, Ordering::Relaxed);
                             }
-                            if ui.small_button("×").clicked() {
+                            if ui.add_sized(CANCEL_SIZE, egui::Button::new("取消")).clicked() {
                                 shared.dismissed.store(true, Ordering::Relaxed);
                             }
                         });
@@ -176,5 +206,26 @@ mod tests {
     fn deadline_is_five_and_a_half_seconds() {
         // C# 是 5.5 秒；这里只钉住这个数，别在改 UI 时被顺手调掉。
         assert_eq!(LINGER.as_millis(), 5500);
+    }
+
+    #[test]
+    fn bubble_flips_below_selection_and_stays_inside_a_negative_origin_monitor() {
+        let work = Rect::new(-1920.0, 0.0, 1920.0, 1040.0);
+        let point = bubble_origin(Point::new(-1910.0, 8.0), 1.0, Some(work));
+        assert_eq!(point, Point::new(-1920.0, 26.0));
+        let right_bottom = bubble_origin(Point::new(-2.0, 1030.0), 1.0, Some(work));
+        assert!(right_bottom.x + f64::from(BUBBLE_SIZE.x) <= work.max_x());
+        assert!(right_bottom.y + f64::from(BUBBLE_SIZE.y) <= work.max_y());
+    }
+
+    #[test]
+    fn bubble_fits_scaled_monitor_without_overlapping_action_targets() {
+        let work = Rect::new(1920.0, 0.0, 1080.0, 1900.0);
+        let point = bubble_origin(Point::new(2990.0, 5.0), 2.0, Some(work));
+        assert!(point.x >= work.min_x());
+        assert!(point.x + f64::from(BUBBLE_SIZE.x) * 2.0 <= work.max_x());
+        assert_eq!(point.y, 41.0);
+        assert!(COPY_SIZE.y >= 48.0 && CANCEL_SIZE.y >= 48.0 && CANCEL_SIZE.x >= 48.0);
+        assert_eq!(COPY_SIZE.x + 8.0 + CANCEL_SIZE.x + 32.0, BUBBLE_SIZE.x);
     }
 }

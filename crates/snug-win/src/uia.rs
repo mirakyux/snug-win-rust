@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 
-use snug_core::session::{ControllerTable, ControllerTableParser, UuElement};
+use snug_core::session::{ControllerTable, ControllerTableParser, UuElement, PAGE_TITLE};
 use snug_core::Rect;
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
@@ -42,6 +42,8 @@ pub const UIA_LIST: i32 = 50008;
 pub const UIA_MENU_ITEM: i32 = 50011;
 /// UIA 控件类型：文本。
 pub const UIA_TEXT: i32 = 50020;
+/// UIA 控件类型：组。当前 Qt 版 UU 用精确的 AutomationId 标识控制表和行。
+pub const UIA_GROUP: i32 = 50026;
 /// UIA 控件类型：数据网格。
 pub const UIA_DATA_GRID: i32 = 50028;
 /// UIA 控件类型：数据项。
@@ -177,7 +179,30 @@ pub fn snapshot(
         return None;
     }
 
-    match node_kind(root.control_type()) {
+    let control_type = root.control_type();
+    if control_type == UIA_GROUP {
+        match root.automation_id().as_str() {
+            "ControllerInfoView.ControllerItemWidget" => {
+                return Some(UuElement::row_node(children));
+            }
+            "ControllerInfoView" if children.iter().any(|child| {
+                matches!(child, UuElement::Text { text } if text == PAGE_TITLE)
+            }) => {
+                // The current Qt client exposes direct controller groups rather than
+                // Table/DataItem controls. Keep its real header in this container;
+                // only its direct, precisely identified rows become the sibling table
+                // required by the core parser. Other groups remain ordinary containers.
+                let (rows, mut content): (Vec<_>, Vec<_>) = children
+                    .into_iter()
+                    .partition(|child| matches!(child, UuElement::Row { .. }));
+                content.push(UuElement::table_node(rows));
+                return Some(UuElement::other_node(content));
+            }
+            _ => {}
+        }
+    }
+
+    match node_kind(control_type) {
         NodeKind::Text => {
             let name = root.name();
             if name.trim().is_empty() {
@@ -607,6 +632,91 @@ mod tests {
         let table = read_controllers(&[Box::new(window)]);
         assert_eq!(table.names, vec!["iPhone 17 Pro".to_string()]);
         assert!(table.readable);
+    }
+
+    /// Sanitized Qt tree observed on the current UU client. Qt exposes groups,
+    /// not the UIA Table/DataItem types used by the older client.
+    fn qt_controller_item(mark: &str) -> FakeNode {
+        FakeNode::new(50026, "")
+            .with_id("ControllerInfoView.ControllerItemWidget")
+            .with_children(vec![
+                FakeNode::text("Test Phone")
+                    .with_id("ControllerInfoView.ControllerItemWidget.controllerNameLabel"),
+                FakeNode::new(50026, "")
+                    .with_id("ControllerInfoView.ControllerItemWidget.controllerPlatform"),
+                FakeNode::text(mark)
+                    .with_id("ControllerInfoView.ControllerItemWidget.remoteLabel"),
+                FakeNode::new(UIA_BUTTON, "断开远控"),
+                FakeNode::text("连接时长 00:12")
+                    .with_id("ControllerInfoView.ControllerItemWidget.controllTimeLabel"),
+            ])
+    }
+
+    fn qt_controller_view(children: Vec<FakeNode>) -> FakeNode {
+        FakeNode::new(50026, "")
+            .with_id("ControllerInfoView")
+            .with_children(children)
+    }
+
+    fn qt_controlled_title() -> FakeNode {
+        FakeNode::text("本机被控中").with_id("ControllerInfoView.titleLabel")
+    }
+
+    #[test]
+    fn qt_controller_groups_feed_the_strict_core_parser() {
+        let view = qt_controller_view(vec![
+            FakeNode::text("本账号设备"),
+            FakeNode::new(UIA_BUTTON, "断开所有远控"),
+            qt_controlled_title(),
+            FakeNode::text("当前有1台设备正在控制此电脑"),
+            qt_controller_item("远程控制"),
+        ]);
+        let window = FakeNode::new(0, "UU")
+            .with_id("HomePageMainWindow")
+            .with_children(vec![view]);
+        let table = read_controllers(&[Box::new(window)]);
+        assert!(table.readable);
+        assert_eq!(table.names, vec!["Test Phone".to_string()]);
+    }
+
+    #[test]
+    fn qt_groups_without_the_known_view_are_not_a_control_table() {
+        let generic = FakeNode::new(50026, "")
+            .with_id("UnrelatedView")
+            .with_children(vec![qt_controlled_title(), qt_controller_item("远程控制")]);
+        assert_eq!(read_controllers(&[Box::new(generic)]), ControllerTable::unreadable());
+    }
+
+    #[test]
+    fn qt_controller_view_requires_its_real_direct_header() {
+        let missing = qt_controller_view(vec![qt_controller_item("远程控制")]);
+        assert_eq!(read_controllers(&[Box::new(missing)]), ControllerTable::unreadable());
+        let unrelated_header = FakeNode::new(0, "UU").with_children(vec![
+            qt_controlled_title(),
+            qt_controller_view(vec![qt_controller_item("远程控制")]),
+        ]);
+        assert_eq!(read_controllers(&[Box::new(unrelated_header)]), ControllerTable::unreadable());
+    }
+
+    #[test]
+    fn qt_controller_row_still_requires_the_remote_control_mark() {
+        let view = qt_controller_view(vec![qt_controlled_title(), qt_controller_item("远程协助")]);
+        let table = read_controllers(&[Box::new(view)]);
+        assert!(table.readable);
+        assert!(table.names.is_empty());
+    }
+
+    #[test]
+    fn qt_empty_known_controlled_page_is_a_readable_empty_table() {
+        let view = qt_controller_view(vec![qt_controlled_title()]);
+        assert_eq!(read_controllers(&[Box::new(view)]), ControllerTable::unrecognized());
+    }
+
+    #[test]
+    fn qt_generic_group_with_remote_text_is_not_a_controller_row() {
+        let row = qt_controller_item("远程控制").with_id("SomeOtherItem");
+        let view = qt_controller_view(vec![qt_controlled_title(), row]);
+        assert_eq!(read_controllers(&[Box::new(view)]), ControllerTable::unrecognized());
     }
 
     #[test]

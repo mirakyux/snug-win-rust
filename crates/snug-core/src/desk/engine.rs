@@ -48,6 +48,8 @@ pub const MINIMUM_LIFETIME: f64 = 2.5;
 const TOPOLOGY_SETTLE: f64 = 1.0;
 /// C# `RetryDelays`。
 const RETRY_DELAYS: [f64; 3] = [5.0, 15.0, 30.0];
+/// 删除命令失败或系统尚未下线时，限制再次发送删除命令的频率。
+const RETIRE_RETRY_DELAY: f64 = 5.0;
 /// C# SettleDelay：摆好/改字号后等一下再继续。
 const SETTLE_DELAY: f64 = 0.3;
 /// 收尾时等"撤屏"这条动作的上限。超过就不等了：一次在飞的建屏可能 8 秒 × 4 个候选，
@@ -151,6 +153,7 @@ struct Retiring {
     id: u32,
     before: Surroundings,
     permanently: bool,
+    retry_after: f64,
 }
 
 /// 此刻摆在手机屏上的窗口（对应 C# 私有类 `Placement`）。
@@ -248,6 +251,7 @@ struct DeskShared {
 #[derive(Default)]
 pub(crate) struct DeskHub {
     desks: HashMap<String, DeskCore>,
+    retired: Vec<DeskCore>,
 }
 
 impl DeskHub {
@@ -265,8 +269,21 @@ impl DeskHub {
         self.desks.insert(key, core);
     }
 
-    pub(crate) fn remove(&mut self, id: &str) -> Option<DeskCore> {
-        self.desks.remove(&Self::key(id))
+    pub(crate) fn remove(&mut self, id: &str) {
+        if let Some(core) = self.desks.remove(&Self::key(id)) {
+            // 愿望已消失，但下线确认可能比删除命令晚。保留善后状态，不能随句柄一起丢掉。
+            core.shared.remote.store(false, Ordering::SeqCst);
+            if core.retiring.is_some() || core.persist_owed {
+                self.retired.push(core);
+            }
+        }
+    }
+
+    pub(crate) fn settle_retired(&mut self) {
+        self.retired.retain_mut(|core| {
+            core.settle_displays();
+            core.retiring.is_some() || core.persist_owed
+        });
     }
 
     pub(crate) fn ids(&self) -> Vec<String> {
@@ -275,6 +292,7 @@ impl DeskHub {
 
     pub(crate) fn clear(&mut self) {
         self.desks.clear();
+        self.retired.clear();
     }
 
     /// 跨屏转移：除 `except` 之外，哪块屏正铺着这个窗口就把它摘下来。
@@ -598,7 +616,12 @@ impl Desk {
 
     /// 对应 C# `SettleDisplays`：撤屏后系统还没下线 / 要持久化其它屏模式时善后。
     pub fn settle_displays(&self) {
-        self.inner.slot.run(|core: &mut DeskCore| core.settle_displays());
+        self.inner.slot.run(|core: &mut DeskCore| {
+            core.settle_displays();
+            if core.state().screen_phase == PhoneScreenPhase::Off && core.retiring.is_none() {
+                core.reconcile();
+            }
+        });
     }
 
     /// 对应 C# `Pull`：把某个窗口放上手机屏。
@@ -1116,11 +1139,13 @@ impl DeskCore {
 
     /// 对应 C# `AddScreenAsync`。
     fn add_screen(&mut self) {
+        self.settle_displays();
+        if self.retiring.is_some() {
+            // 同一 desk 重新进入时也必须等旧屏真正下线，避免覆盖旧屏的善后记录。
+            return;
+        }
         self.log("加屏：开始");
         self.set_state(self.state().with_screen_phase(PhoneScreenPhase::Preparing));
-        if let Some(old) = self.retiring.take() {
-            self.warn(format!("上一块手机屏 #{} 还没下线就又要加屏，放弃旧的善后记录", old.id));
-        }
         let before = self.capture_surroundings("加屏");
         self.topology_changing();
         let fit = self.fit();
@@ -1214,14 +1239,19 @@ impl DeskCore {
         if self.remote() {
             self.persist_owed = true;
         }
-        let pending = Retiring { id: display.id, before, permanently: !self.remote() };
+        let pending = Retiring {
+            id: display.id,
+            before,
+            permanently: !self.remote(),
+            retry_after: self.now() + RETIRE_RETRY_DELAY,
+        };
         if offline {
             self.settle(pending.before.clone(), "撤屏", pending.permanently);
+            self.log(format!("已撤掉手机屏 #{}", display.id));
         } else {
             self.retiring = Some(pending);
             self.log(format!("手机屏 #{} 尚未下线，稍后自动善后", display.id));
         }
-        self.log(format!("已撤掉手机屏 #{}", display.id));
     }
 
     /// 对应 C# `CaptureSurroundingsAsync`。
@@ -1330,8 +1360,20 @@ impl DeskCore {
     }
 
     fn settle_displays_inner(&mut self) {
-        if let Some(retiring) = self.retiring.clone() {
+        if let Some(mut retiring) = self.retiring.clone() {
             if self.shared.displays.is_online(retiring.id) {
+                if self.now() < retiring.retry_after {
+                    return;
+                }
+                self.topology_changing();
+                let offline = self.shared.displays.retire(retiring.id);
+                retiring.retry_after = self.now() + RETIRE_RETRY_DELAY;
+                self.retiring = Some(retiring.clone());
+                if !offline {
+                    return;
+                }
+            } else if !self.shared.displays.retire(retiring.id) {
+                // 下线可能发生在上次轮询超时后；让平台完成本地映射和持久归属销账。
                 return;
             }
             self.retiring = None;
@@ -2995,6 +3037,29 @@ mod tests {
         harness.desk.settle_displays();
         harness.desk.idle();
         assert!(!harness.desk.retiring(), "下线后善后完成");
+    }
+
+    #[test]
+    fn reenter_waits_for_pending_retirement_before_creating_another_screen() {
+        let harness = Harness::new();
+        harness.desk.set_wanted(true);
+        harness.desk.idle();
+        harness.displays.keep_online_after_retire();
+        harness.desk.dismiss_screen();
+        harness.desk.idle();
+        assert!(harness.desk.retiring());
+
+        harness.desk.reenter_screen();
+        harness.desk.idle();
+        assert_eq!(harness.displays.create_calls(), 1, "旧屏仍在线时不能覆盖善后记录");
+        assert!(harness.desk.retiring());
+
+        harness.displays.bring_offline();
+        harness.desk.settle_displays();
+        harness.desk.idle();
+        assert_eq!(harness.displays.create_calls(), 2);
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
+        assert!(!harness.desk.retiring());
     }
 
     // ---- 摆放分块 ----
