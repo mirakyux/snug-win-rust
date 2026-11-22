@@ -688,6 +688,34 @@ impl Controller {
         self.enqueue(move |desks| desks.set_default_zoom(steps));
     }
 
+    pub fn restore_placed(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.put_back(Some(&id)));
+    }
+
+    pub fn adjust_zoom(&self, screen_id: Option<&str>, delta: i32) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.zoom(&id, delta));
+    }
+
+    pub fn force_quit(&self, screen_id: Option<&str>, pid: i32, app: String) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.force_quit(&id, pid, &app));
+    }
+
+    pub fn dismiss_notice(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.dismiss_notice(&id));
+    }
+
     /// 把一个 desk 操作排给后台线程（界面线程不在这把锁上等）。
     fn enqueue(&self, action: impl FnOnce(&mut DeskSet) + Send + 'static) {
         match self.pending.lock() {

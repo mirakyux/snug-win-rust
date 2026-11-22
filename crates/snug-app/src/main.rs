@@ -9,6 +9,7 @@ mod driver;
 mod embedded_fonts;
 mod library;
 mod logging;
+mod mobile_library;
 mod privileged;
 mod settings;
 mod theme;
@@ -25,7 +26,29 @@ use snug_core::PhoneCatalog;
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let preview_requested = arguments.iter().any(|argument| argument == "--preview");
+    let preview_settings = arguments.iter().find_map(|argument| {
+        argument
+            .strip_prefix("--preview-settings=")
+            .map(|tab| match tab {
+                "general" => settings::SettingsTab::Home,
+                "interaction" => settings::SettingsTab::Gestures,
+                _ => settings::SettingsTab::Screens,
+            })
+    });
+    let preview_all = arguments.iter().any(|argument| argument == "--preview-all");
+    let preview_search = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--preview-search="))
+        .map(str::to_owned);
+    let preview_output = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--preview-output="))
+        .map(std::path::PathBuf::from);
+    let preview_requested = preview_settings.is_some()
+        || preview_all
+        || preview_search.is_some()
+        || preview_output.is_some()
+        || arguments.iter().any(|argument| argument == "--preview");
     match privileged::dispatch(&arguments) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
@@ -173,6 +196,14 @@ fn main() -> eframe::Result<()> {
             );
             if preview_requested {
                 app.open_preview(&cc.egui_ctx);
+                app.set_preview_library(preview_all, preview_search);
+            }
+            if let Some(tab) = preview_settings {
+                app.settings.select_tab(tab);
+                app.settings.open();
+            }
+            if let Some(path) = preview_output {
+                app.capture_preview_to(path);
             }
             Ok(Box::new(app))
         }),

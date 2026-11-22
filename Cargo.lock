@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "snug-app"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "eframe",
  "snug-core",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "snug-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3012,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "snug-win"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "serde",
  "serde_json",

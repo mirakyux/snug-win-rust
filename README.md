@@ -15,7 +15,7 @@ Snug 是配合网易 UU 远程使用的 Windows 工具。它在电脑上创建�
 
 ## 更新
 
-在设置的「关于与更新」页点击「检查更新」，或开启「启动时自动检查新版本」。程序默认查询本仓库的 GitHub Releases。
+在设置的「通用 → 更新与关于」中点击「检查更新」，或开启「启动时自动检查新版本」。程序默认查询本仓库的 GitHub Releases。
 找到更高版本后，可以从程序内下载并重启更新。自动安装需要普通权限且 EXE 所在目录可写。
 
 如果曾运行本地开发版 `1.3.0`，请先退出旧进程，再用发布版 `v1.0.0` 的 `snug.exe` 替换原文件。
@@ -51,10 +51,23 @@ tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真
 
 ## 功能
 
-v1.0.4 本地候选采用手机触控布局：底部应用导航、多窗口选择及整页设置，
-并修复 UU Qt 控制端识别、后台队列断管崩溃和撤屏失败后的善后。
-桌面可运行 `snug.exe --preview` 查看只读界面；实际手机屏按物理短边统一缩放，
-不会把 Windows 上的桌面字号直接缩小后塞到手机上。预览不能替代真实远控验收。
+v1.0.5 的手机界面按原版的运行中、全部和搜索页面调整：
+顶部使用返回当前 App 的胶囊和屏幕菜单，运行中的 App 卡片直接列出窗口，全部应用采用四列网格，横屏使用 App / 窗口双栏。
+设置精简为「屏幕 / 交互 / 通用」，更新、驱动和日志收在通用页。融合范围与验收要求见 [界面融合记录](docs/ui-fusion-20261122.md)。
+
+桌面可运行 `snug.exe --preview` 查看界面。预览中的资源库动作不会启动、关闭或搬移应用；设置仍可修改真实配置或执行系统操作。
+实际手机屏按物理短边统一缩放。桌面预览用于检查布局，真实远控操作仍需验收。
+
+可直接指定预览页面，并保存当前程序视口的 PNG 截图：
+
+```powershell
+snug.exe --preview-all
+snug.exe --preview-search=edge
+snug.exe --preview-settings=screens    # 也可选 interaction 或 general
+snug.exe --preview --preview-output=preview.png
+```
+
+`--preview-output` 使用 egui 的帧缓冲截图，约 3 秒后写入指定路径；可与上述页面参数组合使用。输出目录需事先存在。
 
 屏幕直接按分辨率配置，不必选择机型。新屏默认 1080×1920，提供常见竖屏、横屏、平板预设和自定义宽高；点击“应用分辨率”才生效，应用切换不会改变分辨率。旧配置保留原有像素尺寸。
 
@@ -70,12 +83,12 @@ v1.0.4 本地候选采用手机触控布局：底部应用导航、多窗口选�
 | 拼音搜索 | `PinyinSearch` | ✅ 已移植 + 单测 |
 | 应用枚举 / 会话判定 | `Apps` `Session/*` `ControllerTable` | ✅ 已移植 + 单测 |
 | 平台层 | `SnugWin.Windows` | ✅ 已移植 + 单测（虚拟屏 IPC / CCD / DWM / 钩子 / UIA / 截图 / 更新） |
-| 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（控制中心设置、主题、重入胶囊、桌面预览） |
+| 界面 | `PhoneHomeWindow` 等 WPF | ✅ egui 重写（触控资源库、三类设置、主题、重入胶囊、桌面预览） |
 
 全仓单测覆盖核心状态机、Win32 适配器、应用与更新事务（数量以当前测试摘要为准），
 `rustc` 零警告是硬门禁，见 [docs/quality.md](docs/quality.md)。
 
-**开机自启**在设置里开（「开机静默自启动」）。它注册一条计划任务
+**开机自启**在设置的「通用」页开启（「登录后后台启动」）。它注册一条计划任务
 （`SnugWinAutoStart`，登录触发、普通权限、参数 `--minimized`）：开机后后台常驻托盘，
 **不弹窗、不抢焦点**，手机屏就绪了才把界面摆上虚拟屏。换 exe 目录后会自动把任务里的
 路径改过去。
@@ -83,7 +96,7 @@ v1.0.4 本地候选采用手机触控布局：底部应用导航、多窗口选�
 主界面默认使用普通权限；驱动安装通过同一 EXE 的一次性 UAC 任务执行。当前驱动管道要求管理员权限，首次建屏会请求受限 VDD 代理的 UAC；取消或失败后本次运行不再重复请求，需重启 GUI 后再试。自动更新仅在普通权限下执行，使用 EXE 同级的独占暂存目录；受保护安装目录请手动替换 EXE。需要管理提升权限的应用窗口时，可在设置里显式选择“以管理员重启”，更新前应退出并普通启动。
 
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
-多屏形态（单窗口 + 顶部切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
+多屏形态（单窗口 + 屏幕菜单切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
 线程与锁纪律见 [`docs/desk-threading.md`](docs/desk-threading.md)。
 本轮响应优化、编译体积对照与验证边界见 [`docs/optimization-20261119.md`](docs/optimization-20261119.md)。
 
@@ -118,6 +131,7 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 - [docs/real-machine-test.md](docs/real-machine-test.md) — 真机测试记录
 - [docs/display-parity.md](docs/display-parity.md) — 虚拟屏链路与原版逐行对拍
 - [docs/ui-parity.md](docs/ui-parity.md) — 界面与原版对照
+- [docs/ui-fusion-20261122.md](docs/ui-fusion-20261122.md) — v1.0.5 界面融合与验证记录
 - [docs/size-budget.md](docs/size-budget.md) — 体积预算与已做的取舍
 - [docs/quality.md](docs/quality.md) — 质量门禁（rustc 零警告、clippy 怎么用）
 

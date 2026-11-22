@@ -7,7 +7,7 @@ members = ["crates/snug-core", "crates/snug-win", "crates/snug-app"]
 # = 自动更新跟 GitHub tag 比的版本。
 #
 # 独立的 Rust 版从 1.0.0 开始发布，与参考项目的版本分别维护。
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 # 1.89 是硬下限：单实例锁用了 `File::try_lock`（1.89 稳定）。
 # edition 2024 本身只要 1.85，但声明低版本而实际用高版本 API 会让别人按 1.85 装不上。
