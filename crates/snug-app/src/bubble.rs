@@ -87,6 +87,21 @@ impl CopyBubble {
         self.visible
     }
 
+    /// 已完成布局的气泡矩形，供输入钩子纯几何命中；隐藏或尚未布局时不直通。
+    pub fn screen_bounds(&self, pixels_per_point: f64) -> Option<Rect> {
+        if !self.visible {
+            return None;
+        }
+        let origin = self.origin?;
+        let scale = pixels_per_point.max(0.5);
+        Some(Rect::new(
+            origin.x,
+            origin.y,
+            f64::from(BUBBLE_SIZE.x) * scale,
+            f64::from(BUBBLE_SIZE.y) * scale,
+        ))
+    }
+
     /// 选区结束：记下位置，开始存在 5.5 秒。
     pub fn show_at(&mut self, at: Point) {
         *self.shared.at.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);

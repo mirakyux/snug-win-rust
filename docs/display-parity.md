@@ -8,6 +8,7 @@
 
 | 项 | 内容 | 位置 |
 |---|---|---|
+| 固定手机屏 | v1.0.4 手机与平板使用固定分辨率，应用最小窗口宽度、返回列表和切换应用均不能自动扩屏。超宽窗口显示尺寸受限提示，不自动减小字号；仅用户明确更改屏幕设置时变更模式 | `show_list` / `wanted_width` / `start_width` / `fill_steps` |
 | 手机底栏 | v1.0.1 按物理短边 / 400 × 60 留出底栏，配合手机 UI 缩放容纳 48 点按钮和上下留白；不再使用 C# 28 点底栏。极矮工作区优先保留应用区，底栏不越界。原几何 TSV 保留，旧 BAR 值明确排除等价声明，新尺寸单独回归 | `home_bar_height_of` / `window_area` |
 | 稳定 ID | C# `HashCode.Combine` 是进程内随机化；我们用确定性 FNV-1a，跨进程稳定。**若将来持久化 display_id**，两版编号不通用，需与 C# 对齐或明确「不跨版本通用」 | `stable_id` |
 | 查询加锁 | C# 的 PhoneDisplayService 是 async、等待时让出线程；Rust 无运行时，拆成「ScreenMaps 短锁 + ops 慢操作锁」。查询（界面每帧调 `home_bar_area`/`phone_bounds`）不经过 ops 锁，不会被 4s/8s/10s 的轮询挡住 | `WinPhoneDisplays` |

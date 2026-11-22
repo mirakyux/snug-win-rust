@@ -45,9 +45,11 @@ impl ScreenPlan {
         if kind.is_touch() { ScreenBehavior::TouchScreen } else { ScreenBehavior::Computer }
     }
 
-    /// 这块屏的档位表（C# `FitOf`）。
+    /// 分辨率是独立配置；机型只保留设备行为与方向，不决定物理尺寸。
     pub fn fit_of(screen: &ScreenConfig) -> ScreenFit {
-        ScreenFit::from_device(&screen.device.screen.to_fit_spec(), screen.device.kind, screen.orientation)
+        let fit = ScreenFit::from_device(&screen.device.screen.to_fit_spec(), screen.device.kind, screen.orientation);
+        fit.with_resolution(screen.resolution.unwrap_or_else(||
+            crate::config::ScreenResolution::default_for(screen.orientation)))
     }
 
     /// 当前该建哪些屏（C# `Wishes`）。
@@ -77,6 +79,36 @@ impl ScreenPlan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolution_defaults_do_not_follow_device_models() {
+        let first = super::ScreenConfig { resolution: None, ..Default::default() };
+        let mut other = first.clone();
+        other.device.screen = crate::phone_models::PhoneScreenSpec::new(1600, 2560, Some(800));
+        for screen in [&first, &other] {
+            let fit = super::ScreenPlan::fit_of(screen);
+            assert_eq!(fit.pixel_size(fit.base_width()), (1080, 1920));
+            assert_eq!(fit.registration_order().len(), 1);
+        }
+        other.orientation = crate::phone_models::ScreenOrientation::Landscape;
+        let fit = super::ScreenPlan::fit_of(&other);
+        assert_eq!(fit.pixel_size(fit.base_width()), (1920, 1080));
+    }
+
+    #[test]
+    fn wishes_carry_manual_pixels_without_reinterpreting_them_as_phone_specs() {
+        let cfg = super::AppConfig::default().sanitize();
+        let default = super::ScreenPlan::wishes(&cfg, true, false).remove(0);
+        assert_eq!(default.fit.pixel_size(default.fit.base_width()), (1080, 1920));
+        let cfg = cfg.with_screen_updated(super::ScreenConfig::LEGACY_PHONE_ID, |mut screen| {
+            screen.resolution = Some(crate::config::ScreenResolution { width: 720, height: 1280 });
+            screen
+        });
+        let manual = super::ScreenPlan::wishes(&cfg, true, false).remove(0);
+        assert_eq!(manual.fit.pixel_size(manual.fit.base_width()), (720, 1280));
+        assert_eq!(manual.fit.widths(), &[360]);
+        assert_eq!(manual.device, default.device);
+    }
+
     use super::*;
     use crate::phone_models::PhoneScreenSpec;
 
@@ -150,20 +182,20 @@ mod tests {
     }
 
     #[test]
-    fn fit_of_uses_the_device_kind_and_orientation() {
+    fn fit_of_preserves_device_behavior_but_uses_resolution_defaults() {
         let screen = ScreenConfig {
             id: "s".into(),
             orientation: ScreenOrientation::Landscape,
             device: computer(),
             enabled: true,
             name: "副屏".into(),
+            resolution: None,
         };
         let fit = ScreenPlan::fit_of(&screen);
         assert_eq!(fit.kind(), DeviceKind::Computer);
         assert_eq!(fit.orientation(), ScreenOrientation::Landscape);
-        // 电脑横屏基准宽取高（1080p 的 1080），只有一档。
-        assert_eq!(fit.base_width(), 1080);
-        assert_eq!(fit.widths(), &[1080]);
+        assert_eq!(fit.pixel_size(fit.base_width()), (1920, 1080));
+        assert_eq!(fit.widths(), &[960]);
 
         let portrait_tablet = ScreenConfig {
             orientation: ScreenOrientation::Portrait,

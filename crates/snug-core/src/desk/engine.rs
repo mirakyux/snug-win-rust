@@ -13,6 +13,7 @@
 //! - 平台接口都是 `Send + Sync` 的 `&self` 方法，watch 线程可以并发查询；
 //! - 状态通过 [`DeskEvents::state_changed`] 推给界面，`Desk::state()` 随时可读快照。
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -167,6 +168,15 @@ struct Placement {
     asking: bool,
 }
 
+/// UIA 查询开始时的窗口、几何和视图代次；返回时必须仍是同一次摆放。
+#[derive(Clone, Copy, PartialEq)]
+struct CloseButtonQuery {
+    key: WindowKey,
+    window_frame: Rect,
+    display_id: u32,
+    generation: u64,
+}
+
 /// 手机屏上的窗口被外部关掉后，等同一进程里的新窗口回来（对应 C# `_replaced`）。
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // 字段在 watch 分块（FollowReplacement）里读
@@ -223,6 +233,7 @@ struct DeskShared {
     state: Mutex<DeskState>,
     watches: Mutex<HashMap<WatchedKey, CancelToken>>,
     pending_retry: Mutex<Option<RetryHandle>>,
+    close_button_busy: AtomicBool,
     /// C# 字段 `_wanted` / `_remote` 由界面线程直接读写，这里用原子量保持同样语义。
     wanted: AtomicBool,
     remote: AtomicBool,
@@ -418,6 +429,10 @@ pub(crate) struct DeskCore {
     recheck_generation: u64,
     verifying: bool,
     checking_returns: bool,
+    close_button_generation: Cell<u64>,
+    close_button_inflight: Option<CloseButtonQuery>,
+    close_button_next: Option<CloseButtonQuery>,
+    close_button_worker: Option<std::sync::mpsc::Sender<CloseButtonQuery>>,
     /// 手机屏上的窗口被外部关掉后，等同一进程的新窗口回来。
     #[allow(dead_code)] // 跟进逻辑在 watch 分块（FollowReplacement）里接入
     replaced: Option<Replaced>,
@@ -495,6 +510,7 @@ impl Desk {
             state: Mutex::new(DeskState::default()),
             watches: Mutex::new(HashMap::new()),
             pending_retry: Mutex::new(None),
+            close_button_busy: AtomicBool::new(false),
             wanted: AtomicBool::new(false),
             remote: AtomicBool::new(false),
             default_zoom: AtomicI32::new(default_zoom),
@@ -527,6 +543,10 @@ impl Desk {
                 recheck_generation: 0,
                 verifying: false,
                 checking_returns: false,
+                close_button_generation: Cell::new(0),
+                close_button_inflight: None,
+                close_button_next: None,
+                close_button_worker: None,
                 replaced: None,
             });
         });
@@ -899,7 +919,7 @@ impl Desk {
     pub fn show_list(&self) {
         self.inner.slot.run(|core: &mut DeskCore| {
             core.set_state(core.state().with_list_visible(true));
-            core.match_width();
+            // 资源库按短边缩放，不需要换显示模式；切回基础宽会让整个桌面重配。
         });
     }
 
@@ -979,6 +999,7 @@ impl Desk {
     pub(crate) fn is_quiet(&self) -> bool {
         self.inner.shared.pending_retry.lock().expect("retry").is_none()
             && self.inner.shared.watches.lock().expect("watches").is_empty()
+            && !self.inner.shared.close_button_busy.load(Ordering::SeqCst)
     }
 
     /// 对应 C# `IdleAsync`：等重试跑完、队列排空、所有 watch 结束。
@@ -1007,7 +1028,8 @@ impl Desk {
                 }
             };
             let watches = self.inner.shared.watches.lock().expect("watches").len();
-            if unchanged && watches == 0 {
+            if unchanged && watches == 0
+                && !self.inner.shared.close_button_busy.load(Ordering::SeqCst) {
                 return;
             }
         }
@@ -1094,16 +1116,31 @@ impl DeskCore {
 
     /// 对应 C# `State` 的 setter：内容没变就不触发 `StateChanged`。
     fn set_state(&self, next: DeskState) {
+        let refresh;
         {
             let mut current = self.shared.state.lock().expect("desk state");
             if *current == next {
                 return;
+            }
+            refresh = if current.list_visible && !next.list_visible {
+                next.placed.as_ref().map(|placed| placed.window.key)
+            } else {
+                None
+            };
+            if current.list_visible != next.list_visible
+                || current.screen_phase != next.screen_phase
+                || current.display_id != next.display_id
+            {
+                self.close_button_generation.set(self.close_button_generation.get().wrapping_add(1));
             }
             *current = next;
         }
         if let Some(callback) = self.shared.events.state_changed.as_ref() {
             let snapshot = self.state();
             callback(&snapshot);
+        }
+        if let Some(key) = refresh {
+            self.slot.run(move |core| core.refresh_close_button(key));
         }
     }
 
@@ -1409,12 +1446,19 @@ impl DeskCore {
         }
     }
 
-    /// 对应 C# `WantedWidth`：列表可见时用基础宽度，窗口铺满时用窗口宽度。
+    /// 手机触屏固定基础档；电脑副屏保留会话内已扩大的屏宽。
     fn wanted_width(&self) -> i32 {
-        match (&self.placement, self.state().list_visible) {
+        if self.behavior() == ScreenBehavior::TouchScreen {
+            return self.current_screen_fit().base_width();
+        }
+        let wanted = match (&self.placement, self.state().list_visible) {
             (Some(placement), false) => placement.width,
             _ => self.current_screen_fit().base_width(),
-        }
+        };
+        self.display
+            .and_then(|display| self.shared.displays.width_of(display.id))
+            .unwrap_or(wanted)
+            .max(wanted)
     }
 
     /// 对应 C# `MatchWidthAsync`。
@@ -1426,6 +1470,11 @@ impl DeskCore {
 
     /// 对应 C# `SwitchWidthAsync`。
     fn switch_width(&self, id: u32, width: i32) {
+        let width = if self.behavior() == ScreenBehavior::TouchScreen {
+            self.current_screen_fit().base_width()
+        } else {
+            width
+        };
         if self.shared.displays.width_of(id) != Some(width) {
             self.shared.displays.set_width(id, width);
         }
@@ -1446,6 +1495,10 @@ impl DeskCore {
     const WIDEN_STEPS_LIMIT: usize = 2;
 
     fn fill_steps(&mut self, placement: &mut Placement, id: u32, steps: usize) -> Option<Rect> {
+        let fixed_resolution = self.behavior() == ScreenBehavior::TouchScreen;
+        if fixed_resolution {
+            placement.width = self.current_screen_fit().base_width();
+        }
         // 每一步都量一下：真机上"点 App 要等 5 秒"，光看日志看不出是换屏宽、
         // 挪窗口还是 UIA 找关闭按钮吃掉的。单步超过 300ms 就记一行。
         let mut started = std::time::Instant::now();
@@ -1495,6 +1548,8 @@ impl DeskCore {
         placement.record.filled = Some(got);
         self.write_record(&placement.record);
 
+        self.note_window_fit(&placement.window, got, area);
+
         // 先算"要不要换更宽的档"：要换的话这一轮就白铺了，关闭按钮的位置也立刻作废，
         // 不必去查（真机单轮 500–1500ms）。阶梯换成最终档后才查一次。
         let placed_at_origin = (got.min_x() - area.min_x()).abs() < 2.0
@@ -1504,7 +1559,10 @@ impl DeskCore {
         // 加到 970 还差——每加宽一档它就再长高一点，屏幕被无限推宽，而每次加宽
         // 都是一次 0.5–0.9 秒的显示模式变更。宽度已经放得下就别再追高度了。
         let height_overflow_is_small = got.width <= area.width + 2.0 && got.height < area.height * 1.1;
-        let next_width = self
+        let next_width = if fixed_resolution {
+            None
+        } else {
+            self
             .shared
             .displays
             .width_of(id)
@@ -1517,20 +1575,17 @@ impl DeskCore {
                 self.shared.displays.width_of(id).is_some_and(|current| {
                     *next > current && *next != placement.width
                 })
-            });
+            })
+        };
 
-        let mut ms_close = 0.0;
         if placement.asking {
             self.set_state(self.state().with_close_button(None));
         } else if next_width.is_none() {
-            // 找关闭按钮要问 UIA，真机 0.6–1.5 秒。它挡在"窗口已经铺好"这条状态
-            // **前面**，用户看到的就是"点完等半天界面才变"。改成排在当前动作之后再查：
-            // 铺好的状态立刻发布，按钮晚一秒出现（拖动窗口时才用得上）。
+            // 在最终摆放发布后启动独立查询，不让跨进程 UIA 占住桌面操作队列。
             let key = placement.window.key;
             self.slot.run(move |core: &mut DeskCore| core.refresh_close_button(key));
-            ms_close = 0.0;
         }
-        for (what, ms) in [("换屏宽", ms_switch), ("挪窗口", ms_move), ("找关闭按钮", ms_close)] {
+        for (what, ms) in [("换屏宽", ms_switch), ("挪窗口", ms_move)] {
             if ms >= 300.0 {
                 self.log(format!("[耗时] 铺开·{what} {ms:.0}ms"));
             }
@@ -1575,26 +1630,109 @@ impl DeskCore {
             && frame.y < bounds.max_y() + 2.0
     }
 
-    /// 后排一次"去问 UIA 要关闭按钮位置"（真机 0.6–1.5 秒，不能挡在铺好状态前面）。
+    fn note_window_fit(&self, window: &WindowInfo, frame: Rect, area: Rect) {
+        if self.behavior() != ScreenBehavior::TouchScreen {
+            return;
+        }
+        if frame.width > area.width + 2.0 {
+            self.set_state(self.state().with_notice(Some(DeskNotice::WindowTooLarge {
+                app: window.app_name.clone(),
+            })));
+        } else if matches!(self.state().notice, Some(DeskNotice::WindowTooLarge { .. })) {
+            self.set_state(self.state().with_notice(None));
+        }
+    }
+
+    fn current_close_button_query(&self) -> Option<CloseButtonQuery> {
+        let state = self.state();
+        if !self.wanted() || state.screen_phase != PhoneScreenPhase::Ready || state.list_visible {
+            return None;
+        }
+        let placement = self.placement.as_ref().filter(|placement| !placement.asking)?;
+        Some(CloseButtonQuery {
+            key: placement.window.key,
+            window_frame: placement.settled?,
+            display_id: state.display_id?,
+            generation: self.close_button_generation.get(),
+        })
+    }
+
+    /// 每块屏最多一个 UIA 查询在飞；忙时只保留最新请求，不向操作队列塞慢查询。
     fn refresh_close_button(&mut self, key: WindowKey) {
-        let started = std::time::Instant::now();
-        let rect = self.shared.windows.close_button(key);
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let Some(request) = self.current_close_button_query().filter(|request| request.key == key) else {
+            return;
+        };
+        if let Some(inflight) = self.close_button_inflight {
+            if inflight != request {
+                self.close_button_next = Some(request);
+            }
+            return;
+        }
+        self.start_close_button_query(request);
+    }
+
+    fn start_close_button_query(&mut self, request: CloseButtonQuery) {
+        if self.close_button_worker.is_none() {
+            let (send, requests) = std::sync::mpsc::channel::<CloseButtonQuery>();
+            let windows = Arc::clone(&self.shared.windows);
+            let shared = Arc::downgrade(&self.shared);
+            let slot = self.slot.clone();
+            // 固定线程保留平台的 thread_local UIA/COM 缓存；desk 析构后发送端
+            // 随之关闭，线程自然退出。关闭和撤屏不等待在飞的跨进程调用。
+            let worker = std::thread::Builder::new().name("snug-close-button".into()).spawn(move || {
+                for request in requests {
+                    let started = std::time::Instant::now();
+                    let rect = windows.close_button(request.key);
+                    // 外部挪窗也使按钮坐标失效；平台读取仍留在工作线程上。
+                    let rect = rect.filter(|_| windows.look(request.key)
+                        .is_some_and(|look| look.frame.matches(request.window_frame, 2.0)));
+                    let ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let shared = shared.clone();
+                    slot.run(move |core| {
+                        // 同 id 的 desk 可能已被移除又重建，不能写入新实例。
+                        if shared.upgrade().is_some_and(|shared| Arc::ptr_eq(&shared, &core.shared)) {
+                            core.finish_close_button_query(request, rect, ms);
+                        }
+                    });
+                }
+            });
+            if let Err(error) = worker {
+                self.warn(format!("无法启动关闭按钮查询：{error}"));
+                return;
+            }
+            self.close_button_worker = Some(send);
+        }
+        self.close_button_inflight = Some(request);
+        self.shared.close_button_busy.store(true, Ordering::SeqCst);
+        if self.close_button_worker.as_ref().expect("query worker").send(request).is_err() {
+            self.close_button_inflight = None;
+            self.close_button_worker = None;
+            self.shared.close_button_busy.store(false, Ordering::SeqCst);
+            self.warn("关闭按钮查询线程已经退出");
+        }
+    }
+
+    fn finish_close_button_query(&mut self, request: CloseButtonQuery, rect: Option<Rect>, ms: f64) {
+        if self.close_button_inflight != Some(request) {
+            return;
+        }
+        self.close_button_inflight = None;
         if ms >= 300.0 {
-            self.log(format!("[耗时] 找关闭按钮 {ms:.0}ms（铺好之后补）"));
+            self.log(format!("[耗时] 找关闭按钮 {ms:.0}ms（独立查询）"));
         }
-        // 期间用户可能已经回列表或换了窗口，结果只认还是同一个铺着的窗口。
-        let Some(placement) = self.placement.clone() else {
-            return;
-        };
-        if placement.window.key != key {
-            return;
+        let current = self.current_close_button_query();
+        if current == Some(request) {
+            let button = rect.map(|frame| CloseButton {
+                frame, window_handle: request.key.handle, window_frame: request.window_frame,
+            });
+            self.set_state(self.state().with_close_button(button));
         }
-        let Some(window_frame) = placement.settled else {
-            return;
-        };
-        let button = rect.map(|frame| CloseButton { frame, window_handle: key.handle, window_frame });
-        self.set_state(self.state().with_close_button(button));
+        // 只补忙时收到的最新目标；没有新请求就结束，失败结果也不自动重试。
+        if self.close_button_next.take().is_some() && let Some(current) = current {
+            self.start_close_button_query(current);
+        } else {
+            self.shared.close_button_busy.store(false, Ordering::SeqCst);
+        }
     }
 
     /// 记住"这个 App 上次铺满用的是哪一档屏宽"（存在共享盘上，跨进程有效）。
@@ -1604,6 +1742,9 @@ impl DeskCore {
     /// 加一次挪窗口加一次找关闭按钮，合计 4.9 秒，用户看到的就是"点了没反应"。
     /// 记住上一轮的档位，下次直接从它起步。
     fn learn_width(&mut self, window: &WindowInfo, width: i32) {
+        if self.behavior() == ScreenBehavior::TouchScreen {
+            return;
+        }
         let Some(key) = self.width_key(window) else {
             return;
         };
@@ -1618,10 +1759,16 @@ impl DeskCore {
         }
     }
 
-    /// 铺某个窗口该从哪一档起步：学过的档位，否则基础宽。
+    /// 触屏忽略旧版学到的大分辨率；电脑副屏继续复用当前及已学档位。
     fn start_width(&self, window: &WindowInfo) -> i32 {
         let fit = self.current_screen_fit();
-        let base = fit.base_width();
+        if self.behavior() == ScreenBehavior::TouchScreen {
+            return fit.base_width();
+        }
+        let base = self.display
+            .and_then(|display| self.shared.displays.width_of(display.id))
+            .unwrap_or(fit.base_width())
+            .max(fit.base_width());
         let Some(learned) = self
             .width_key(window)
             .and_then(|key| {
@@ -1636,7 +1783,7 @@ impl DeskCore {
         else {
             return base;
         };
-        if fit.widths().contains(&learned) { learned } else { base }
+        if fit.widths().contains(&learned) { learned.max(base) } else { base }
     }
 
     /// 学到的屏宽的键：比例 + App。比例换了（换机型/方向）旧记录自然失效。
@@ -1651,6 +1798,13 @@ impl DeskCore {
         };
         self.switch_width(display.id, placement.width);
         self.refill("回到窗口");
+        if self.behavior() == ScreenBehavior::TouchScreen
+            && let Some(placement) = &self.placement
+            && let Some(frame) = placement.settled
+            && let Some(area) = self.shared.displays.window_area_of(display.id)
+        {
+            self.note_window_fit(&placement.window, frame, area);
+        }
         self.set_state(self.state().with_list_visible(false));
         self.shared.windows.focus(placement.window.key);
     }
@@ -2077,13 +2231,17 @@ impl DeskCore {
 
     /// 对应 C# `SetPlacement`。
     fn set_placement(&mut self, placement: Option<Placement>) {
-        let old_key = self.placement.as_ref().map(|current| current.window.key);
+        let signature = |placement: &Placement| (placement.window.key, placement.settled, placement.asking);
+        let changed = self.placement.as_ref().map(signature) != placement.as_ref().map(signature);
+        if changed {
+            self.close_button_generation.set(self.close_button_generation.get().wrapping_add(1));
+        }
         self.placement = placement;
         let placed = self.placement.as_ref().map(|current| PlacedWindow {
             window: current.window.clone(),
             zoom: current.record.zoom,
         });
-        let close_button = if self.placement.as_ref().map(|current| current.window.key) != old_key {
+        let close_button = if changed {
             None
         } else {
             self.state().close_button
@@ -3080,21 +3238,125 @@ mod tests {
         assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
     }
 
-    /// 转写自 C# `PhoneDeskTests.Pull_StepsUpWidthWhenClamped_ZoomsAndRestoresOnPutBack`。
+    fn block_close_buttons(
+        harness: &Harness,
+    ) -> (std::sync::mpsc::Receiver<WindowKey>, std::sync::mpsc::Sender<Option<Rect>>) {
+        let (started, starts) = std::sync::mpsc::channel();
+        let (release, releases) = std::sync::mpsc::channel();
+        let releases = Mutex::new(releases);
+        harness.windows.on_close_button(move |key| {
+            let _ = started.send(key);
+            releases.lock().expect("release query")
+                .recv_timeout(Duration::from_secs(3)).unwrap_or(None)
+        });
+        (starts, release)
+    }
+
     #[test]
-    fn pull_steps_up_width_when_clamped_zooms_and_restores_on_put_back() {
+    fn blocked_close_button_query_does_not_hold_show_list_or_shutdown() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let (starts, release) = block_close_buttons(&harness);
+        let key = WindowKey::new(101, 0x101);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 900.0, 700.0));
+        harness.desk.pull(window(key, Some("notepad.exe"), "notes"));
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).expect("query started"), key);
+
+        harness.desk.show_list();
+        assert!(harness.desk.inner.slot.call_timeout(Duration::from_millis(250), |_| {}),
+            "returning to the library must not wait for UIA");
+        assert!(harness.desk.state().list_visible);
+        let desk = harness.desk.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = done.send(desk.shutdown()); });
+        assert!(finished.recv_timeout(Duration::from_secs(1)).expect("shutdown advanced"));
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Off);
+        release.send(Some(Rect::new(1.0, 2.0, 30.0, 30.0))).expect("release old result");
+        harness.desk.idle();
+        assert!(harness.desk.state().close_button.is_none());
+    }
+
+    #[test]
+    fn blocked_close_button_query_coalesces_latest_window_and_discards_old_result() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let (starts, release) = block_close_buttons(&harness);
+        let first = WindowKey::new(101, 0x101);
+        let skipped = WindowKey::new(102, 0x102);
+        let latest = WindowKey::new(103, 0x103);
+        for key in [first, skipped, latest] {
+            harness.windows.insert(key, Rect::new(100.0, 100.0, 900.0, 700.0));
+        }
+        harness.desk.pull(window(first, Some("notepad.exe"), "first"));
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).expect("first query"), first);
+        harness.desk.pull(window(skipped, Some("notepad.exe"), "skipped"));
+        harness.desk.pull(window(latest, Some("notepad.exe"), "latest"));
+        assert!(harness.desk.inner.slot.call_timeout(Duration::from_millis(250), |_| {}),
+            "new placements must not wait for the old query");
+        // Start jobs queued by fill follow the barrier above; drain them separately.
+        assert!(harness.desk.inner.slot.call_timeout(Duration::from_millis(250), |_| {}));
+        assert_eq!(harness.desk.placed_window_key(), Some(latest));
+        assert!(starts.try_recv().is_err(), "one query per desk may be in flight");
+
+        release.send(Some(Rect::new(1.0, 2.0, 30.0, 30.0))).expect("old result");
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).expect("latest query"), latest);
+        assert!(harness.desk.state().close_button.is_none(), "old result must not be published");
+        let current = Rect::new(30.0, 40.0, 30.0, 30.0);
+        release.send(Some(current)).expect("latest result");
+        harness.desk.idle();
+        let button = harness.desk.state().close_button.expect("latest close button");
+        assert_eq!(button.window_handle, latest.handle);
+        assert_eq!(button.frame, current);
+        assert!(starts.try_recv().is_err(), "superseded requests must not create extra workers");
+    }
+
+    #[test]
+    fn blocked_close_button_query_checks_view_generation_and_live_window_frame() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let (starts, release) = block_close_buttons(&harness);
+        let key = WindowKey::new(101, 0x101);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 900.0, 700.0));
+        harness.desk.pull(window(key, Some("notepad.exe"), "notes"));
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).expect("first query"), key);
+
+        // 回到同一个窗口、相同矩形，也不能接纳离开资源库前的旧结果。
+        harness.desk.show_list();
+        harness.desk.return_to_placed();
+        assert!(harness.desk.inner.slot.call_timeout(Duration::from_millis(250), |_| {}));
+        assert!(harness.desk.inner.slot.call_timeout(Duration::from_millis(250), |_| {}));
+        release.send(Some(Rect::new(1.0, 2.0, 30.0, 30.0))).expect("first result");
+        assert_eq!(starts.recv_timeout(Duration::from_secs(1)).expect("new view query"), key);
+        assert!(harness.desk.state().close_button.is_none());
+
+        // 同时防止核心状态尚未察觉的外部挪窗留下旧坐标。
+        let frame = harness.windows.frame_of(key).expect("placed frame");
+        harness.windows.insert(key, Rect::new(frame.x + 100.0, frame.y, frame.width, frame.height));
+        release.send(Some(Rect::new(30.0, 40.0, 30.0, 30.0))).expect("moved result");
+        harness.desk.idle();
+        assert!(harness.desk.state().close_button.is_none());
+        assert!(starts.try_recv().is_err(), "a stale result must not trigger endless retries");
+    }
+
+    /// 触屏固定分辨率，窗口最小宽度超限时提示；保留原有字号及归位行为。
+    #[test]
+    fn touch_screen_keeps_base_resolution_when_clamped_and_restores_on_put_back() {
         let harness = Harness::new();
         let key = WindowKey::new(42, 0x100);
         let original = Rect::new(100.0, 100.0, 1500.0, 700.0);
         harness.windows.insert(key, original);
-        // 窗口最小宽度把 540 撑到 700，铺不满时桌面应自动换到更宽档位。
+        // 应用最小宽度超过屏幕，不能通过扩屏让手机端的字越来越小。
         harness.windows.set_min_logical_width(700.0);
         ready_screen(&harness);
 
         harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
         harness.desk.idle();
 
-        assert_eq!(harness.displays.width_of(1001), Some(700), "应该换到 700 宽");
+        let base = harness.desk.fit().base_width();
+        assert_eq!(harness.displays.width_of(1001), Some(base));
+        assert!(harness.displays.width_sets().is_empty(), "应用最小宽度不能触发换档");
+        assert_eq!(harness.desk.state().notice,
+            Some(DeskNotice::WindowTooLarge { app: "VS Code".into() }));
         assert_eq!(harness.windows.zoom_delta_total(), 2, "按默认字号放大 2 级");
         assert!(!harness.desk.state().list_visible);
         assert!(harness.desk.state().placed.is_some());
@@ -3105,7 +3367,7 @@ mod tests {
         let state = harness.desk.state();
         assert!(state.placed.is_none());
         assert!(state.list_visible);
-        assert_eq!(harness.displays.width_of(1001), Some(540), "列表要回到基础宽度");
+        assert_eq!(harness.displays.width_of(1001), Some(base));
         assert_eq!(harness.windows.zoom_delta_total(), 0, "字号应缩回");
         assert_eq!(harness.windows.frame_of(key), Some(original), "窗口应回原位");
         assert!(!harness.paths.phone_record_file().exists(), "还原记录应被清掉");
@@ -3161,10 +3423,64 @@ mod tests {
         assert!(!harness.paths.phone_record_file().exists(), "恢复后清除还原记录");
     }
 
+    #[test]
+    fn app_list_and_window_navigation_reuse_the_current_display_mode() {
+        let harness = Harness::new();
+        let key = WindowKey::new(42, 0x100);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
+        harness.windows.set_min_logical_width(700.0);
+        ready_screen(&harness);
+        harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
+        harness.desk.idle();
+        let modes_after_placement = harness.displays.width_sets();
+        assert!(modes_after_placement.is_empty(), "触屏铺窗不换分辨率");
+        let moves_after_placement = harness.windows.move_calls().len();
+
+        for _ in 0..3 {
+            harness.desk.show_list();
+            harness.desk.idle();
+            assert!(harness.desk.state().list_visible);
+            harness.desk.return_to_placed();
+            harness.desk.idle();
+            assert!(!harness.desk.state().list_visible);
+            assert!(matches!(harness.desk.state().notice, Some(DeskNotice::WindowTooLarge { .. })),
+                "回到未挪动的大窗口仍应保留超宽提示");
+        }
+        assert_eq!(harness.displays.width_sets(), modes_after_placement,
+            "列表与当前窗口往返不得触发显示模式切换");
+        assert_eq!(harness.windows.move_calls().len(), moves_after_placement,
+            "位置未变的当前窗口不应再次搬动");
+    }
+
+    #[test]
+    fn switching_apps_keeps_the_touch_screen_at_base_resolution() {
+        let harness = Harness::new();
+        let wide = WindowKey::new(42, 0x100);
+        let narrow = WindowKey::new(43, 0x101);
+        harness.windows.insert(wide, Rect::new(100.0, 100.0, 1500.0, 700.0));
+        harness.windows.insert(narrow, Rect::new(200.0, 150.0, 800.0, 600.0));
+        harness.windows.set_min_logical_width(700.0);
+        ready_screen(&harness);
+        harness.desk.pull(window(wide, Some("Wide.exe"), "wide"));
+        harness.desk.idle();
+        let modes_after_wide = harness.displays.width_sets();
+
+        harness.windows.set_min_logical_width(0.0);
+        harness.desk.show_list();
+        harness.desk.pull(window(narrow, Some("Narrow.exe"), "narrow"));
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_of(1001), Some(harness.desk.fit().base_width()));
+        assert!(modes_after_wide.is_empty(), "大窗口也不能自动扩屏");
+        assert_eq!(harness.displays.width_sets(), modes_after_wide,
+            "切换到较小应用不应先缩屏再扩屏");
+        assert_eq!(harness.desk.state().placed.unwrap().window.key, narrow);
+    }
+
     /// 第二次铺同一个 App 不该重走换档阶梯（真机上一次铺垫 4.9 秒，几乎全是换档）。
     #[test]
-    fn placing_the_same_app_again_starts_at_the_learned_width() {
+    fn computer_placing_the_same_app_again_starts_at_the_learned_width() {
         let harness = Harness::new();
+        harness.desk.update_wish("电脑副屏", ScreenFit::standard(), ScreenBehavior::Computer);
         let key = WindowKey::new(42, 0x100);
         harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
         harness.windows.set_min_logical_width(700.0);
@@ -3174,10 +3490,10 @@ mod tests {
         harness.desk.idle();
         assert_eq!(harness.displays.width_of(1001), Some(700), "先走一遍阶梯");
 
-        // 回列表：屏宽回到基础宽，但"这个 App 要 700"应该记住。
+        // 回列表保留当前屏宽；新会话仍能使用已经学到的档位。
         harness.desk.put_back();
         harness.desk.idle();
-        assert_eq!(harness.displays.width_of(1001), Some(540));
+        assert_eq!(harness.displays.width_of(1001), Some(700));
 
         harness.desk.pull(window(key, Some("Code.exe"), "README.md"));
         harness.desk.idle();
@@ -3201,6 +3517,7 @@ mod tests {
     #[test]
     fn learned_widths_are_per_screen_ratio() {
         let harness = Harness::new();
+        harness.desk.update_wish("电脑副屏", ScreenFit::standard(), ScreenBehavior::Computer);
         let key = WindowKey::new(42, 0x100);
         harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
         harness.windows.set_min_logical_width(700.0);
@@ -3223,6 +3540,38 @@ mod tests {
             harness.desk.fit().widths().contains(&width),
             "换比例后铺出的宽度必须是新档位表里的档（{width}）"
         );
+    }
+
+    #[test]
+    fn touch_screen_ignores_learned_widths_and_an_expanded_current_mode() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let key = WindowKey::new(42, 0x100);
+        let app = window(key, Some("notepad.exe"), "notes");
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 1500.0, 700.0));
+        harness.windows.set_min_logical_width(700.0);
+        let for_seed = app.clone();
+        harness.desk.inner.slot.call(move |core| {
+            let cache_key = core.width_key(&for_seed).expect("app cache key");
+            let wide = *core.current_screen_fit().widths().last().expect("wide mode");
+            core.shared.books.learned_widths.lock().expect("learned widths").insert(cache_key, wide);
+            core.shared.displays.set_width(core.display.expect("display").id, wide);
+            assert_eq!(core.wanted_width(), core.current_screen_fit().base_width(),
+                "重查显示器时也不能把旧的大档位作为目标");
+        });
+        let before = harness.displays.width_sets().len();
+        harness.desk.pull(app);
+        harness.desk.idle();
+        let base = harness.desk.fit().base_width();
+        assert_eq!(harness.displays.width_of(1001), Some(base));
+        assert_eq!(&harness.displays.width_sets()[before..], &[base],
+            "旧版遗留的大分辨率只应归到基础档一次");
+        let modes = harness.displays.width_sets();
+        harness.desk.show_list();
+        harness.desk.return_to_placed();
+        harness.desk.put_back();
+        harness.desk.idle();
+        assert_eq!(harness.displays.width_sets(), modes);
     }
 
     /// 转写自 C# `PhoneDeskTests.Recover_RestoresLeftoverRecordAfterSimulatedCrash`。

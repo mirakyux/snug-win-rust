@@ -30,8 +30,7 @@ use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
@@ -43,6 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW,
     SetForegroundWindow, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
     GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
+    WM_PAINT,
 };
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 
@@ -333,8 +333,12 @@ pub trait WindowApi: Send + Sync {
     fn raw_and_extended(&self, handle: u64) -> (Option<Rect>, Option<Rect>);
     fn show(&self, handle: u64, command: ShowCommand);
     fn set_window_rect(&self, handle: u64, x: i32, y: i32, width: i32, height: i32);
-    /// 抢前台（内部按 C# 的写法挂 `AttachThreadInput`）。
+    /// 请求前台焦点；系统拒绝时不合并其它程序的输入队列来强抢焦点。
     fn focus(&self, handle: u64);
+    /// 只读确认目标仍在前台；无法确认的平台默认拒绝全局按键注入。
+    fn is_foreground(&self, _handle: u64) -> bool {
+        false
+    }
     fn post_close(&self, handle: u64) -> bool;
     /// 发一次 Ctrl(+Shift)+某键（C# `SendKeystroke`）。
     fn send_ctrl_key(&self, virtual_key: u16, with_shift: bool);
@@ -550,6 +554,10 @@ impl<A: WindowApi> WindowControl for Windows<A> {
         self.focus(window);
         sleep_for(self.timings.focus_settle);
         for key in zoom_step_keys(steps) {
+            // focus 是尽力请求；被系统拒绝或中途切换应用时，不能向其它窗口发 Ctrl 键。
+            if !self.api.is_foreground(window.handle) {
+                return false;
+            }
             self.api.send_ctrl_key(key, false);
             sleep_for(self.timings.zoom_step);
         }
@@ -947,31 +955,15 @@ impl WindowApi for WinDesktop {
     fn focus(&self, handle: u64) {
         let window = hwnd(handle);
         unsafe {
-            let foreground = GetForegroundWindow();
-            let foreground_thread = if foreground.0.is_null() {
-                0
-            } else {
-                GetWindowThreadProcessId(foreground, None)
-            };
-            let target_thread = GetWindowThreadProcessId(window, None);
-            let current_thread = GetCurrentThreadId();
-
-            let attached_foreground = foreground_thread != 0
-                && foreground_thread != current_thread
-                && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
-            let attached_target = target_thread != 0
-                && target_thread != current_thread
-                && AttachThreadInput(current_thread, target_thread, true).as_bool();
-
+            // 不用 AttachThreadInput：合并后台、前台与目标应用的输入队列后，
+            // 目标应用响应慢可能连带拖住用户正在操作的前台程序。
+            // 焦点请求只尽力一次，系统的前台限制仍由系统决定。
             let _ = SetForegroundWindow(window);
-
-            if attached_target {
-                let _ = AttachThreadInput(current_thread, target_thread, false);
-            }
-            if attached_foreground {
-                let _ = AttachThreadInput(current_thread, foreground_thread, false);
-            }
         }
+    }
+
+    fn is_foreground(&self, handle: u64) -> bool {
+        handle != 0 && unsafe { GetForegroundWindow() == hwnd(handle) }
     }
 
     fn post_close(&self, handle: u64) -> bool {
@@ -1028,6 +1020,23 @@ pub fn is_own_process(pid: i32) -> bool {
     pid == std::process::id() as i32
 }
 
+/// 异步唤醒本进程窗口的原生重绘，不依赖 egui 合并后的 repaint 请求。
+///
+/// winit 在 `WM_PAINT` 中派发 `RedrawRequested`；投递消息不等待窗口线程，
+/// 也不改变窗口的可见性、位置或焦点。失效或其它进程的句柄一律拒绝。
+pub fn request_own_window_redraw(handle: u64) -> bool {
+    let window = hwnd(handle);
+    unsafe {
+        if !IsWindow(Some(window)).as_bool() {
+            return false;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        pid == std::process::id()
+            && PostMessageW(Some(window), WM_PAINT, WPARAM(0), LPARAM(0)).is_ok()
+    }
+}
+
 /// 在本进程里找标题匹配的顶层可见窗口，返回它的句柄。
 ///
 /// 应用层要用它找自己的窗口：eframe/winit 不对外暴露 `HWND`，而"把手机屏界面
@@ -1073,7 +1082,7 @@ pub fn find_own_window(title: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// 单测（只测纯逻辑与假实现，绝不真的动窗口）
+// 单测（纯逻辑、假实现与独占隐藏测试窗口，不操作用户窗口）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1081,6 +1090,49 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn native_redraw_repeats_without_a_rendered_frame_and_rejects_foreign_windows() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetDesktopWindow, MSG, PM_REMOVE, PeekMessageW,
+            WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        let window = TestWindow(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Snug native redraw test"),
+                WINDOW_STYLE::default(), 0, 0, 1, 1, None, None, None, None,
+            ).expect("create an exclusive hidden test window")
+        });
+        let handle = window.0.0 as usize as u64;
+        let mut message = MSG::default();
+        assert!(!unsafe { IsWindowVisible(window.0) }.as_bool());
+        while unsafe { PeekMessageW(&mut message, Some(window.0), WM_PAINT, WM_PAINT, PM_REMOVE) }.as_bool() {}
+
+        // Neither dispatch nor render the messages: every tick must independently wake the queue.
+        for _ in 0..2 {
+            assert!(request_own_window_redraw(handle));
+            assert!(unsafe {
+                PeekMessageW(&mut message, Some(window.0), WM_PAINT, WM_PAINT, PM_REMOVE)
+            }.as_bool());
+            assert_eq!(message.hwnd, window.0);
+            assert_eq!(message.message, WM_PAINT);
+        }
+        assert!(!unsafe { IsWindowVisible(window.0) }.as_bool());
+        assert!(!request_own_window_redraw(0));
+        let desktop = unsafe { GetDesktopWindow() };
+        assert!(unsafe { IsWindow(Some(desktop)) }.as_bool());
+        assert!(!request_own_window_redraw(desktop.0 as usize as u64));
+        drop(window);
+        assert!(!request_own_window_redraw(handle));
+    }
 
     // ----- 纯函数 -----
 
@@ -1319,6 +1371,9 @@ mod tests {
         focuses: Vec<u64>,
         closes: Vec<u64>,
         keys: Vec<(u16, bool)>,
+        foreground: Option<u64>,
+        deny_focus: bool,
+        lose_focus_after_keys: Option<usize>,
         /// 前 N 次挪窗故意摆偏一点，逼出重试。
         honor_after: usize,
         /// 每个窗口的"当前可见边框"查询要不要返回 None。
@@ -1396,7 +1451,15 @@ mod tests {
         }
 
         fn focus(&self, handle: u64) {
-            self.0.lock().unwrap().focuses.push(handle);
+            let mut state = self.0.lock().unwrap();
+            state.focuses.push(handle);
+            if !state.deny_focus {
+                state.foreground = Some(handle);
+            }
+        }
+
+        fn is_foreground(&self, handle: u64) -> bool {
+            self.0.lock().unwrap().foreground == Some(handle)
         }
 
         fn post_close(&self, handle: u64) -> bool {
@@ -1405,7 +1468,11 @@ mod tests {
         }
 
         fn send_ctrl_key(&self, virtual_key: u16, with_shift: bool) {
-            self.0.lock().unwrap().keys.push((virtual_key, with_shift));
+            let mut state = self.0.lock().unwrap();
+            state.keys.push((virtual_key, with_shift));
+            if state.lose_focus_after_keys.is_some_and(|count| state.keys.len() >= count) {
+                state.foreground = None;
+            }
         }
 
         fn window_at_point(&self, _point: snug_core::Point) -> Option<u64> {
@@ -1559,6 +1626,31 @@ mod tests {
             assert_eq!(state.keys, vec![(VK_OEM_PLUS.0, false), (VK_OEM_PLUS.0, false)]);
         }
         assert!(!service.zoom(WindowKey::new(999, 0x99), 1), "窗口不在就别按键");
+    }
+
+    #[test]
+    fn zoom_does_not_send_keys_when_focus_is_denied() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        {
+            let mut state = state.lock().unwrap();
+            state.foreground = Some(0x20);
+            state.deny_focus = true;
+        }
+        assert!(!service.zoom(WindowKey::new(100, 0x10), 2));
+        let state = state.lock().unwrap();
+        assert_eq!(state.foreground, Some(0x20));
+        assert_eq!(state.focuses, vec![0x10]);
+        assert!(state.keys.is_empty(), "focus refusal must not send Ctrl keys to another app");
+    }
+
+    #[test]
+    fn zoom_stops_sending_keys_if_focus_changes_after_the_first_step() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().lose_focus_after_keys = Some(1);
+        assert!(!service.zoom(WindowKey::new(100, 0x10), 3));
+        let state = state.lock().unwrap();
+        assert_eq!(state.focuses, vec![0x10], "do not keep forcing focus back");
+        assert_eq!(state.keys, vec![(VK_OEM_PLUS.0, false)]);
     }
 
     #[test]

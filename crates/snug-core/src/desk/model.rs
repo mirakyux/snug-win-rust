@@ -53,6 +53,7 @@ impl DeskWork {
 pub enum DeskNotice {
     WindowGone { app: String },
     WindowUnresponsive { app: String },
+    WindowTooLarge { app: String },
     RecordUnwritable,
     ScreenNotReady,
     OpenFailed { app: String },

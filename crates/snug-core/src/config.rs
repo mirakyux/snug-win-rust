@@ -60,6 +60,29 @@ impl AppThemeMode {
     }
 }
 
+/// 用户明确应用的虚拟屏物理像素；与机型本身的规格分别保存。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScreenResolution {
+    pub width: i32,
+    pub height: i32,
+}
+
+impl ScreenResolution {
+    pub const DEFAULT: Self = Self { width: 1080, height: 1920 };
+
+    pub const fn default_for(orientation: ScreenOrientation) -> Self {
+        match orientation {
+            ScreenOrientation::Portrait => Self::DEFAULT,
+            ScreenOrientation::Landscape => Self { width: 1920, height: 1080 },
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        (320..=8192).contains(&self.width) && (320..=8192).contains(&self.height)
+            && self.width % 2 == 0 && self.height % 2 == 0
+    }
+}
+
 /// 一块（虚拟）屏的配置，对应 C# `ScreenConfig`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenConfig {
@@ -68,6 +91,7 @@ pub struct ScreenConfig {
     pub device: PhoneChoice,
     pub enabled: bool,
     pub name: String,
+    pub resolution: Option<ScreenResolution>,
 }
 
 impl ScreenConfig {
@@ -76,7 +100,7 @@ impl ScreenConfig {
     /// 旧版单屏配置迁移过来时固定用的 id（C# `ScreenConfig.LegacyPhoneId`）。
     pub const LEGACY_PHONE_ID: &'static str = "00000000-0000-0000-0000-000000000001";
 
-    /// 旧版 `phone` 字段迁移成的那块屏：竖屏手机、固定 id。
+    /// 兼容旧字段的主手机屏：竖屏、固定 id；旧文件像素在读取边界单独迁移。
     pub fn legacy_phone(phone: PhoneChoice, enabled: bool) -> Self {
         Self {
             id: Self::LEGACY_PHONE_ID.to_string(),
@@ -84,6 +108,7 @@ impl ScreenConfig {
             device: phone.with_kind(DeviceKind::Phone),
             enabled,
             name: PHONE_SCREEN_NAME.to_string(),
+            resolution: Some(ScreenResolution::DEFAULT),
         }
     }
 
@@ -103,7 +128,7 @@ impl ScreenConfig {
 
     /// 兜底：空 id 生成新的、无效规格回落标准屏、电脑强制横屏、空名字用建议名。
     pub fn sanitize(self) -> Self {
-        let Self { id, orientation, device, enabled, name } = self;
+        let Self { id, orientation, device, enabled, name, resolution } = self;
         let id = if id.trim().is_empty() { new_guid() } else { id.trim().to_string() };
         let kind = device.kind;
         let screen = if device.screen.is_valid() {
@@ -123,7 +148,7 @@ impl ScreenConfig {
         } else {
             name.trim().to_string()
         };
-        Self { id, orientation, device, enabled, name }
+        Self { id, orientation, device, enabled, name, resolution: resolution.filter(|value| value.is_valid()) }
     }
 }
 
@@ -135,6 +160,7 @@ impl Default for ScreenConfig {
             device: PhoneChoice::standard(),
             enabled: true,
             name: PHONE_SCREEN_NAME.to_string(),
+            resolution: Some(ScreenResolution::DEFAULT),
         }
     }
 }
@@ -280,6 +306,7 @@ impl AppConfig {
             device,
             enabled: true,
             name: clean_name,
+            resolution: Some(ScreenResolution::default_for(clean_orientation)),
         }
         .sanitize();
         list.push(screen);
@@ -363,6 +390,13 @@ impl AppConfig {
             }
             _ => None,
         };
+        // 只有读取旧文件时使用旧机型公式；新装的 Default 不走这条迁移路径。
+        if cfg.screens.is_none() {
+            let phone = if cfg.phone.screen.is_valid() { cfg.phone.clone() } else { PhoneChoice::standard() };
+            let mut screen = ScreenConfig::legacy_phone(phone, cfg.phone_screen).sanitize();
+            screen.resolution = Some(legacy_resolution(&screen));
+            cfg.screens = Some(vec![screen]);
+        }
         cfg.sanitize()
     }
 
@@ -372,13 +406,19 @@ impl AppConfig {
             .effective_screens()
             .iter()
             .map(|screen| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "id": screen.id,
                     "orientation": screen.orientation.label(),
                     "device": phone_choice_json(&screen.device),
                     "enabled": screen.enabled,
                     "name": screen.name,
-                })
+                });
+                let resolution = screen.resolution.unwrap_or_else(||
+                    ScreenResolution::default_for(screen.orientation));
+                value["resolution"] = serde_json::json!({
+                    "width": resolution.width, "height": resolution.height,
+                });
+                value
             })
             .collect();
         let value = serde_json::json!({
@@ -501,7 +541,27 @@ fn parse_screen_config(value: &Value) -> Option<ScreenConfig> {
     let device = get_value(obj, "device").and_then(parse_phone_choice).unwrap_or(fallback.device);
     let enabled = get_bool(obj, "enabled").unwrap_or(fallback.enabled);
     let name = get_string(obj, "name").unwrap_or(fallback.name);
-    Some(ScreenConfig { id, orientation, device, enabled, name })
+    let resolution = get_value(obj, "resolution").and_then(Value::as_object).and_then(|value| {
+        Some(ScreenResolution {
+            width: i32::try_from(get_i64(value, "width")?).ok()?,
+            height: i32::try_from(get_i64(value, "height")?).ok()?,
+        })
+    }).filter(|resolution| resolution.is_valid());
+    let mut screen = ScreenConfig { id, orientation, device, enabled, name, resolution };
+    if get_value(obj, "resolution").is_none() {
+        // 按清理后的旧规格求精确像素，迁移后不再跟着机型库变动。
+        let normalized = screen.clone().sanitize();
+        screen.resolution = Some(legacy_resolution(&normalized));
+    }
+    Some(screen)
+}
+
+fn legacy_resolution(screen: &ScreenConfig) -> ScreenResolution {
+    let fit = crate::screen_fit::ScreenFit::from_device(
+        &screen.device.screen.to_fit_spec(), screen.device.kind, screen.orientation,
+    );
+    let (width, height) = fit.pixel_size(fit.base_width());
+    ScreenResolution { width, height }
 }
 
 /// 设备种类：`"phone"` / `"tablet"` / `"computer"`（大小写不敏感）或 0/1/2。
@@ -542,6 +602,67 @@ fn parse_orientation(value: &Value) -> Option<ScreenOrientation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_invalid_resolution_keeps_its_fallback_after_saving() {
+        for resolution in [
+            serde_json::Value::Null,
+            serde_json::json!({"width": 321, "height": 1280}),
+        ] {
+            for orientation in [ScreenOrientation::Portrait, ScreenOrientation::Landscape] {
+                let json = serde_json::json!({"Screens": [{
+                    "id": "phone", "orientation": orientation.label(), "resolution": resolution,
+                }]}).to_string();
+                let cfg = AppConfig::from_json_or_default(&json);
+                let pixels = |cfg: &AppConfig| {
+                    let fit = crate::screen_plan::ScreenPlan::fit_of(&cfg.effective_screens()[0]);
+                    fit.pixel_size(fit.base_width())
+                };
+                let expected = ScreenResolution::default_for(orientation);
+                assert_eq!(pixels(&cfg), (expected.width, expected.height));
+                let saved = AppConfig::from_json_or_default(&cfg.to_json());
+                assert_eq!(pixels(&saved), pixels(&cfg), "saving must not trigger legacy migration");
+                assert_eq!(AppConfig::from_json_or_default(&saved.to_json()), saved);
+            }
+        }
+    }
+
+    #[test]
+    fn new_screens_write_the_resolution_default_and_old_json_migrates_once() {
+        let fresh = super::AppConfig::default().sanitize();
+        assert_eq!(fresh.effective_screens()[0].resolution, Some(super::ScreenResolution::DEFAULT));
+        assert_eq!(super::ScreenConfig::default().resolution, Some(super::ScreenResolution::DEFAULT));
+        assert_eq!(super::AppConfig::from_json_or_default(&fresh.to_json()), fresh);
+        let old = super::AppConfig::from_json_or_default(r#"{"Screens":[{"id":"old","device":{"screen":{"width":1200,"height":2400},"kind":"Phone"}}]}"#);
+        let screen = &old.effective_screens()[0];
+        let fit = crate::screen_fit::ScreenFit::from_device(&screen.device.screen.to_fit_spec(), screen.device.kind, screen.orientation);
+        let (width, height) = fit.pixel_size(fit.base_width());
+        assert_eq!(screen.resolution, Some(super::ScreenResolution { width, height }));
+        assert_eq!(super::AppConfig::from_json_or_default(&old.to_json()), old,
+            "migration persists exact pixels and must not rerun on the next load");
+        let added = fresh.with_screen_added(crate::phone_models::ScreenOrientation::Landscape,
+            crate::phone_models::PhoneChoice::standard(), None);
+        assert_eq!(added.effective_screens()[1].resolution,
+            Some(super::ScreenResolution { width: 1920, height: 1080 }));
+    }
+
+    #[test]
+    fn manual_resolution_round_trips_without_changing_legacy_defaults() {
+        let old = super::AppConfig::from_json_or_default(r#"{"Screens":[{"id":"phone"}]}"#);
+        assert_eq!(old.effective_screens()[0].resolution,
+            Some(super::ScreenResolution { width: 1080, height: 1900 }));
+        let configured = old.with_screen_updated("phone", |mut screen| {
+            screen.resolution = Some(super::ScreenResolution { width: 720, height: 1280 });
+            screen
+        });
+        let restored = super::AppConfig::from_json_or_default(&configured.to_json());
+        assert_eq!(restored.effective_screens()[0].resolution,
+            Some(super::ScreenResolution { width: 720, height: 1280 }));
+        for width in [321_i64, -1, 9000, i64::MAX] {
+            let json = serde_json::json!({"Screens":[{"id":"phone", "resolution":{"width":width,"height":1280}}]}).to_string();
+            assert_eq!(super::AppConfig::from_json_or_default(&json).effective_screens()[0].resolution, None);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -576,8 +697,11 @@ mod tests {
           "LastVersion": null
         }"#;
         let cfg = AppConfig::from_json_or_default(json);
-        // v1.3 读老配置会迁移出一块 Legacy 手机屏，所以和 `default().sanitize()` 相等。
-        assert_eq!(cfg, AppConfig::default().sanitize());
+        // 更新保留旧文件的 1080×1900；新装默认使用固定的 1080×1920。
+        let mut expected = AppConfig::default().sanitize();
+        expected.screens.as_mut().expect("default screen")[0].resolution =
+            Some(ScreenResolution { width: 1080, height: 1900 });
+        assert_eq!(cfg, expected);
         assert_eq!(cfg.effective_screens().len(), 1);
         assert_eq!(cfg.effective_screens()[0].id, ScreenConfig::LEGACY_PHONE_ID);
     }
@@ -752,6 +876,7 @@ mod tests {
             },
             enabled: true,
             name: "   ".into(),
+            resolution: None,
         };
         let clean = screen.sanitize();
         assert_eq!(clean.device.screen, PhoneChoice::standard().screen, "坏规格回落标准屏");

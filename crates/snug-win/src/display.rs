@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use snug_core::desk::{PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException};
-use snug_core::screen_fit::DESIGN_WIDTH;
 use snug_core::store::OwnedDisplayStore;
 use snug_core::{DisplayModeInfo, OtherDisplay, Paths, Point, Rect, ScreenFit};
 use windows::Win32::Devices::Display::{
@@ -827,7 +826,13 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             sleep_for(self.timings.resolution_settle);
         }
 
-        if let Some(after) = find_monitor_of(&self.api, &self.maps, display_id) {
+        // 模式未改变时，当前快照已经包含可用的 DPI；实际改过模式才重新枚举。
+        let after = if needs_resolution {
+            find_monitor_of(&self.api, &self.maps, display_id)
+        } else {
+            current
+        };
+        if let Some(after) = after {
             // C# v1.3：目标 DPI 由 `ScreenFit.TargetDpiPercent(width)` 决定——
             // 电脑屏超过 3840×2400 的 2 倍阈值时是 100%，否则 200%。
             let target_dpi = fit.target_dpi_percent(width);
@@ -892,8 +897,8 @@ fn window_area_of_display<A: DisplayApi>(
     display_id: u32,
 ) -> Option<Rect> {
     let monitor = find_monitor_of(api, maps, display_id)?;
-    let logical_width = width_of_display(api, maps, display_id)
-        .unwrap_or(DESIGN_WIDTH as i32);
+    let fit = lock_maps(maps).fits.get(&display_id).cloned();
+    let logical_width = width_for_mode(monitor.mode.width, fit.as_ref());
     Some(window_area(&monitor, logical_width))
 }
 
@@ -902,9 +907,18 @@ fn home_bar_area_of_display<A: DisplayApi>(
     maps: &Mutex<ScreenMaps>,
     display_id: u32,
 ) -> Option<Rect> {
+    Some(phone_layout_of_display(api, maps, display_id)?.1)
+}
+
+fn phone_layout_of_display<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<(Rect, Rect)> {
     let monitor = find_monitor_of(api, maps, display_id)?;
-    let area = window_area(&monitor, width_of_display(api, maps, display_id).unwrap_or(DESIGN_WIDTH as i32));
-    Some(home_bar_area(&monitor, area))
+    let fit = lock_maps(maps).fits.get(&display_id).cloned();
+    let area = window_area(&monitor, width_for_mode(monitor.mode.width, fit.as_ref()));
+    Some((monitor.bounds, home_bar_area(&monitor, area)))
 }
 
 fn main_area_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>) -> Option<Rect> {
@@ -1795,6 +1809,11 @@ impl WinPhoneDisplays {
         home_bar_area_of_display(&self.api, &self.maps, display_id)
     }
 
+    /// 用同一次显示器快照返回整屏和底栏，供界面布局与触控区域共用。
+    pub fn phone_layout_of(&self, display_id: u32) -> Option<(Rect, Rect)> {
+        phone_layout_of_display(&self.api, &self.maps, display_id)
+    }
+
     /// 慢操作串行入口；锁中毒（上一次调用 panic）也照常继续。
     fn with_ops<T>(&self, body: impl FnOnce(&mut PhoneScreen<WinDisplay, VddClient>) -> T) -> T {
         let mut guard = match self.ops.lock() {
@@ -2209,6 +2228,7 @@ mod tests {
     #[derive(Default)]
     struct World {
         monitors: Vec<MonitorSnapshot>,
+        snapshot_calls: usize,
         pipe_available: bool,
         restart_ok: bool,
         cursor: Option<Point>,
@@ -2264,7 +2284,9 @@ mod tests {
 
     impl DisplayApi for FakeApi {
         fn active_monitors(&self) -> Vec<MonitorSnapshot> {
-            self.0.lock().unwrap().monitors.clone()
+            let mut world = self.0.lock().unwrap();
+            world.snapshot_calls += 1;
+            world.monitors.clone()
         }
 
         fn has_display_mode(&self, device_name: &str, width: i32, height: i32) -> bool {
@@ -2562,6 +2584,84 @@ mod tests {
         assert!(is_online_of(&screen.api, &screen.maps, id));
         assert_eq!(width_of_display(&screen.api, &screen.maps, id), Some(540));
         assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), Some(ScreenFit::standard()));
+    }
+
+    #[test]
+    fn unchanged_width_uses_one_snapshot_without_writing_resolution_or_dpi() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.snapshot_calls = 0;
+            world.resolutions.clear();
+            world.dpi_calls.clear();
+        }
+        screen.set_width(id, ScreenFit::standard().base_width());
+        let world = shared.lock().unwrap();
+        assert_eq!(world.snapshot_calls, 1);
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+    }
+
+    #[test]
+    fn area_queries_each_use_one_consistent_monitor_snapshot() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let fit = ScreenFit::standard();
+        let id = screen.create(fit.clone()).unwrap();
+        let monitor = {
+            let mut world = shared.lock().unwrap();
+            world.snapshot_calls = 0;
+            world.monitors.iter().find(|m| m.virtual_display_id == Some(id)).unwrap().clone()
+        };
+        let expected_area = window_area(&monitor, fit.base_width());
+        assert_eq!(window_area_of_display(&screen.api, &screen.maps, id), Some(expected_area));
+        {
+            let mut world = shared.lock().unwrap();
+            assert_eq!(world.snapshot_calls, 1);
+            world.snapshot_calls = 0;
+        }
+        assert_eq!(
+            home_bar_area_of_display(&screen.api, &screen.maps, id),
+            Some(home_bar_area(&monitor, expected_area)),
+        );
+        assert_eq!(shared.lock().unwrap().snapshot_calls, 1);
+    }
+
+    #[test]
+    fn phone_layout_uses_one_snapshot_and_preserves_the_work_area_offset() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let fit = ScreenFit::standard();
+        let id = screen.create(fit.clone()).unwrap();
+        let monitor = {
+            let mut world = shared.lock().unwrap();
+            world.snapshot_calls = 0;
+            let monitor = world.monitors.iter_mut().find(|m| m.virtual_display_id == Some(id)).unwrap();
+            monitor.work_area = Rect::new(1930.0, 20.0, 1060.0, 1840.0);
+            monitor.clone()
+        };
+        let area = window_area(&monitor, fit.base_width());
+        assert_eq!(
+            phone_layout_of_display(&screen.api, &screen.maps, id),
+            Some((monitor.bounds, home_bar_area(&monitor, area))),
+        );
+        assert_eq!(shared.lock().unwrap().snapshot_calls, 1);
+    }
+
+    #[test]
+    fn changed_width_refreshes_the_snapshot_after_resolution_settles() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.snapshot_calls = 0;
+            world.resolutions.clear();
+            world.dpi_calls.clear();
+        }
+        screen.set_width(id, 600);
+        let world = shared.lock().unwrap();
+        assert_eq!(world.snapshot_calls, 2, "模式变化后仍须重新采样 DPI");
+        assert_eq!(world.resolutions.len(), 1);
+        assert!(world.dpi_calls.is_empty());
     }
 
     #[test]

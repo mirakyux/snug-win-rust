@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use snug_core::desk::PhoneScreenPhase;
-use snug_core::{AppConfig, Paths, PhoneCatalog};
+use snug_core::{AppConfig, Paths};
 
 use crate::controller::{Controller, TouchEvent};
 use crate::library::Library;
@@ -49,7 +49,7 @@ enum HomeAction {
 /// 改这里必须和 `main.rs` 里 `ViewportBuilder::with_title` 保持一致。
 pub const WINDOW_TITLE: &str = "Snug 手机屏";
 
-/// Periodically wakes eframe so tray and quit polling keeps running for hidden windows.
+/// Keeps native redraws arriving even when egui has merged its pending repaint requests.
 pub struct UiHeartbeat {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -57,6 +57,20 @@ pub struct UiHeartbeat {
 
 impl UiHeartbeat {
     pub fn start(ctx: egui::Context) -> std::io::Result<Self> {
+        // Resolve on the owning GUI thread. Reading our title from the worker would
+        // synchronously send WM_GETTEXT and could deadlock shutdown's worker join.
+        let window = snug_win::find_own_window(WINDOW_TITLE).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "无法找到界面心跳的主窗口")
+        })?;
+        Self::start_with_wake(ctx, move || {
+            let _ = snug_win::request_own_window_redraw(window);
+        })
+    }
+
+    fn start_with_wake(
+        ctx: egui::Context,
+        mut wake: impl FnMut() + Send + 'static,
+    ) -> std::io::Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = running.clone();
         let worker = std::thread::Builder::new()
@@ -66,6 +80,9 @@ impl UiHeartbeat {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     if worker_running.load(Ordering::Relaxed) {
                         ctx.request_repaint();
+                        // egui only invokes its callback once until a new frame consumes it.
+                        // WM_PAINT provides an independent wake without waiting for the UI thread.
+                        wake();
                     }
                 }
             })
@@ -94,8 +111,30 @@ mod heartbeat_tests {
     use super::*;
 
     #[test]
+    fn heartbeat_keeps_native_wakes_running_without_an_egui_frame() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callbacks_for_ctx = callbacks.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            callbacks_for_ctx.fetch_add(1, Ordering::Relaxed);
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut heartbeat = UiHeartbeat::start_with_wake(ctx, move || {
+            let _ = sender.send(());
+        }).unwrap();
+        let first_wake = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        let second_wake = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        heartbeat.stop();
+        assert!(first_wake.is_ok() && second_wake.is_ok(),
+            "native wake must keep ticking when no egui frame consumes the repaint request");
+        assert!(callbacks.load(Ordering::Relaxed) <= 1,
+            "egui merges pending repaint callbacks, so two native wakes must not depend on two callbacks");
+    }
+
+    #[test]
     fn heartbeat_stops_and_releases_its_worker_idempotently() {
-        let mut heartbeat = UiHeartbeat::start(egui::Context::default()).unwrap();
+        let mut heartbeat = UiHeartbeat::start_with_wake(egui::Context::default(), || {}).unwrap();
         let weak = Arc::downgrade(&heartbeat.running);
         heartbeat.stop();
         heartbeat.stop();
@@ -206,15 +245,13 @@ pub enum InstallOutcome {
 impl PhoneHomeApp {
     pub fn new(
         config: AppConfig,
-        catalog: Option<PhoneCatalog>,
         paths: Paths,
         pipe_ready: bool,
         start_minimized: bool,
         controller: Controller,
         ui_heartbeat: UiHeartbeat,
     ) -> Self {
-        let mut settings = SettingsWindow::new();
-        settings.set_catalog(catalog.clone());
+        let settings = SettingsWindow::new();
         // 托盘必须在主线程建（它建的那个隐藏窗口靠 eframe 的消息泵分发），
         // 而 `new` 就是在 `run_native` 的创建回调里跑的。
         let tray = match Tray::new(false) {
@@ -620,7 +657,11 @@ impl PhoneHomeApp {
     /// 对应 C# 里 `PhoneHomeWindow` 始终待在虚拟屏上（由 `_displays.BoundsOf` 定位），
     /// 没有手机屏时整个程序只剩托盘图标。这条是"Rust 版看起来像不像原版"的关键，
     /// 所以失败时只记 warn，不阻塞界面。
-    fn sync_window(&mut self, ctx: &egui::Context) {
+    fn sync_window(
+        &mut self,
+        ctx: &egui::Context,
+        phone_layout: Option<(snug_core::Rect, snug_core::Rect)>,
+    ) {
         let state = self.state();
         let ready = state.screen_phase == PhoneScreenPhase::Ready;
         // 有窗口铺在手机屏上时，我们只留底部那条指示条（C# 里 `PhoneHomeWindow` 隐、
@@ -641,16 +682,16 @@ impl PhoneHomeApp {
             self.preview = None;
             crate::info!("预览：手机屏已就绪，预览窗口让位");
         }
-        if ready && let Some(full_screen) = self.controller.phone_bounds_of(self.active_screen.as_deref()) {
+        if ready && let Some((full_screen, _)) = phone_layout {
             let native = (ctx.pixels_per_point() / ctx.zoom_factor()).max(0.5);
             let zoom = touch_zoom(full_screen.width as f32, full_screen.height as f32, native);
             self.apply_ui_scale(ctx, zoom, "手机触控");
         }
         let bounds = if ready {
             if showing_bar {
-                self.controller.home_bar_area_of(self.active_screen.as_deref())
+                phone_layout.map(|(_, bar)| bar)
             } else {
-                self.controller.phone_bounds_of(self.active_screen.as_deref())
+                phone_layout.map(|(full, _)| full)
             }
         } else if self.preview.is_some() {
             self.preview_rect(ctx)
@@ -764,7 +805,11 @@ impl PhoneHomeApp {
     /// 返回 `None` 表示拿不到主屏区域，调用方按"没有手机屏"处理（窗口挪到屏幕外）。
     fn desktop_layout(&self, ctx: &egui::Context) -> Option<(snug_core::Rect, f32)> {
         let area = self.controller.main_area()?;
-        let fit = snug_core::ScreenFit::from_phone(&self.config.phone.screen.to_fit_spec());
+        let screen = self.active_screen.as_deref()
+            .and_then(|id| self.config.effective_screens().into_iter().find(|screen| screen.id == id))
+            .or_else(|| self.config.primary_touch_screen())
+            .unwrap_or_default();
+        let fit = snug_core::ScreenPlan::fit_of(&screen);
         let (design_width, design_height, scale) = snug_core::ScreenFit::compute_preview_layout(
             snug_core::Size::new(area.width, area.height),
             &fit,
@@ -1022,7 +1067,8 @@ impl eframe::App for PhoneHomeApp {
             return;
         }
         // 手势钩子跟着手机屏与配置走（区域没变时什么都不做）。
-        self.controller.sync_touch(&self.config);
+        // 缩放、摆窗和触控共享本帧的显示器快照，避免每帧重复全量枚举。
+        let phone_layout = self.controller.phone_layout_of(self.active_screen.as_deref());
 
         // 选区结束 → 在选区上方弹"复制"气泡（C# `ShowCopySelectionBubble`）。
         for event in self.controller.take_selection_events() {
@@ -1096,7 +1142,14 @@ impl eframe::App for PhoneHomeApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
         // 界面窗口跟着手机屏走（对应 C# 里 PhoneHomeWindow 一直待在虚拟屏上）。
-        self.sync_window(ctx);
+        self.sync_window(ctx, phone_layout);
+        self.controller.sync_touch(
+            &self.config,
+            self.active_screen.as_deref(),
+            phone_layout.map(|(full, _)| full),
+            self.last_phone_rect,
+            self.bubble.screen_bounds(ctx.pixels_per_point() as f64),
+        );
 
         // 截图覆盖层：过期检查 + 画在最上层。
         self.shots.poll();
@@ -1209,7 +1262,9 @@ impl PhoneHomeApp {
     }
 
     fn draw_mobile_bar(&mut self, ctx: &egui::Context) {
-        let placed = self.state().placed.map(|p| p.window);
+        let state = self.state();
+        let constrained = matches!(state.notice, Some(snug_core::desk::DeskNotice::WindowTooLarge { .. }));
+        let placed = state.placed.map(|p| p.window);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -1232,10 +1287,11 @@ impl PhoneHomeApp {
                         - 76.0
                         - ui.spacing().item_spacing.x * 2.0)
                         .max(0.0);
-                    let label = placed
+                    let app_name = placed
                         .as_ref()
                         .map(|w| w.app_name.as_str())
                         .unwrap_or("手机屏");
+                    let label = if constrained { format!("{app_name} · 尺寸受限") } else { app_name.to_string() };
                     ui.add_sized(
                         [title_width, 48.0],
                         egui::Label::new(egui::RichText::new(label).color(self.palette.text_weak))
@@ -1544,7 +1600,7 @@ impl PhoneHomeApp {
                                         }
                                     }
                                     ui.add_space(12.0);
-                                    if touch_button(ui, "管理设备").clicked() { *action = Some(HomeAction::Settings(SettingsTab::Screens)); close = true; }
+                                    if touch_button(ui, "屏幕与分辨率").clicked() { *action = Some(HomeAction::Settings(SettingsTab::Screens)); close = true; }
                                 }
                                 Some(MobileSheet::Windows(app)) => {
                                     ui.label("选择要铺到手机屏的窗口");
@@ -1587,6 +1643,10 @@ impl PhoneHomeApp {
                                     if touch_button(ui, "取消").clicked() { close = true; }
                                 }
                                 Some(MobileSheet::More) => {
+                                    if let Some(snug_core::desk::DeskNotice::WindowTooLarge { app }) = self.state().notice {
+                                        ui.label(format!("{app} 的最小窗口宽度超出手机屏，部分内容可能在屏幕外。分辨率保持固定，可在应用内调整布局或字号。"));
+                                        ui.add_space(12.0);
+                                    }
                                     if touch_button(ui, "回到当前窗口").clicked() { *action = Some(HomeAction::ReturnPlaced); close = true; }
                                     if touch_button(ui, "显示与字号").clicked() { *action = Some(HomeAction::Settings(SettingsTab::Home)); close = true; }
                                     if touch_button(ui, "切换屏幕").clicked() { next = Some(MobileSheet::Screens); }

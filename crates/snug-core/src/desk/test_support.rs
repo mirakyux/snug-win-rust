@@ -55,6 +55,7 @@ impl Timeline for FakeTimeline {
 pub struct FakeDisplays {
     active: Mutex<Option<u32>>,
     width: Mutex<i32>,
+    width_sets: Mutex<Vec<i32>>,
     fit: Mutex<Option<ScreenFit>>,
     others: Mutex<Vec<OtherDisplay>>,
     fail_creates: AtomicUsize,
@@ -71,6 +72,7 @@ impl Default for FakeDisplays {
         Self {
             active: Mutex::new(None),
             width: Mutex::new(540),
+            width_sets: Mutex::new(Vec::new()),
             fit: Mutex::new(None),
             others: Mutex::new(Vec::new()),
             fail_creates: AtomicUsize::new(0),
@@ -85,6 +87,10 @@ impl Default for FakeDisplays {
 }
 
 impl FakeDisplays {
+    pub fn width_sets(&self) -> Vec<i32> {
+        self.width_sets.lock().expect("width sets").clone()
+    }
+
     pub fn fail_creates(&self, times: usize) {
         self.fail_creates.store(times, Ordering::SeqCst);
     }
@@ -219,6 +225,7 @@ impl PhoneDisplays for FakeDisplays {
     }
 
     fn set_width(&self, display_id: u32, width: i32) {
+        self.width_sets.lock().expect("width sets").push(width);
         if self.active.lock().expect("active").as_ref() == Some(&display_id) {
             *self.width.lock().expect("width") = width;
         }
@@ -264,6 +271,8 @@ impl PhoneDisplays for FakeDisplays {
     }
 }
 
+type CloseButtonHook = Arc<dyn Fn(WindowKey) -> Option<Rect> + Send + Sync>;
+
 /// 假窗口服务，对应 C# `FakeWindows`（并补上 C# 测试里没用到的"列出窗口"能力）。
 pub struct FakeWindows {
     frames: Mutex<HashMap<WindowKey, Rect>>,
@@ -279,6 +288,7 @@ pub struct FakeWindows {
     minimized_calls: Mutex<Vec<(WindowKey, bool)>>,
     full_screen_state: Mutex<HashMap<WindowKey, bool>>,
     minimized_state: Mutex<HashMap<WindowKey, bool>>,
+    close_button_hook: Mutex<Option<CloseButtonHook>>,
 }
 
 impl Default for FakeWindows {
@@ -297,11 +307,16 @@ impl Default for FakeWindows {
             minimized_calls: Mutex::new(Vec::new()),
             full_screen_state: Mutex::new(HashMap::new()),
             minimized_state: Mutex::new(HashMap::new()),
+            close_button_hook: Mutex::new(None),
         }
     }
 }
 
 impl FakeWindows {
+    pub fn on_close_button(&self, hook: impl Fn(WindowKey) -> Option<Rect> + Send + Sync + 'static) {
+        *self.close_button_hook.lock().expect("close button hook") = Some(Arc::new(hook));
+    }
+
     pub fn insert(&self, key: WindowKey, frame: Rect) {
         self.frames.lock().expect("frames").insert(key, frame);
     }
@@ -454,8 +469,9 @@ impl WindowControl for FakeWindows {
         self.frames.lock().expect("frames").remove(&window).is_some()
     }
 
-    fn close_button(&self, _window: WindowKey) -> Option<Rect> {
-        None
+    fn close_button(&self, window: WindowKey) -> Option<Rect> {
+        let hook = self.close_button_hook.lock().expect("close button hook").clone();
+        hook.and_then(|hook| hook(window))
     }
 
     fn frames(&self, _pid: i32) -> HashMap<WindowKey, Rect> {

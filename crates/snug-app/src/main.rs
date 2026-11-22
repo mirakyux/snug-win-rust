@@ -1,7 +1,7 @@
 //! snug —— SnugWin 的 Rust 重写（托盘程序 + 手机屏界面）。
 //!
 //! 阶段：核心逻辑层与虚拟屏管道已移植；显示配置、搬窗、钩子等平台层由 `snug-win` 逐步补齐。
-//! 当前这个二进制已经能：加载配置与机型库、单实例、写日志、把手机屏界面按机型比例显示出来。
+//! 屏幕按用户指定的分辨率工作；旧机型资料只用于读取和迁移历史配置。
 
 mod bubble;
 mod controller;
@@ -19,7 +19,9 @@ mod ui;
 use std::fs::File;
 
 use eframe::egui;
-use snug_core::{AppConfig, Paths, PhoneCatalog, ScreenFit};
+use snug_core::{AppConfig, Paths};
+#[cfg(test)]
+use snug_core::PhoneCatalog;
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -102,13 +104,17 @@ fn main() -> eframe::Result<()> {
     crate::debug!("数据目录 {}", paths.data_dir().display());
 
     let config = load_config(&paths);
-    let catalog = load_catalog();
+    let screen = config.primary_touch_screen()
+        .or_else(|| config.effective_screens().into_iter().next())
+        .unwrap_or_default();
+    let fit = snug_core::ScreenPlan::fit_of(&screen);
+    let (pixel_width, pixel_height) = fit.pixel_size(fit.base_width());
     crate::info!(
-        "配置：手机屏={} 手势={} 机型={:?} 档位基准={}",
+        "配置：手机屏={} 手势={} 分辨率={}×{}",
         config.phone_screen,
         config.gestures,
-        config.phone.model,
-        ScreenFit::from_phone(&config.phone.screen.to_fit_spec()).base_width()
+        pixel_width,
+        pixel_height
     );
 
     let pipe_ready = snug_win::vdd::is_driver_pipe_available(snug_win::vdd::DEFAULT_PIPE_NAME);
@@ -117,7 +123,6 @@ fn main() -> eframe::Result<()> {
         if pipe_ready { "就绪" } else { "未检测到（手机屏功能需要驱动）" }
     );
 
-    let fit = ScreenFit::from_phone(&config.phone.screen.to_fit_spec());
     let logical = fit.size(fit.base_width());
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -145,9 +150,8 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             install_fonts(&cc.egui_ctx)?;
             let repaint_ctx = cc.egui_ctx.clone();
-            // 心跳线程：eframe 在窗口长期没输入时会停在 Wait 上，而我们要靠 `update()`
-            // 去轮询托盘事件、退出请求、搬窗。真机上撞到过"隐藏窗口后一帧都不出"，
-            // 所以这里明确按节奏叫醒它，不依赖"窗口可见"这个前提。
+            // 托盘、退出请求和搬窗仍由主线程处理。egui 会合并未消费的重绘请求，
+            // 心跳因此还向本进程窗口异步投递原生重绘，避免撤屏后一直等不到下一帧。
             let ui_heartbeat = ui::UiHeartbeat::start(cc.egui_ctx.clone())?;
             let controller = controller::Controller::start(
                 &config,
@@ -161,7 +165,6 @@ fn main() -> eframe::Result<()> {
             }
             let mut app = ui::PhoneHomeApp::new(
                 config,
-                catalog,
                 paths.clone(),
                 pipe_ready,
                 start_minimized,
@@ -203,14 +206,7 @@ fn load_config(paths: &Paths) -> AppConfig {
     }
 }
 
-fn load_catalog() -> Option<PhoneCatalog> {
-    let external = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("assets").join("phone-models.json")));
-    load_catalog_from(external.as_deref())
-}
-
-/// exe 旁的资源可覆盖内置机型库；单 exe 分发时不需要任何运行时源码路径。
+#[cfg(test)]
 fn load_catalog_from(external: Option<&std::path::Path>) -> Option<PhoneCatalog> {
     if let Some(path) = external.filter(|path| path.exists()) {
         match PhoneCatalog::load_from_file(path) {

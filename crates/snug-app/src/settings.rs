@@ -22,9 +22,16 @@
 //! 5. 首页切浅色/暗黑/自动，界面配色立刻变（自动跟系统）。
 
 use eframe::egui;
+use snug_core::config::ScreenResolution;
 use snug_core::{
-    AppConfig, AppThemeMode, PhoneCatalog, PhoneChoice, PhoneScreenSpec, ScreenConfig, ScreenFit,
+    AppConfig, AppThemeMode, PhoneChoice, PhoneScreenSpec, ScreenConfig,
 };
+
+fn screen_spec_text(screen: &ScreenConfig) -> String {
+    let fit = snug_core::ScreenPlan::fit_of(screen);
+    let (width, height) = fit.pixel_size(fit.base_width());
+    format!("{width} × {height}")
+}
 
 /// 字号放大档位（C# `ZoomCombo` 的 0~4），与 core 的 `MIN_ZOOM_STEPS`/`MAX_ZOOM_STEPS` 一致。
 pub const ZOOM_LABELS: [&str; 5] = ["0 级（默认）", "+1 级", "+2 级", "+3 级", "+4 级"];
@@ -58,7 +65,7 @@ impl SettingsTab {
             SettingsTab::Gestures => "手势与交互",
             SettingsTab::Diagnostics => "驱动与日志",
             SettingsTab::About => "关于与更新",
-            SettingsTab::Screens => "多屏与设备",
+            SettingsTab::Screens => "屏幕与分辨率",
         }
     }
 
@@ -69,7 +76,7 @@ impl SettingsTab {
             SettingsTab::Gestures => "手势与交互细项",
             SettingsTab::Diagnostics => "驱动状态与实时日志",
             SettingsTab::About => "关于与版本更新",
-            SettingsTab::Screens => "多屏与设备管理",
+            SettingsTab::Screens => "屏幕与分辨率",
         }
     }
 
@@ -284,10 +291,10 @@ pub fn change_hint(impact: ChangeImpact) -> Option<&'static str> {
         ChangeImpact::RefreshHomeBar => Some("相机键会在手机屏底部条上即时刷新。"),
         ChangeImpact::ReloadGestures => Some("手势设置会在下一次接管触控时生效。"),
         ChangeImpact::RebuildPhoneScreen => {
-            Some("机型或字号已改变：下次连接会按新比例重建手机屏，已铺开的窗口会重新归位。")
+            Some("显示与字号设置已保存。")
         }
         ChangeImpact::Theme => None,
-        ChangeImpact::Screens => Some("屏配置已变化：下一次连接会按新配置建屏。"),
+        ChangeImpact::Screens => Some("屏幕设置已保存。切换应用不会更改分辨率。"),
     }
 }
 
@@ -300,30 +307,6 @@ pub fn both_off_hint(cfg: &AppConfig, autostart: bool) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// 机型下拉里显示的当前选择（C# `$"{model ?? "自定义"}（{w} × {h}）"`）。
-pub fn model_text(choice: &PhoneChoice) -> String {
-    let model = choice.model.clone().unwrap_or_else(|| "自定义".to_string());
-    format!("{model}（{} × {}）", choice.screen.width, choice.screen.height)
-}
-
-/// 首页「当前手机屏」卡的第二行（C# `PhoneSpecText`：`1206 × 2622 · 200%`）。
-///
-/// 尺寸取设备本身的物理像素；百分比取 `ScreenFit` 给虚拟屏定的 DPI
-/// （电脑屏且 2 倍会超 4K/2400 时退回 100%，见 C# `TargetDpiPercent`）。
-pub fn spec_text(choice: &PhoneChoice) -> String {
-    let fit = ScreenFit::from_device(
-        &choice.screen.to_fit_spec(),
-        choice.kind,
-        choice.kind.usual_orientation(),
-    );
-    format!(
-        "{} × {} · {}%",
-        choice.screen.width as i64,
-        choice.screen.height as i64,
-        fit.target_dpi_percent(fit.base_width())
-    )
 }
 
 /// 关于页的版本行（C# `AboutVersionText`）。
@@ -360,6 +343,104 @@ pub fn zoom_label(steps: i32) -> &'static str {
     ZOOM_LABELS[zoom_index(steps)]
 }
 
+/// 仅在用户点应用时写入配置的分辨率草稿。
+const RESOLUTION_PRESETS: &[(i32, i32, &str)] = &[
+    (720, 1280, "720 × 1280 · 轻量竖屏"),
+    (900, 1600, "900 × 1600 · 均衡竖屏"),
+    (1080, 1920, "1080 × 1920 · 默认"),
+    (1080, 2400, "1080 × 2400 · 长屏"),
+    (1440, 2560, "1440 × 2560 · 高清竖屏"),
+    (1280, 720, "1280 × 720 · 轻量横屏"),
+    (1920, 1080, "1920 × 1080 · 全高清横屏"),
+    (1200, 1920, "1200 × 1920 · 平板竖屏"),
+    (1536, 2048, "1536 × 2048 · 平板 4:3"),
+    (1600, 1200, "1600 × 1200 · 平板横屏"),
+];
+
+#[derive(Clone)]
+struct ResolutionDraft {
+    width: String,
+    height: String,
+    custom: bool,
+}
+
+impl ResolutionDraft {
+    fn from_screen(screen: &ScreenConfig) -> Self {
+        let fit = snug_core::ScreenPlan::fit_of(screen);
+        let (width, height) = fit.pixel_size(fit.base_width());
+        Self::from_resolution(ScreenResolution { width, height })
+    }
+
+    fn from_resolution(resolution: ScreenResolution) -> Self {
+        Self {
+            width: resolution.width.to_string(),
+            height: resolution.height.to_string(),
+            custom: !RESOLUTION_PRESETS.iter().any(|&(width, height, _)| {
+                resolution == ScreenResolution { width, height }
+            }),
+        }
+    }
+
+    fn select_preset(&mut self, index: usize) {
+        let (width, height, _) = RESOLUTION_PRESETS[index];
+        *self = Self::from_resolution(ScreenResolution { width, height });
+    }
+
+    fn label(&self) -> &'static str {
+        if self.custom { return "自定义"; }
+        RESOLUTION_PRESETS.iter().find_map(|&(width, height, label)| {
+            (self.resolution() == Some(ScreenResolution { width, height })).then_some(label)
+        }).unwrap_or("自定义")
+    }
+
+    fn resolution(&self) -> Option<ScreenResolution> {
+        let resolution = ScreenResolution {
+            width: self.width.trim().parse().ok()?,
+            height: self.height.trim().parse().ok()?,
+        };
+        resolution.is_valid().then_some(resolution)
+    }
+
+    fn apply(&self, screen: &mut ScreenConfig) -> bool {
+        let Some(resolution) = self.resolution() else { return false };
+        if screen.resolution == Some(resolution) { return false; }
+        screen.resolution = Some(resolution);
+        true
+    }
+}
+
+fn resolution_fields(ui: &mut egui::Ui, draft: &mut ResolutionDraft, id: &str) {
+    ui.label("分辨率（物理像素）");
+    egui::ComboBox::from_id_salt(("resolution-preset", id))
+        .selected_text(draft.label())
+        .width(ui.available_width())
+        .truncate()
+        .show_ui(ui, |ui| {
+            for (index, &(_, _, label)) in RESOLUTION_PRESETS.iter().enumerate() {
+                if ui.add_sized([ui.available_width(), 48.0], egui::Button::new(label)).clicked() {
+                    draft.select_preset(index);
+                }
+            }
+            if ui.add_sized([ui.available_width(), 48.0], egui::Button::new("自定义")).clicked() {
+                draft.custom = true;
+            }
+        });
+    if draft.custom {
+        let field_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(48.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("宽");
+                ui.add_sized([field_width, 48.0], egui::TextEdit::singleline(&mut draft.width));
+            });
+            ui.vertical(|ui| {
+                ui.label("高");
+                ui.add_sized([field_width, 48.0], egui::TextEdit::singleline(&mut draft.height));
+            });
+        });
+        if draft.resolution().is_none() { ui.label("宽高需为 320–8192 之间的偶数。"); }
+    }
+}
+
 /// 设置窗口本体。字段都是界面自己的状态，不持有控制器/平台层。
 pub struct SettingsWindow {
     open: bool,
@@ -372,28 +453,16 @@ pub struct SettingsWindow {
     manual_override: bool,
     /// 诊断页的日志文本（app 层追加）。
     logs: String,
-    /// 机型库：默认内置在 exe 中，允许 exe 旁的 assets/phone-models.json 覆盖。
-    catalog: Option<PhoneCatalog>,
     /// 待执行动作队列。
     actions: Vec<SettingsAction>,
     /// 打开窗口时的配置快照，用来算“改了什么”。
     baseline: Option<AppConfig>,
     /// 最近一次改动的提示，换页/关窗后清空。
     last_hint: Option<&'static str>,
-    /// 多屏页「添加一块屏」的三个选择（只属于界面状态，不进配置）。
     new_screen_kind: snug_core::DeviceKind,
-    new_screen_orientation: snug_core::ScreenOrientation,
-    new_screen_model: Option<String>,
-    /// 添加屏时填的名字（C# `AddScreenNameBox`）：空就用建议名。
     new_screen_name: String,
-    /// 正在给第几块屏挑机型（`None` = 没在挑）。对应 C# 的 `PhoneModelWindow`，
-    /// 我们把它做成多屏页里的内嵌选择器，不再单开一个窗口。
-    model_picker: Option<usize>,
-    /// 机型选择器的搜索词。
-    model_search: String,
-    /// 机型选择器里的自定义分辨率（C# `CustomWidthBox` / `CustomHeightBox`）。
-    custom_width: String,
-    custom_height: String,
+    new_screen_resolution: ResolutionDraft,
+    resolution_drafts: std::collections::HashMap<String, ResolutionDraft>,
     /// 只在设置页内确认本次收屏，避免与自动开屏总开关混淆。
     confirm_dismiss: bool,
 }
@@ -414,45 +483,15 @@ impl SettingsWindow {
             autostart: false,
             manual_override: false,
             logs: String::new(),
-            catalog: None,
             actions: Vec::new(),
             baseline: None,
             last_hint: None,
             new_screen_kind: snug_core::DeviceKind::Phone,
-            new_screen_orientation: snug_core::ScreenOrientation::Portrait,
-            new_screen_model: None,
             new_screen_name: String::new(),
-            model_picker: None,
-            model_search: String::new(),
-            custom_width: String::new(),
-            custom_height: String::new(),
+            new_screen_resolution: ResolutionDraft::from_resolution(ScreenResolution::DEFAULT),
+            resolution_drafts: std::collections::HashMap::new(),
             confirm_dismiss: false,
         }
-    }
-
-    /// 打开机型选择器（`index` 是 `screens` 里的第几块）。
-    ///
-    /// 三件事一起做，避免调用点各写一遍写漏：清搜索词、清自定义输入框，
-    /// 当前这块屏如果本来就是自定义分辨率，就把它的宽高填进去方便微调
-    /// （C# `PhoneHomeWindow.xaml.cs:689-695` 的判断：`Model is null` 且输入框为空）。
-    fn open_model_picker(&mut self, index: usize, device: Option<&PhoneChoice>) {
-        self.model_picker = Some(index);
-        self.model_search.clear();
-        self.custom_width.clear();
-        self.custom_height.clear();
-        if let Some(device) = device
-            && device.model.is_none()
-        {
-            self.custom_width = device.screen.width.to_string();
-            self.custom_height = device.screen.height.to_string();
-        }
-    }
-
-    /// 把输入框里的宽高解析成自定义规格；两个都填且合法才返回（C# `Custom(w, h)`）。
-    fn custom_spec_from_inputs(&self) -> Option<PhoneScreenSpec> {
-        let width = self.custom_width.trim().parse::<i32>().ok();
-        let height = self.custom_height.trim().parse::<i32>().ok();
-        PhoneScreenSpec::custom(width, height)
     }
 
     /// 打开窗口（C# 里是 `new SettingsWindow(...)` + `Show()`）。
@@ -493,9 +532,7 @@ impl SettingsWindow {
         self.manual_override = enabled;
     }
 
-    pub fn set_catalog(&mut self, catalog: Option<PhoneCatalog>) {
-        self.catalog = catalog;
-    }
+
 
     pub fn set_logs(&mut self, logs: impl Into<String>) {
         self.logs = logs.into();
@@ -641,8 +678,8 @@ impl SettingsWindow {
             let count = cfg.effective_screens().len();
             if Self::mobile_link(
                 ui,
-                "多屏与设备",
-                &format!("{} 块已配置 · {}", count, model_text(&cfg.phone)),
+                "屏幕与分辨率",
+                &format!("{} 块已配置 · {}", count, cfg.primary_touch_screen().map(|screen| screen_spec_text(&screen)).unwrap_or_else(|| "1080 × 1920".into())),
             ) {
                 self.tab = SettingsTab::Screens;
             }
@@ -1005,15 +1042,14 @@ impl SettingsWindow {
         ui.add_space(8.0);
 
         // ---- 当前手机屏卡 ----
-        let model_line = model_text(&cfg.phone);
-        let spec_line = spec_text(&cfg.phone);
+        let spec_line = cfg.primary_touch_screen().map(|screen| screen_spec_text(&screen))
+            .unwrap_or_else(|| "1080 × 1920".into());
         let zoom_steps_now = cfg.zoom_steps;
         let zoom_lbl = zoom_label(zoom_steps_now);
         let enabled_screens = cfg.effective_screens().iter().filter(|s| s.enabled).count();
         let mut go_screens = false;
         let mut zoom_click: Option<i32> = None;
-        Self::card(ui, "当前手机屏", |ui| {
-            ui.label(egui::RichText::new(&model_line).size(15.0).strong());
+        Self::card(ui, "当前屏幕", |ui| {
             ui.label(egui::RichText::new(&spec_line).small().weak());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1026,23 +1062,10 @@ impl SettingsWindow {
                 }
             });
             ui.add_space(4.0);
-            let mut pick_model = false;
             ui.horizontal(|ui| {
-                if ui.button("预览界面").clicked() {
-                    self.actions.push(SettingsAction::OpenPreview);
-                }
-                if ui.button("换机型...").clicked() {
-                    pick_model = true;
-                }
+                if ui.button("预览界面").clicked() { self.actions.push(SettingsAction::OpenPreview); }
+                if ui.button("分辨率设置").clicked() { self.tab = SettingsTab::Screens; }
             });
-            if pick_model {
-                // 机型选择器画在「多屏与设备」页里，所以要跟着跳过去。
-                // 首页这块卡对应 `screens[0]`，预填也用它的设备（不是 `cfg.phone`：
-                // 多屏时主手机屏未必是第一块）。
-                let first = cfg.effective_screens().into_iter().next();
-                self.open_model_picker(0, first.as_ref().map(|screen| &screen.device));
-                self.tab = SettingsTab::Screens;
-            }
             ui.add_space(4.0);
             if ui
                 .add(egui::Button::new(format!("多屏 {enabled_screens}/4 ›")).frame(false))
@@ -1122,7 +1145,7 @@ impl SettingsWindow {
         let mut remove: Option<usize> = None;
 
         ui.label(
-            egui::RichText::new(format!("最多 {} 块屏，每块对应一台设备", ScreenConfig::LIMIT))
+            egui::RichText::new(format!("最多 {} 块虚拟屏，每块独立设置分辨率", ScreenConfig::LIMIT))
                 .small()
                 .weak(),
         );
@@ -1134,14 +1157,13 @@ impl SettingsWindow {
 
         for (index, screen) in screens.iter_mut().enumerate() {
             let title = screen.name.clone();
-            let badge = format!(
-                "{} · {}",
-                screen.device.kind.display_name(),
-                screen.orientation.display_name()
-            );
-            let spec = spec_text(&screen.device);
+            let fit = snug_core::ScreenPlan::fit_of(screen);
+            let (width, height) = fit.pixel_size(fit.base_width());
+            let badge = format!("{} · 固定分辨率", if width > height { "横屏" } else { "竖屏" });
+            let spec = screen_spec_text(screen);
             let mut remove_this = false;
-            let mut pick_this = false;
+            let draft = self.resolution_drafts.entry(screen.id.clone())
+                .or_insert_with(|| ResolutionDraft::from_screen(screen));
             Self::card(ui, &title, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1172,14 +1194,25 @@ impl SettingsWindow {
                     if ui.button("预览界面").clicked() {
                         self.actions.push(SettingsAction::OpenPreview);
                     }
-                    if ui.button("换机型...").clicked() {
-                        pick_this = true;
+                });
+                ui.add_space(8.0);
+                resolution_fields(ui, draft, &screen.id);
+                ui.label(egui::RichText::new("预设和自定义仅在点击“应用分辨率”后生效。").small().weak());
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(draft.resolution().is_some(),
+                        egui::Button::new("应用分辨率").min_size(egui::vec2(120.0, 48.0))).clicked() {
+                        changed |= draft.apply(screen);
+                    }
+                    if ui.add(egui::Button::new("恢复默认").min_size(egui::vec2(112.0, 48.0))).clicked() {
+                        let orientation = if width > height {
+                            snug_core::ScreenOrientation::Landscape
+                        } else {
+                            snug_core::ScreenOrientation::Portrait
+                        };
+                        *draft = ResolutionDraft::from_resolution(ScreenResolution::default_for(orientation));
                     }
                 });
             });
-            if pick_this {
-                self.open_model_picker(index, Some(&screen.device));
-            }
             if remove_this {
                 remove = Some(index);
             }
@@ -1194,6 +1227,7 @@ impl SettingsWindow {
         ui.separator();
         ui.add_space(6.0);
         ui.label(egui::RichText::new("添加一块屏").strong());
+        let previous_kind = self.new_screen_kind;
         ui.horizontal_wrapped(|ui| {
             ui.label("类型");
             for (kind, label) in [
@@ -1204,198 +1238,40 @@ impl SettingsWindow {
                 ui.selectable_value(&mut self.new_screen_kind, kind, label);
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("方向");
-            for (orientation, label) in [
-                (snug_core::ScreenOrientation::Portrait, "竖屏"),
-                (snug_core::ScreenOrientation::Landscape, "横屏"),
-            ] {
-                ui.selectable_value(&mut self.new_screen_orientation, orientation, label);
-            }
-        });
-        // 电脑屏固定横屏（C# `ScreenConfig.Sanitize` 也是这么兜的）。
-        if self.new_screen_kind == snug_core::DeviceKind::Computer {
-            self.new_screen_orientation = snug_core::ScreenOrientation::Landscape;
-        }
-
-        if self.catalog.is_some() {
-            let mut selected = self.new_screen_model.clone();
-            let selected_label = selected
-                .as_ref()
-                .map(|id| {
-                    self.catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.find_model(id))
-                        .map(|model| format!("{} {}", model.brand, model.name))
-                        .unwrap_or_else(|| id.clone())
-                })
-                .unwrap_or_else(|| "（选择机型）".to_string());
-            egui::ComboBox::from_id_salt("snug-new-screen-model")
-                .selected_text(selected_label)
-                .width(ui.available_width().min(280.0))
-                .truncate()
-                .show_ui(ui, |ui| {
-                    if let Some(catalog) = &self.catalog {
-                        for model in catalog.models() {
-                            let id = model.id();
-                            let label = format!(
-                                "{} {}（{} × {}）",
-                                model.brand, model.name, model.screen.width, model.screen.height
-                            );
-                            if ui.add(egui::Button::new(label).selected(selected.as_ref() == Some(&id)).wrap()).clicked() {
-                                selected = Some(id);
-                            }
-                        }
-                    }
-                });
-            self.new_screen_model = selected;
-        }
-
-        // 名字（C# `AddScreenNameBox`）：留空就按机型与方向自动取。
-        ui.label("名字");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.new_screen_name)
-                .hint_text("留空 = 按机型自动取名")
-                .desired_width(ui.available_width())
-                .min_size(egui::vec2(0.0, 48.0)),
-        );
-
-        let can_add = screens.len() < ScreenConfig::LIMIT && self.new_screen_model.is_some();
-        if ui
-            .add_enabled(can_add, egui::Button::new("选型号并添加"))
-            .on_disabled_hover_text(if screens.len() >= ScreenConfig::LIMIT {
-                "已经到上限 4 块"
-            } else {
-                "先选一个机型"
+        if previous_kind != self.new_screen_kind && !self.new_screen_resolution.custom
+            && self.new_screen_resolution.resolution().is_some_and(|resolution| {
+                resolution == ScreenResolution::DEFAULT
+                    || resolution == ScreenResolution::default_for(snug_core::ScreenOrientation::Landscape)
             })
-            .clicked()
         {
-            if let (Some(model_id), Some(catalog)) = (&self.new_screen_model, &self.catalog)
-                && let Some(model) = catalog.find_model(model_id)
-            {
-                let mut device = PhoneChoice::from_model(model);
-                device.kind = self.new_screen_kind;
-                let typed_name = self.new_screen_name.trim().to_string();
-                let screen = ScreenConfig {
-                    // id 留空，`sanitize()` 会补一个 GUID（C# `ScreenConfig.Sanitize` 同）。
-                    id: String::new(),
-                    orientation: self.new_screen_orientation,
-                    device: device.clone(),
-                    enabled: true,
-                    name: if typed_name.is_empty() {
-                        ScreenConfig::suggested_name(&device, self.new_screen_orientation)
-                    } else {
-                        typed_name
-                    },
-                }
-                .sanitize();
-                screens.push(screen);
+            self.new_screen_resolution = ResolutionDraft::from_resolution(
+                ScreenResolution::default_for(self.new_screen_kind.usual_orientation()),
+            );
+        }
+        resolution_fields(ui, &mut self.new_screen_resolution, "new-screen");
+        ui.label("名字（可选）");
+        ui.add(egui::TextEdit::singleline(&mut self.new_screen_name)
+            .hint_text("例如：手机工作区")
+            .desired_width(ui.available_width()).min_size(egui::vec2(0.0, 48.0)));
+        let can_add = screens.len() < ScreenConfig::LIMIT && self.new_screen_resolution.resolution().is_some();
+        if ui.add_enabled(can_add, egui::Button::new("添加屏幕").min_size(egui::vec2(120.0,48.0))).clicked() {
+            if let Some(resolution) = self.new_screen_resolution.resolution() {
+                let device = PhoneChoice {
+                    model: None,
+                    screen: PhoneScreenSpec::new(resolution.width, resolution.height, None),
+                    kind: self.new_screen_kind,
+                };
+                let orientation = if resolution.width > resolution.height {
+                    snug_core::ScreenOrientation::Landscape
+                } else { snug_core::ScreenOrientation::Portrait };
+                let typed_name = self.new_screen_name.trim();
+                screens.push(ScreenConfig {
+                    id: String::new(), device, orientation, enabled: true,
+                    name: if typed_name.is_empty() { format!("屏幕 {}", screens.len()+1) } else { typed_name.to_string() },
+                    resolution: Some(resolution),
+                }.sanitize());
                 self.new_screen_name.clear();
                 changed = true;
-            }
-        }
-
-        // ---- 机型选择器（C# `PhoneModelWindow` 的内嵌版）----
-        if let Some(index) = self.model_picker {
-            if index >= screens.len() {
-                self.model_picker = None;
-            } else {
-                let kind = screens[index].device.kind;
-                let mut chosen: Option<PhoneChoice> = None;
-                let mut custom_apply = false;
-                let mut cancel = false;
-                Self::card(ui, "选择机型", |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.model_search)
-                            .hint_text("搜索品牌 / 型号")
-                            .desired_width(ui.available_width())
-                            .min_size(egui::vec2(0.0, 48.0)),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("取消").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    let needle = self.model_search.trim().to_lowercase();
-                    // 自定义区块的显示条件要用命中数，所以它得活到 ScrollArea 外面。
-                    let mut shown = 0usize;
-                    egui::ScrollArea::vertical()
-                        .id_salt("snug-model-picker")
-                        .max_height(260.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            let Some(catalog) = self.catalog.as_ref() else {
-                                ui.label(egui::RichText::new("没有加载到机型库").weak());
-                                return;
-                            };
-                            for model in catalog.models() {
-                                if model.kind != kind {
-                                    continue;
-                                }
-                                let haystack =
-                                    format!("{} {}", model.brand, model.name).to_lowercase();
-                                if !needle.is_empty() && !haystack.contains(&needle) {
-                                    continue;
-                                }
-                                shown += 1;
-                                let label = format!(
-                                    "{} {}（{} × {}）",
-                                    model.brand, model.name, model.screen.width, model.screen.height
-                                );
-                                if ui.add(egui::Button::new(label).wrap()).clicked() {
-                                    chosen = Some(PhoneChoice::from_model(model));
-                                }
-                            }
-                            if shown == 0 {
-                                ui.label(egui::RichText::new("没有匹配的机型").weak());
-                            }
-                        });
-                    // 自定义分辨率（C# `CustomModelSection`）：没在搜索、或搜索没结果时露出来，
-                    // 免得一搜机型就被这块占地方。
-                    if needle.is_empty() || shown == 0 {
-                        ui.separator();
-                        ui.label(egui::RichText::new("自定义分辨率").strong());
-                        ui.columns(2, |columns| {
-                            columns[0].label("宽");
-                            let width = columns[0].available_width();
-                            columns[0].add(egui::TextEdit::singleline(&mut self.custom_width)
-                                .desired_width(width).min_size(egui::vec2(0.0, 48.0)).hint_text("1080"));
-                            columns[1].label("高");
-                            let width = columns[1].available_width();
-                            columns[1].add(egui::TextEdit::singleline(&mut self.custom_height)
-                                .desired_width(width).min_size(egui::vec2(0.0, 48.0)).hint_text("2400"));
-                        });
-                        if ui.add_sized([ui.available_width(), 48.0], egui::Button::new("应用自定义")).clicked() {
-                            custom_apply = true;
-                        }
-                        ui.label(
-                            egui::RichText::new("两个都要填；横向填的宽高会自动摆成竖屏")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                });
-                // 列表里点选的机型优先；没点选就是"应用自定义"。
-                let picked = chosen.or_else(|| {
-                    if !custom_apply {
-                        return None;
-                    }
-                    self.custom_spec_from_inputs()
-                        .map(|spec| PhoneChoice { model: None, screen: spec, kind })
-                });
-                if let Some(mut device) = picked {
-                    device.kind = kind;
-                    let orientation = screens[index].orientation;
-                    screens[index].name =
-                        ScreenConfig::suggested_name(&device, orientation);
-                    screens[index].device = device;
-                    changed = true;
-                    self.model_picker = None;
-                }
-                if cancel {
-                    self.model_picker = None;
-                }
-                ui.add_space(6.0);
             }
         }
 
@@ -1581,6 +1457,96 @@ impl SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restoring_default_preserves_applied_orientation_and_waits_for_apply() {
+        for (width, height, expected) in [
+            (720, 1280, ScreenResolution::DEFAULT),
+            (1280, 720, ScreenResolution { width: 1920, height: 1080 }),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx, false);
+            let mut cfg = standard().sanitize();
+            let screen = &mut cfg.screens.as_mut().unwrap()[0];
+            // Applying a landscape preset can leave the legacy orientation unchanged.
+            screen.orientation = snug_core::ScreenOrientation::Portrait;
+            screen.resolution = Some(ScreenResolution { width, height });
+            let before = cfg.clone();
+            let mut window = SettingsWindow::new();
+            window.open();
+            window.select_tab(SettingsTab::Screens);
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 1800.0))),
+                    ..Default::default()
+                }, |ctx| { window.show(ctx, &mut cfg); });
+            }
+            let output = click_settings_label(&ctx, &output, "恢复默认", &mut window, &mut cfg);
+            assert_eq!(cfg, before, "restoring the draft must not apply it");
+            click_settings_label(&ctx, &output, "应用分辨率", &mut window, &mut cfg);
+            assert_eq!(cfg.effective_screens()[0].resolution, Some(expected));
+        }
+    }
+
+    #[test]
+    fn resolution_presets_and_default_are_only_applied_by_explicit_action() {
+        let mut screen = ScreenConfig::default();
+        let before = screen.clone();
+        let mut draft = super::ResolutionDraft::from_screen(&screen);
+        draft.select_preset(0);
+        assert_eq!(screen, before, "choosing a preset is not applying");
+        assert!(draft.apply(&mut screen));
+        assert_eq!(super::screen_spec_text(&screen), "720 × 1280");
+        let applied = screen.clone();
+        draft.width = "721".into();
+        assert!(!draft.apply(&mut screen));
+        assert_eq!(screen, applied, "invalid input must not alter the applied mode");
+        draft = super::ResolutionDraft::from_resolution(ScreenResolution::DEFAULT);
+        assert_eq!(screen, applied, "resetting draft must not change the current resolution");
+        assert!(draft.apply(&mut screen));
+        assert_eq!((draft.width.as_str(), draft.height.as_str()), ("1080", "1920"));
+    }
+
+    #[test]
+    fn landscape_and_existing_custom_dimensions_are_not_normalised_to_a_model() {
+        let mut screen = ScreenConfig::default();
+        screen.resolution = Some(ScreenResolution { width: 1080, height: 1900 });
+        let mut draft = ResolutionDraft::from_screen(&screen);
+        assert!(draft.custom);
+        assert_eq!(draft.label(), "自定义");
+        assert!(!draft.apply(&mut screen));
+        draft.select_preset(6);
+        assert_eq!(draft.resolution(), Some(ScreenResolution { width: 1920, height: 1080 }));
+        draft.custom = true;
+        draft.width = "1280".into();
+        draft.height = "720".into();
+        assert!(draft.apply(&mut screen));
+        assert_eq!(screen_spec_text(&screen), "1280 × 720");
+    }
+
+    #[test]
+    fn screen_can_be_added_with_the_default_resolution_without_a_model_catalog() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut cfg = standard();
+        cfg.screens = Some(Vec::new());
+        let mut window = SettingsWindow::new();
+        window.open();
+        window.select_tab(SettingsTab::Screens);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 1000.0))),
+                ..Default::default()
+            }, |ctx| { window.show(ctx, &mut cfg); });
+        }
+        click_settings_label(&ctx, &output, "添加屏幕", &mut window, &mut cfg);
+        let screens = cfg.effective_screens();
+        assert_eq!(screens.len(), 1);
+        assert_eq!(screens[0].resolution, Some(ScreenResolution::DEFAULT));
+        assert_eq!(screens[0].device.model, None);
+    }
+
     use super::*;
 
     #[test]
@@ -1691,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_settings_pages_and_model_picker_do_not_overflow_with_long_labels() {
+    fn mobile_settings_and_custom_resolution_do_not_overflow_with_long_labels() {
         for width in [320.0, 400.0, 540.0] {
             for tab in SettingsTab::ALL {
                 let mut cfg = standard();
@@ -1702,17 +1668,7 @@ mod tests {
                     version: "1.0.1".into(),
                     progress: 0.42,
                 });
-                window.set_catalog(Some(PhoneCatalog::from_json(
-                    r#"{"phone":[{"name":"Apple","models":[{"name":"A model with a deliberately long readable name to exercise narrow layout","screen":[1080,2400]}]}]}"#,
-                ).expect("model catalog")));
-                window.new_screen_model = window
-                    .catalog
-                    .as_ref()
-                    .and_then(|catalog| catalog.models().next())
-                    .map(|model| model.id());
-                if tab == SettingsTab::Screens {
-                    window.open_model_picker(0, Some(&cfg.phone));
-                }
+                window.new_screen_resolution.custom = true;
                 let output = draw_settings_at(width, &mut window, &mut cfg);
                 let overflow = output
                     .shapes
@@ -1810,65 +1766,6 @@ mod tests {
     }
 
     #[test]
-    fn model_text_falls_back_to_custom() {
-        let choice = PhoneChoice {
-            model: None,
-            screen: snug_core::PhoneScreenSpec::new(1080, 2400, None),
-            kind: snug_core::DeviceKind::Phone,
-        };
-        assert_eq!(model_text(&choice), "自定义（1080 × 2400）");
-        assert!(model_text(&PhoneChoice::standard()).starts_with("Apple iPhone 17 Pro Max（1320 × 2868"));
-    }
-
-    #[test]
-    fn custom_resolution_inputs_need_both_sides_and_normalise_orientation() {
-        let mut window = SettingsWindow::new();
-        // 只填一边不算：C# `Custom(w, h)` 任何一边为 null 都返回 null，界面点了也没反应。
-        window.custom_width = "1080".to_string();
-        assert!(window.custom_spec_from_inputs().is_none());
-
-        window.custom_height = "2400".to_string();
-        let spec = window.custom_spec_from_inputs().expect("两个都填且合法");
-        assert_eq!((spec.width, spec.height), (1080, 2400));
-
-        // 横向填的宽高自动摆成竖屏（0 也走同一条 `custom`，别在这里另写规则）。
-        window.custom_width = "2400".to_string();
-        window.custom_height = "1080".to_string();
-        let spec = window.custom_spec_from_inputs().expect("横向输入也合法");
-        assert_eq!((spec.width, spec.height), (1080, 2400));
-
-        // 越界与非数字一律 None。
-        window.custom_width = "0".to_string();
-        assert!(window.custom_spec_from_inputs().is_none());
-        window.custom_width = "abc".to_string();
-        assert!(window.custom_spec_from_inputs().is_none());
-    }
-
-    #[test]
-    fn opening_the_model_picker_prefills_only_custom_resolutions() {
-        let custom = PhoneChoice {
-            model: None,
-            screen: snug_core::PhoneScreenSpec::new(1080, 2400, None),
-            kind: snug_core::DeviceKind::Phone,
-        };
-        let mut window = SettingsWindow::new();
-        window.open_model_picker(1, Some(&custom));
-        assert_eq!(window.model_picker, Some(1));
-        assert_eq!(window.custom_width, "1080");
-        assert_eq!(window.custom_height, "2400");
-
-        // 有型号名的屏不预填，而且要清掉上一次留下的输入与搜索词。
-        let mut window = SettingsWindow::new();
-        window.custom_width = "999".to_string();
-        window.custom_height = "999".to_string();
-        window.model_search = "iphone".to_string();
-        window.open_model_picker(0, Some(&PhoneChoice::standard()));
-        assert!(window.custom_width.is_empty());
-        assert!(window.custom_height.is_empty());
-        assert!(window.model_search.is_empty());
-    }
-
-    #[test]
     fn version_line_mentions_package_kind() {
         assert_eq!(version_line("1.2.0", true), "当前版本：v1.2.0（自包含版）");
         assert_eq!(version_line("1.2.0", false), "当前版本：v1.2.0（框架依赖版）");
@@ -1912,13 +1809,6 @@ mod tests {
         after.screens = Some(screens);
         assert_eq!(classify_change(&before, &after), ChangeImpact::Screens);
         assert!(change_hint(ChangeImpact::Screens).is_some());
-    }
-
-    #[test]
-    fn spec_line_follows_screen_fit_dpi() {
-        // 标准 iPhone：200%（虚拟屏按 2 倍下发）。
-        let standard_phone = PhoneChoice::standard();
-        assert!(spec_text(&standard_phone).ends_with("200%"));
     }
 
     #[test]

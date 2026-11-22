@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::geometry::Size;
+use crate::config::ScreenResolution;
 use crate::phone_models::{DeviceKind, ScreenOrientation};
 
 pub const DESIGN_WIDTH: f64 = 540.0;
@@ -86,6 +87,7 @@ pub struct ScreenFit {
     widths: Vec<i32>,
     orientation: ScreenOrientation,
     kind: DeviceKind,
+    resolution: Option<ScreenResolution>,
 }
 
 impl ScreenFit {
@@ -114,6 +116,7 @@ impl ScreenFit {
             widths,
             orientation: ScreenOrientation::Portrait,
             kind: DeviceKind::Phone,
+            resolution: None,
         }
     }
 
@@ -218,7 +221,7 @@ impl ScreenFit {
 
         if kind == DeviceKind::Computer {
             let w = MIN_LONG_SIDE.max(wanted_width.unwrap_or(1920));
-            return Self { ratio, base_width: w, widths: vec![w], orientation, kind };
+            return Self { ratio, base_width: w, widths: vec![w], orientation, kind, resolution: None };
         }
 
         let min_w = if orientation == ScreenOrientation::Portrait { MIN_SHORT_SIDE } else { MIN_LONG_SIDE };
@@ -238,11 +241,35 @@ impl ScreenFit {
         if widths.is_empty() {
             widths.push(base_width);
         }
-        Self { ratio, base_width, widths, orientation, kind }
+        Self { ratio, base_width, widths, orientation, kind, resolution: None }
     }
 
     pub fn standard() -> Self {
         Self::from_phone(&PhoneSpec::standard())
+    }
+
+    /// 用户手动应用的物理尺寸，只注册这一种模式，不按机型公式再换算比例。
+    pub fn with_resolution(mut self, resolution: ScreenResolution) -> Self {
+        if !resolution.is_valid() {
+            return self;
+        }
+        self.resolution = Some(resolution);
+        self.ratio = f64::from(resolution.height) / f64::from(resolution.width);
+        self.base_width = resolution.width / self.resolution_multiplier(resolution);
+        self.widths = vec![self.base_width];
+        self
+    }
+
+    pub fn resolution(&self) -> Option<ScreenResolution> {
+        self.resolution
+    }
+
+    fn resolution_multiplier(&self, resolution: ScreenResolution) -> i32 {
+        if self.kind == DeviceKind::Computer && (resolution.width > 3840 || resolution.height > 2400) {
+            1
+        } else {
+            2
+        }
     }
 
     pub fn ratio(&self) -> f64 {
@@ -274,6 +301,10 @@ impl ScreenFit {
 
     /// 某个逻辑宽度对应的逻辑尺寸（宽 × 高）。
     pub fn size(&self, width: i32) -> Size {
+        if let Some(resolution) = self.resolution {
+            let scale = f64::from(self.resolution_multiplier(resolution));
+            return Size::new(f64::from(resolution.width) / scale, f64::from(resolution.height) / scale);
+        }
         Size::new(width as f64, round_away_zero(width as f64 * self.ratio))
     }
 
@@ -282,6 +313,9 @@ impl ScreenFit {
     /// 触屏固定 2 倍（200% DPI）；电脑屏超过 3840×2400 时退回 1 倍，
     /// 否则 4K 屏会被放大成 8K，虚拟屏驱动扛不住。
     pub fn pixel_size(&self, logical_width: i32) -> (i32, i32) {
+        if let Some(resolution) = self.resolution {
+            return (resolution.width, resolution.height);
+        }
         let logical = self.size(logical_width);
         let multiplier = if self.kind == DeviceKind::Computer
             && (logical.width * 2.0 > 3840.0 || logical.height * 2.0 > 2400.0)
@@ -303,6 +337,9 @@ impl ScreenFit {
 
     /// 目标 DPI 百分比（C# `TargetDpiPercent`），与 [`Self::pixel_size`] 同一判据。
     pub fn target_dpi_percent(&self, logical_width: i32) -> i32 {
+        if let Some(resolution) = self.resolution {
+            return self.resolution_multiplier(resolution) * 100;
+        }
         let logical = self.size(logical_width);
         if self.kind == DeviceKind::Computer
             && (logical.width * 2.0 > 3840.0 || logical.height * 2.0 > 2400.0)
@@ -373,6 +410,17 @@ impl PartialEq for ScreenFit {
             && self.base_width == other.base_width
             && self.orientation == other.orientation
             && self.kind == other.kind
+            && self.resolution == other.resolution
+    }
+}
+
+impl std::hash::Hash for ScreenFit {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ratio.to_bits().hash(state);
+        self.base_width.hash(state);
+        self.orientation.hash(state);
+        self.kind.hash(state);
+        self.resolution.hash(state);
     }
 }
 
@@ -384,12 +432,37 @@ pub fn round_away_zero(v: f64) -> f64 {
 impl std::fmt::Display for ScreenFit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.size(self.base_width);
+        if let Some(resolution) = self.resolution {
+            return write!(f, "{}x{}@{}x{}px", self.base_width, s.height as i32, resolution.width, resolution.height);
+        }
         write!(f, "{}x{}", self.base_width, s.height as i32)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_resolution_is_exact_single_mode_and_part_of_identity() {
+        use std::hash::{Hash, Hasher};
+        let recommended = super::ScreenFit::standard();
+        let manual = recommended.clone().with_resolution(super::ScreenResolution { width: 1080, height: 1900 });
+        let custom = recommended.clone().with_resolution(super::ScreenResolution { width: 1280, height: 720 });
+        assert_eq!(custom.pixel_size(custom.base_width()), (1280, 720));
+        assert_eq!(custom.registration_order(), vec![640]);
+        assert_eq!(custom.target_dpi_percent(custom.base_width()), 200);
+        assert_eq!(custom.size(custom.base_width()), super::Size::new(640.0, 360.0));
+        assert_eq!(recommended.pixel_size(recommended.base_width()), (1080, 1900));
+        assert_ne!(recommended, manual);
+        assert_ne!(recommended.to_string(), manual.to_string());
+        let digest = |fit: &super::ScreenFit| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            fit.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(digest(&manual), digest(&manual.clone()));
+        assert_ne!(digest(&recommended), digest(&manual));
+    }
+
     use super::*;
 
     fn base_area() -> Size {

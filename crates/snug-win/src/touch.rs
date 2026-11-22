@@ -21,7 +21,7 @@
 //! 5. 钩子生效时任务栏图标上不该出现"卡鼠标"的拖影；拔掉手机屏后鼠标立即恢复正常。
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -213,6 +213,8 @@ pub struct HookEngine {
     options: TouchOptions,
     held_press_point: Option<Point>,
     passthrough_browser_chrome: bool,
+    passthrough_regions: Vec<Rect>,
+    copy_bubble: Option<Rect>,
     require_injected_flag: bool,
     logged_first_flag: bool,
 }
@@ -226,6 +228,8 @@ impl Default for HookEngine {
             options: TouchOptions::default(),
             held_press_point: None,
             passthrough_browser_chrome: false,
+            passthrough_regions: Vec::new(),
+            copy_bubble: None,
             // C# 默认只接管注入事件（UU 远程模拟出来的鼠标）。
             require_injected_flag: true,
             logged_first_flag: false,
@@ -246,6 +250,20 @@ impl HookEngine {
     /// 全部区域（界面/测试用）。
     pub fn regions(&self) -> &[TouchRegion] {
         &self.regions
+    }
+
+    /// 界面提供的已知直通区域；钩子只做矩形命中，不同步查询窗口或进程。
+    pub fn set_passthrough_regions(&mut self, areas: Vec<Rect>, copy_bubble: Option<Rect>) {
+        self.passthrough_regions = areas;
+        self.copy_bubble = copy_bubble;
+    }
+
+    fn passthrough_hit(&self, point: Point) -> BubbleHit {
+        let on_bubble = self.copy_bubble.is_some_and(|area| area.contains(point));
+        BubbleHit {
+            on_bubble,
+            browser_chrome: !on_bubble && self.passthrough_regions.iter().any(|area| area.contains(point)),
+        }
     }
 
     /// 换一组区域（C# v1.3 `SetRegions`）。
@@ -588,38 +606,13 @@ struct ReplayJob {
 /// 钩子线程与重放线程共享的东西。
 struct HookContext {
     engine: Arc<Mutex<HookEngine>>,
-    desktop: WinDesktop,
+    require_injected_flag: Arc<AtomicBool>,
     replay: SyncSender<ReplayJob>,
     events: Arc<dyn TouchEvents>,
     started: Instant,
 }
 
 impl HookContext {
-    /// 落点是不是复制气泡 / 浏览器工具栏（C# `IsSelectionBubbleAt`）。
-    fn bubble_at(&self, point: Point, scale: f64) -> BubbleHit {
-        let Some(hit) = self.desktop.window_at_point(point) else {
-            return BubbleHit::default();
-        };
-        let root = self.desktop.root_of(hit).unwrap_or(hit);
-        let Some(probe) = self.desktop.probe(root) else {
-            return BubbleHit::default();
-        };
-        if probe.pid <= 0 {
-            return BubbleHit::default();
-        }
-        if is_copy_bubble(probe.pid, &probe.title, std::process::id() as i32) {
-            return BubbleHit { on_bubble: true, browser_chrome: false };
-        }
-        let meta = self.desktop.process_meta(probe.pid);
-        let Some(exe) = meta.app_id else {
-            return BubbleHit::default();
-        };
-        if !is_browser_exe(&exe) {
-            return BubbleHit::default();
-        }
-        BubbleHit { on_bubble: false, browser_chrome: browser_chrome_hit(point, probe.rect, scale) }
-    }
-
     /// C# `HookCallback` 的 Win32 壳子。
     ///
     /// 返回 `Some(swallow)`：`true` = 吞掉这次事件，`false`/`None` = 交给下一个钩子。
@@ -629,6 +622,11 @@ impl HookContext {
         let point = Point::new(info.pt.x as f64, info.pt.y as f64);
         let injected = info.flags & LLMHF_INJECTED != 0;
         let replay_marked = info.dwExtraInfo == REPLAY_MARKER;
+        // 真实鼠标与自己重放的事件不应等待手势状态锁，更不能被一次慢命中探测拖住。
+        // 引擎内保留相同过滤，防止配置切换时仅靠此快照接管不该处理的输入。
+        if replay_marked || (self.require_injected_flag.load(Ordering::Acquire) && !injected) {
+            return Some(false);
+        }
         let now = self.started.elapsed().as_secs_f64();
 
         let outcome = {
@@ -636,9 +634,12 @@ impl HookContext {
                 Ok(engine) => engine,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            engine.on_event(kind, point, now, injected, replay_marked, |at, scale| {
-                self.bubble_at(at, scale)
-            })
+            let hit = if kind == TouchInputKind::Press {
+                engine.passthrough_hit(point)
+            } else {
+                BubbleHit::default()
+            };
+            engine.on_event(kind, point, now, injected, replay_marked, |_, _| hit)
         };
 
         if outcome.dismiss_bubble {
@@ -685,6 +686,7 @@ struct Worker {
 /// 手势翻译服务（C# `TouchHookService`）。
 pub struct TouchHook {
     engine: Arc<Mutex<HookEngine>>,
+    require_injected_flag: Arc<AtomicBool>,
     injector: Arc<dyn InputInjector>,
     events: Arc<dyn TouchEvents>,
     desktop: WinDesktop,
@@ -703,8 +705,11 @@ impl TouchHook {
     }
 
     pub fn with_parts(injector: Arc<dyn InputInjector>, events: Arc<dyn TouchEvents>) -> Self {
+        let engine = HookEngine::new();
+        let require_injected_flag = Arc::new(AtomicBool::new(engine.require_injected_flag()));
         Self {
-            engine: Arc::new(Mutex::new(HookEngine::new())),
+            engine: Arc::new(Mutex::new(engine)),
+            require_injected_flag,
             injector,
             events,
             desktop: WinDesktop,
@@ -749,11 +754,17 @@ impl TouchHook {
         self.lock_engine().set_options(options);
     }
 
+    /// 整屏面板、浏览器工具栏与复制气泡由界面提供物理矩形。
+    pub fn set_passthrough_regions(&self, areas: Vec<Rect>, copy_bubble: Option<Rect>) {
+        self.lock_engine().set_passthrough_regions(areas, copy_bubble);
+    }
+
     pub fn require_injected_flag(&self) -> bool {
         self.lock_engine().require_injected_flag()
     }
 
     pub fn set_require_injected_flag(&self, require: bool) {
+        self.require_injected_flag.store(require, Ordering::Release);
         self.lock_engine().set_require_injected_flag(require);
     }
 
@@ -782,7 +793,7 @@ impl TouchHook {
 
         let context = Arc::new(HookContext {
             engine: self.engine.clone(),
-            desktop: self.desktop,
+            require_injected_flag: self.require_injected_flag.clone(),
             replay: replay_tx,
             events: self.events.clone(),
             started: Instant::now(),
@@ -1015,6 +1026,98 @@ mod tests {
         assert_eq!(hook_input_kind(WM_MOUSEMOVE), Some(TouchInputKind::Drag));
         assert_eq!(hook_input_kind(WM_LBUTTONUP), Some(TouchInputKind::Release));
         assert_eq!(hook_input_kind(0x0200 | 0x8000), None, "别的消息不归我们管");
+    }
+
+    #[test]
+    fn physical_and_replay_events_bypass_a_busy_engine_but_translated_input_waits() {
+        for (injected, replay_marked, require_injected, bypasses) in [
+            (false, false, true, true),
+            (true, true, true, true),
+            (false, true, false, true),
+            (true, false, true, false),
+            (false, false, false, false),
+        ] {
+            let engine = Arc::new(Mutex::new(HookEngine::new()));
+            let (replay, _receiver) = mpsc::sync_channel(REPLAY_QUEUE);
+            let context = HookContext {
+                engine: engine.clone(),
+                require_injected_flag: Arc::new(AtomicBool::new(require_injected)),
+                replay,
+                events: Arc::new(NoopEvents),
+                started: Instant::now(),
+            };
+            let held = engine.lock().unwrap();
+            let (started, ready) = mpsc::channel();
+            let (done, completed) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut info = MSLLHOOKSTRUCT::default();
+                if injected {
+                    info.flags |= LLMHF_INJECTED;
+                }
+                if replay_marked {
+                    info.dwExtraInfo = REPLAY_MARKER;
+                }
+                started.send(()).unwrap();
+                let outcome = context.dispatch(WM_MOUSEMOVE, &info);
+                done.send(outcome).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let while_locked = completed.recv_timeout(Duration::from_millis(100));
+            // 断言前解锁并等线程退出，回归失败也不能遗留永久等待的测试线程。
+            drop(held);
+            worker.join().unwrap();
+            if bypasses {
+                assert_eq!(while_locked.unwrap(), Some(false), "直通输入不应等引擎锁");
+            } else {
+                assert!(matches!(while_locked, Err(RecvTimeoutError::Timeout)));
+                assert_eq!(completed.recv_timeout(Duration::from_secs(2)).unwrap(), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn injected_filter_setter_updates_both_the_fast_path_and_engine() {
+        let hook = TouchHook::with_parts(Arc::new(WinInput), Arc::new(NoopEvents));
+        for require in [false, true] {
+            hook.set_require_injected_flag(require);
+            assert_eq!(hook.require_injected_flag.load(Ordering::Acquire), require);
+            assert_eq!(hook.require_injected_flag(), require);
+        }
+    }
+
+    #[test]
+    fn dispatch_uses_known_passthrough_rectangles_without_a_desktop_probe() {
+        let hook = TouchHook::with_parts(Arc::new(WinInput), Arc::new(NoopEvents));
+        hook.engine.lock().unwrap().set_region(Some(region()));
+        let toolbar = Rect::new(0.0, 0.0, 540.0, 100.0);
+        let bubble = Rect::new(100.0, 200.0, 120.0, 48.0);
+        hook.set_passthrough_regions(vec![toolbar, bubble], Some(bubble));
+        {
+            let engine = hook.engine.lock().unwrap();
+            assert_eq!(engine.passthrough_hit(Point::new(110.0, 210.0)),
+                BubbleHit { on_bubble: true, browser_chrome: false });
+            assert_eq!(engine.passthrough_hit(Point::new(110.0, 50.0)),
+                BubbleHit { on_bubble: false, browser_chrome: true });
+        }
+        let (replay, _receiver) = mpsc::sync_channel(REPLAY_QUEUE);
+        // 上下文不持有桌面适配器：真实 Press 路径仅依赖输入与已知矩形。
+        let context = HookContext {
+            engine: hook.engine.clone(),
+            require_injected_flag: hook.require_injected_flag.clone(),
+            replay,
+            events: Arc::new(NoopEvents),
+            started: Instant::now(),
+        };
+        for (x, y, swallowed) in [(110, 50, false), (110, 210, false), (300, 300, true)] {
+            let mut info = MSLLHOOKSTRUCT::default();
+            info.pt.x = x;
+            info.pt.y = y;
+            info.flags |= LLMHF_INJECTED;
+            assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(swallowed));
+            assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(swallowed));
+        }
+        hook.set_passthrough_regions(Vec::new(), None);
+        assert_eq!(hook.engine.lock().unwrap().passthrough_hit(Point::new(110.0, 210.0)), BubbleHit::default());
     }
 
     #[test]
