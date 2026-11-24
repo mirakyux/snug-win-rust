@@ -20,7 +20,7 @@ Snug 用 virtual-display-rs 创建和撤销手机屏，由 Windows 设置实际�
 
 在“通用 → 驱动与日志”可查看系统安装的驱动版本、设备问题代码和管道访问状态。如果驱动连接中断或取消了管理员授权，可以点“重试驱动连接”。分辨率应用失败时，屏幕详情页允许重新应用同一尺寸。
 
-Snug 内嵌上游 `v0.3.1` 安装包。修复了两处画面资源释放问题的 `0.4.0.1` 驱动在独立分支开发，接入发行版前需完成发行签名和真机验收。见 [驱动开发分支](https://github.com/mirakyux/snug-win-rust/tree/feature/driver-0.4.0.1)。
+仓库包含固定提交的驱动源码和两处画面资源释放补丁，可独立构建 Windows x64 驱动 `0.4.0.1`。在驱动发行签名和真机验收完成前，Snug 的常规构建和发布继续内嵌上游 `v0.3.1` 安装包。详见 [驱动构建与验收](driver/README.md)。
 
 ## 更新
 
@@ -54,7 +54,8 @@ assets/
   phone-models.json   机型库（853 款：手机 / 平板 / 电脑），与 C# 版共用
   *.ico               应用与托盘图标
 docs/                 移植对照、验收单、多屏与线程模型、体积预算
-driver/               虚拟显示器驱动安装脚本
+driver/               驱动安装、源码版本记录和独立构建说明
+vendor/virtual-display-rs/  固定提交的驱动源码与资源释放补丁
 references/           上游源码的浅克隆，仅供对照，已在 .gitignore 中
 tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真值 TSV）
 ```
@@ -127,6 +128,12 @@ pwsh -File scripts/build-release.ps1    # dist/snug.exe；另保留自动更新 
 cargo build --release -p snug-app --offline --target-dir target\release-check
 ```
 
+若需要从源码编译驱动，请准备 WDK 与 LLVM，再执行下面的命令。脚本输出 DLL、INF、CAT、校验和与 ABI 对照结果。参数与签名方法见 [驱动构建指南](driver/README.md)。
+
+```powershell
+pwsh -File scripts/build-driver.ps1
+```
+
 ## 发版
 
 在 GitHub Actions 中运行 `Release`。工作流依据 `Cargo.toml` 的版本构建和打包，通过检查后创建 Release 草稿。
@@ -140,6 +147,7 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 - [docs/release.md](docs/release.md) — 发版流程（版本号、门禁、资产名、更新源）
 - [docs/real-machine-test.md](docs/real-machine-test.md) — 真机测试记录
 - [docs/display-parity.md](docs/display-parity.md) — 虚拟屏链路与原版逐行对拍
+- [docs/driver-hardening-20261123.md](docs/driver-hardening-20261123.md) — 驱动可靠性改进与验证记录
 - [docs/ui-parity.md](docs/ui-parity.md) — 界面与原版对照
 - [docs/ui-fusion-20261122.md](docs/ui-fusion-20261122.md) — v1.0.5 界面融合与验证记录
 - [docs/size-budget.md](docs/size-budget.md) — 体积预算与已做的取舍
@@ -147,4 +155,4 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 
 ## 许可
 
-Snug 应用使用 MIT 许可证。内嵌的上游 `v0.3.1` 驱动安装包使用 AGPLv3，附有对应版本的源码和许可证链接。详见 [应用许可证](LICENSE) 与 [第三方声明](THIRD_PARTY_NOTICES.md)。
+Snug 应用和仓库中的驱动源码使用 MIT 许可证。默认内嵌的旧版驱动安装包使用 AGPLv3，附有对应版本的源码和许可证链接。详见 [应用许可证](LICENSE) 与 [第三方声明](THIRD_PARTY_NOTICES.md)。

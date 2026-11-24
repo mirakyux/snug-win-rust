@@ -44,7 +44,7 @@ snug.exe
 版本与三个哈希写死在 `scripts/fetch-driver.ps1` 和 `driver/Install-SnugDriver.ps1` 两处，
 升级驱动要同时改这两处，更新 `driver.rs` 的固定哈希回归断言，并重跑真机验收。
 
-`0.4.0.1` 的源码和构建脚本位于 [驱动开发分支](https://github.com/mirakyux/snug-win-rust/tree/feature/driver-0.4.0.1)。更换内嵌驱动前，需核对发行签名和哈希，并在 Windows 上验收全新安装、升级及卸载。
+仓库内的补丁版驱动另行构建和签名，见 [驱动构建与验收](../driver/README.md)。更换内嵌驱动时，需同时核对新版安装包的安装、升级和卸载行为，以及发布产物的签名与哈希。
 
 `build-release.ps1` 会用 Rust 侧的 `sha256_hex` 再算一遍 exe 与 zip，和 `Get-FileHash`
 比对——两套独立实现，发布链最容易在这里悄悄分叉。

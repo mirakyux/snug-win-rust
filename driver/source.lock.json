@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/MolotovCherry/virtual-display-rs",
+  "commit": "22fcd2e065aac13745cb27dc869848091b9e3a23",
+  "license": "MIT",
+  "cargoPackage": "virtual-display-driver",
+  "driverVersion": "0.4.0.1",
+  "driverDate": "11/23/2026",
+  "sourceArchiveSha256": "6026df3a5521b4b8d22997d6de5fd898fbd0a4386ba13ffdc15833c2ac9a5f70"
+}

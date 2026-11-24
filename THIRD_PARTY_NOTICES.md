@@ -10,6 +10,7 @@ SnugWin incorporates or relies on the following third-party projects and data:
 
 2. **MolotovCherry/virtual-display-rs**
    - The default embedded Windows IddCx driver is the upstream [v0.3.1 installer ZIP](https://github.com/MolotovCherry/virtual-display-rs/releases/tag/v0.3.1). Its [corresponding source](https://github.com/MolotovCherry/virtual-display-rs/tree/561fd024b3d00271f7d793e9d7f7390becc97352) and [license](https://github.com/MolotovCherry/virtual-display-rs/blob/561fd024b3d00271f7d793e9d7f7390becc97352/LICENSE) are distributed by the upstream project under GNU AGPLv3. The official ZIP, MSI and certificate are checked against pinned SHA-256 values.
+   - The separately buildable [vendored source](vendor/virtual-display-rs/) is based on [commit 22fcd2e](https://github.com/MolotovCherry/virtual-display-rs/tree/22fcd2e065aac13745cb27dc869848091b9e3a23), copyright (c) 2024 Cherry, under the [MIT License](vendor/virtual-display-rs/LICENSE). See [driver source and build notes](driver/README.md) for Snug's changes.
 
 3. **.NET Runtime / WPF / xUnit**
    - License: MIT License / Apache-2.0

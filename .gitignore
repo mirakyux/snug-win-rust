@@ -1,4 +1,5 @@
 /target
+/vendor/virtual-display-rs/target/
 /references
 *.user
 *.pdb
