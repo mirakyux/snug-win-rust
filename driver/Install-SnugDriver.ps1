@@ -1,6 +1,6 @@
 ﻿# 虚拟显示器驱动：安装 / 卸载 / 状态
 #
-# 驱动本身是 MolotovCherry/virtual-display-rs（MIT），我们不重编、不改造，
+# 此脚本安装 MolotovCherry/virtual-display-rs v0.3.1 官方二进制（AGPLv3），
 # 只做「校验 + 安装 + 归属记录」三件事：
 #   1. 校验安装包与证书的 SHA-256（版本与哈希写死在下面，不接受其他来源）；
 #   2. 用 msiexec 静默安装，再等命名管道 \\.\pipe\virtualdisplaydriver 起来；

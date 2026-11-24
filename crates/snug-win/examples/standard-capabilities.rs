@@ -71,12 +71,20 @@ fn main() -> std::io::Result<()> {
         Ok(code) => serde_json::json!({ "query": "ok", "validate_status": code }),
         Err(code) => serde_json::json!({ "query": "failed", "query_status": code }),
     };
+    let health = snug_win::driver_health::DriverHealth::probe();
     println!(
         "{}",
         serde_json::json!({
             "elevated": false,
             "driver_access": driver_access,
             "driver_error": driver_error,
+            "driver_health": {
+                "installed": health.installed,
+                "version": health.version,
+                "started": health.started,
+                "problem_code": health.problem_code,
+                "access": format!("{:?}", health.access),
+            },
             "display_validation": display_validation,
             "topology_mutations": 0,
             "driver_commands_sent": 0,

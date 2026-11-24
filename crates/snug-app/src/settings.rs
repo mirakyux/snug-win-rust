@@ -120,6 +120,8 @@ pub enum SettingsAction {
     OpenLogDirectory,
     /// 安装 / 修复虚拟显示器驱动（C# `OnInstallDriver`）。
     InstallDriver,
+    RetryDriverConnection,
+    RetryResolution(String),
     /// 打开 GitHub 仓库主页（C# `OnOpenRepo`）。
     OpenRepository,
     /// 以管理员身份重启（C# `OnRestartElevated`）。
@@ -139,6 +141,10 @@ pub enum SettingsAction {
 pub struct StatusInfo {
     /// `snug_win::vdd::is_driver_pipe_available`：`\\.\pipe\virtualdisplaydriver` 是否在。
     pub pipe_available: bool,
+    pub driver_health: Option<snug_win::driver_health::DriverHealth>,
+    pub driver_reconnecting: bool,
+    pub driver_connection_result: Option<String>,
+    pub failed_resolution_screen: Option<String>,
     /// 当前进程是否管理员。
     pub elevated: bool,
     /// 手机屏是否已就绪（决定状态灯颜色）。
@@ -157,6 +163,10 @@ impl Default for StatusInfo {
     fn default() -> Self {
         Self {
             pipe_available: false,
+            driver_health: None,
+            driver_reconnecting: false,
+            driver_connection_result: None,
+            failed_resolution_screen: None,
             elevated: false,
             phone_screen_ready: false,
             can_reenter: false,
@@ -315,9 +325,9 @@ pub fn version_line(current_version: &str, self_contained: bool) -> String {
 /// 驱动页的管道文案（C# `DiagPipeText`）。
 pub fn pipe_text(available: bool) -> String {
     if available {
-        r"已连接命名管道 \\.\pipe\virtualdisplaydriver".to_string()
+        "检测到驱动管道".to_string()
     } else {
-        r"未检测到命名管道 \\.\pipe\virtualdisplaydriver".to_string()
+        "未检测到驱动管道".to_string()
     }
 }
 
@@ -1081,6 +1091,9 @@ impl SettingsWindow {
                 .small()
                 .weak(),
         );
+        if self.status.failed_resolution_screen.as_deref() == Some(id) {
+            ui.colored_label(ui.visuals().error_fg_color, "Windows 未确认目标分辨率，请重新应用。");
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
@@ -1089,7 +1102,11 @@ impl SettingsWindow {
                 )
                 .clicked()
             {
-                changed |= draft.apply(&mut screen);
+                if draft.apply(&mut screen) {
+                    changed = true;
+                } else {
+                    self.actions.push(SettingsAction::RetryResolution(id.into()));
+                }
             }
             if ui
                 .add(egui::Button::new("恢复默认").min_size(egui::vec2(112.0, 48.0)))
@@ -1350,14 +1367,52 @@ impl SettingsWindow {
     }
 
     fn page_diagnostics(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("virtual-display-rs 0.3.1 驱动通道").strong());
+        use snug_win::VddProtocol;
+        use snug_win::driver_health::PipeAccess;
+        ui.label(egui::RichText::new("Virtual Display 驱动").strong());
         ui.label(
             egui::RichText::new(pipe_text(self.status.pipe_available))
                 .small()
                 .weak(),
         );
+        if let Some(health) = &self.status.driver_health {
+            ui.label(match &health.version {
+                Some(version) => format!("已安装版本 {version}"),
+                None if health.installed => "已安装，版本读取失败".into(),
+                None => "未检测到设备".into(),
+            });
+            if let Some(code) = health.problem_code {
+                ui.label(format!("Windows 设备问题代码 {code}"));
+            } else if health.started == Some(false) {
+                ui.label("Windows 设备尚未启动");
+            }
+            ui.label(match health.access {
+                PipeAccess::Direct(VddProtocol::V2) => "可直接连接 · 双向协议",
+                PipeAccess::Direct(VddProtocol::Legacy) => "可直接连接 · 旧版协议",
+                PipeAccess::RequiresElevation => "连接需要管理员授权",
+                PipeAccess::Busy => "驱动管道繁忙",
+                PipeAccess::Missing => "驱动管道尚未出现",
+                PipeAccess::Unavailable => "驱动管道暂不可访问",
+            });
+        }
+        if let Some(result) = &self.status.driver_connection_result {
+            ui.label(result);
+        }
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.status.driver_reconnecting,
+                    egui::Button::new(if self.status.driver_reconnecting {
+                        "正在连接…"
+                    } else {
+                        "重试驱动连接"
+                    }),
+                )
+                .clicked()
+            {
+                self.actions.push(SettingsAction::RetryDriverConnection);
+            }
             if ui.button("安装 / 修复驱动").clicked() {
                 self.actions.push(SettingsAction::InstallDriver);
             }
@@ -1622,6 +1677,9 @@ mod tests {
         window.open();
         assert_eq!(window.tab(), SettingsTab::Home);
         assert!(window.needs_logs());
+        let output = settle_settings(&ctx, &mut window, &mut cfg);
+        click_settings_label(&ctx, &output, "重试驱动连接", &mut window, &mut cfg);
+        assert_eq!(window.take_actions(), vec![SettingsAction::RetryDriverConnection]);
         let output = settle_settings(&ctx, &mut window, &mut cfg);
         click_settings_label(&ctx, &output, "安装 / 修复驱动", &mut window, &mut cfg);
         assert_eq!(window.take_actions(), vec![SettingsAction::InstallDriver]);
@@ -2073,8 +2131,8 @@ mod tests {
 
     #[test]
     fn pipe_and_elevation_text_match_csharp() {
-        assert_eq!(pipe_text(true), r"已连接命名管道 \\.\pipe\virtualdisplaydriver");
-        assert_eq!(pipe_text(false), r"未检测到命名管道 \\.\pipe\virtualdisplaydriver");
+        assert_eq!(pipe_text(true), "检测到驱动管道");
+        assert_eq!(pipe_text(false), "未检测到驱动管道");
         assert_eq!(elevation_text(true), "管理员权限运行中");
         assert_eq!(elevation_text(false), "当前权限：普通用户");
     }

@@ -128,40 +128,121 @@ fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "VDD broker operation timed out")
 }
 
-/// A failed/cancelled launch is remembered for this GUI lifetime to avoid repeated UAC prompts.
+/// An automatic launch or transport failure requires a fresh, explicit user action.
 enum Session {
     Unstarted,
     Connected(Broker),
-    Failed(String),
+    Failed(BrokerFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerFailure {
+    Cancelled,
+    Launch(String),
+    Disconnected(String),
+}
+
+impl std::fmt::Display for BrokerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("已取消驱动权限请求"),
+            Self::Launch(error) => write!(f, "驱动权限代理启动失败：{error}"),
+            Self::Disconnected(error) => write!(f, "驱动权限代理已断开：{error}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerStatus {
+    Idle,
+    Busy,
+    Connected,
+    Failed(BrokerFailure),
 }
 
 static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
 
+pub fn status() -> BrokerStatus {
+    let Some(session) = SESSION.get() else {
+        return BrokerStatus::Idle;
+    };
+    match session.try_lock().as_deref() {
+        Ok(Session::Unstarted) => BrokerStatus::Idle,
+        Ok(Session::Connected(_)) => BrokerStatus::Connected,
+        Ok(Session::Failed(failure)) => BrokerStatus::Failed(failure.clone()),
+        Err(std::sync::TryLockError::WouldBlock) => BrokerStatus::Busy,
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            BrokerStatus::Failed(BrokerFailure::Disconnected("状态锁不可用".into()))
+        }
+    }
+}
+
 pub(crate) fn request(request: Request) -> io::Result<Reply> {
+    request_with_retry(request, false)
+}
+
+/// Explicit retry performs a non-mutating probe. Never replay an interrupted display write.
+pub fn retry_connection() -> io::Result<Option<VddProtocol>> {
+    let reply = request_with_retry(Request::State, true)?;
+    Ok(reply.legacy.map(|legacy| {
+        if legacy {
+            VddProtocol::Legacy
+        } else {
+            VddProtocol::V2
+        }
+    }))
+}
+
+fn launch_failure(error: &io::Error) -> BrokerFailure {
+    const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04c7u32 as i32;
+    if error.raw_os_error() == Some(1223)
+        || error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<windows::core::Error>())
+            .is_some_and(|source| source.code().0 == ERROR_CANCELLED_HRESULT)
+    {
+        BrokerFailure::Cancelled
+    } else {
+        BrokerFailure::Launch(error.to_string())
+    }
+}
+
+fn request_with_retry(request: Request, explicit: bool) -> io::Result<Reply> {
     request.validate()?;
     let mut session = SESSION
         .get_or_init(|| Mutex::new(Session::Unstarted))
         .lock()
         .map_err(|_| io::Error::other("VDD broker session lock poisoned"))?;
-    if matches!(*session, Session::Unstarted) {
-        *session = match Broker::start() {
-            Ok(broker) => Session::Connected(broker),
-            Err(error) => Session::Failed(error.to_string()),
-        };
-    }
-    let result = match &mut *session {
-        Session::Connected(broker) => broker.request(&request),
-        Session::Failed(message) => return Err(io::Error::other(message.clone())),
-        Session::Unstarted => unreachable!(),
-    };
-    if let Err(error) = &result {
-        *session = Session::Failed(error.to_string());
-    }
-    let reply = result?;
+    let reply = transact(&mut session, explicit, Broker::start, |broker| {
+        broker.request(&request)
+    })?;
     match &reply.error {
         Some(error) => Err(io::Error::other(error.clone())),
         None => Ok(reply),
     }
+}
+
+fn transact<T>(
+    session: &mut Session,
+    explicit: bool,
+    start: impl FnOnce() -> io::Result<Broker>,
+    exchange: impl FnOnce(&mut Broker) -> io::Result<T>,
+) -> io::Result<T> {
+    if matches!(session, Session::Unstarted) || explicit && matches!(session, Session::Failed(_)) {
+        *session = match start() {
+            Ok(broker) => Session::Connected(broker),
+            Err(error) => Session::Failed(launch_failure(&error)),
+        };
+    }
+    let result = match session {
+        Session::Connected(broker) => exchange(broker),
+        Session::Failed(failure) => return Err(io::Error::other(failure.to_string())),
+        Session::Unstarted => unreachable!(),
+    };
+    if let Err(error) = &result {
+        *session = Session::Failed(BrokerFailure::Disconnected(error.to_string()));
+    }
+    result
 }
 
 struct Broker {
@@ -633,6 +714,55 @@ mod tests {
                 refresh_rates: vec![60],
             }],
         }
+    }
+
+    #[test]
+    fn cancelled_launch_and_lost_transport_require_explicit_retry() {
+        let mut session = Session::Unstarted;
+        let cancelled = transact::<()>(
+            &mut session,
+            false,
+            || Err(io::Error::from_raw_os_error(1223)),
+            |_| unreachable!(),
+        );
+        assert!(cancelled.is_err());
+        assert!(matches!(session, Session::Failed(BrokerFailure::Cancelled)));
+        assert!(
+            transact::<()>(
+                &mut session,
+                false,
+                || panic!("automatic retry prompted"),
+                |_| unreachable!()
+            )
+            .is_err()
+        );
+
+        let dummy_broker = || -> io::Result<Broker> {
+            use std::os::windows::io::AsHandle;
+            let name = format!("snug-vdd-{}-{:032x}", std::process::id(), 987654_u64);
+            let pipe = create_server(&name)?;
+            let process = pipe.as_handle().try_clone_to_owned()?;
+            Ok(Broker { pipe, process })
+        };
+        transact(&mut session, true, dummy_broker, |_| Ok(())).unwrap();
+        assert!(matches!(session, Session::Connected(_)));
+        let disconnected =
+            transact::<()>(&mut session, false, || unreachable!(), |_| Err(timed_out()));
+        assert!(disconnected.is_err());
+        assert!(matches!(
+            session,
+            Session::Failed(BrokerFailure::Disconnected(_))
+        ));
+        assert!(
+            transact::<()>(
+                &mut session,
+                false,
+                || panic!("interrupted operation replayed"),
+                |_| unreachable!()
+            )
+            .is_err()
+        );
+        transact(&mut session, true, dummy_broker, |_| Ok(())).unwrap();
     }
 
     #[test]

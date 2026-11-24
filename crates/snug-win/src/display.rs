@@ -358,7 +358,6 @@ pub trait VirtualDisplays: Send {
     fn replace_legacy(&mut self, remove_ids: &[u32], add: &[VddMonitor]) -> Result<(), VddError>;
     fn remove(&mut self, ids: &[u32]) -> Result<(), VddError>;
     fn remove_all(&mut self) -> Result<(), VddError>;
-    fn is_legacy(&self) -> bool;
 }
 
 impl VirtualDisplays for VddClient {
@@ -378,9 +377,6 @@ impl VirtualDisplays for VddClient {
         VddClient::remove_all(self)
     }
 
-    fn is_legacy(&self) -> bool {
-        VddClient::is_legacy(self)
-    }
 }
 
 /// 轮询节奏，对应 C# 里的几个常量与 `Task.Delay` 值。测试里改成 0 就瞬间返回。
@@ -561,7 +557,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         }
 
         // C#：`string.IsNullOrWhiteSpace(displayName) ? PhoneScreenSpec.Name : displayName`。
-        let vdd_name = name.filter(|value| !value.trim().is_empty()).unwrap_or(MONITOR_NAME);
+        let vdd_name = name
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(MONITOR_NAME);
 
         let before_monitors = self.api.active_monitors();
         let existing: HashSet<String> = before_monitors
@@ -580,7 +578,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         for candidate in candidates_starting_after(existing_virtual_count) {
             // C# v1.3.0：已经归本程序管的编号不再重复 Notify，否则会把那块屏
             // 的模式覆盖成这次请求的档位（多屏时两块屏会互踩）。
-            if lock_maps(&self.maps).fits.contains_key(&candidate) {
+            if lock_maps(&self.maps).fits.contains_key(&candidate)
+                || before_monitors.iter().any(|monitor| monitor.virtual_display_id == Some(candidate))
+            {
                 continue;
             }
             let monitor = VddMonitor {
@@ -593,12 +593,12 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 // C# `PhoneDisplayService.cs:73`：`Log.Warn($"手机屏（id={candidateId}）IPC Notify 失败：{ex.Message}")`
                 // 这一行是排障关键：没有它，「Notify 全被驱动拒了」和「Notify 成功但驱动
                 // 没把屏挂上来」在日志里长得一模一样。
-                crate::warn(&format!(
-                    "手机屏（id={candidate}）IPC Notify 失败：{error}"
-                ));
+                crate::warn(&format!("手机屏（id={candidate}）IPC Notify 失败：{error}"));
                 continue;
             }
-            let Some(snapshot) = self.wait_for_online(&existing, candidate, base_width, base_height) else {
+            let Some(snapshot) =
+                self.wait_for_online(&existing, candidate, base_width, base_height)
+            else {
                 // C# `6f548dd`：超时后**不要** Remove 这个 id。那个 id 可能对应 C# 版
                 // 或别的程序建的屏（同机跑两版时很常见），误删会把别人的手机屏拆掉。
                 // 只跳过这个候选，换下一个。
@@ -611,15 +611,28 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             {
                 let mut maps = lock_maps(&self.maps);
                 maps.fits.insert(candidate, fit.clone());
-                maps.device_names.insert(candidate, snapshot.device_name.clone());
+                maps.device_names
+                    .insert(candidate, snapshot.device_name.clone());
             }
             // C# v1.3.0：确认上线后才记账；没上线就跳过、绝不写进归属记录。
             if let Some(store) = &self.owned {
                 store.record_owned(candidate);
             }
-            self.set_width(candidate, fit.base_width());
-            // C2：与 C# 一致——SetWidth 失败时这里仍返回成功、fits 已记，
-            // 屏在线但分辨率/DPI 可能不对（见 docs/display-parity.md）。
+            if !self.set_width(candidate, fit.base_width()) {
+                let retired = self.retire(candidate);
+                if !retired {
+                    crate::warn(&format!(
+                        "手机屏 #{candidate} 模式应用失败后尚未下线，保留归属以便重试"
+                    ));
+                }
+                let error = PhoneScreenException::with_detail(
+                    PhoneScreenErrorKind::CreateFailed,
+                    format!(
+                        "手机屏 #{candidate} 未能应用并确认目标分辨率 {base_width}×{base_height} @ 60 Hz"
+                    ),
+                );
+                return Err(error.with_pending_display(candidate));
+            }
             return Ok(candidate);
         }
 
@@ -665,39 +678,96 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 换比例（C# `ReshapeAsync`）。
     fn reshape(&mut self, display_id: u32, fit: ScreenFit) -> bool {
-        let Some(device_name) = lock_maps(&self.maps).device_names.get(&display_id).cloned() else {
+        let Some(old_fit) = lock_maps(&self.maps).fits.get(&display_id).cloned() else {
             return false;
         };
-        // C# v1.3 `ReshapeAsync` 这里仍写死 `PhoneScreenSpec.Name`（不是建屏时给的
-        // displayName）；照抄，避免换比例顺手把用户起的名字改掉这件事出现两版差异。
+        let Some(before) = bound_monitor_of(&self.api, &self.maps, display_id) else {
+            crate::warn(&format!("手机屏 #{display_id} 身份无法确认，未改变分辨率"));
+            return false;
+        };
+        let modes_sent = match self.send_modes(display_id, &fit) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::warn(&format!("手机屏 #{display_id} 更新模式表失败：{error}"));
+                false
+            }
+        };
+
+        let (width, height) = fit.pixel_size(fit.base_width());
+        if modes_sent
+            && self.wait_for_mode(display_id, width, height)
+            && self.apply_fit(display_id, &fit, fit.base_width())
+        {
+            lock_maps(&self.maps).fits.insert(display_id, fit);
+            return true;
+        }
+
+        crate::warn(&format!(
+            "手机屏 #{display_id} 未确认新模式 {width}×{height} @ 60 Hz，恢复原模式"
+        ));
+        // Preserve the last confirmed fit. Legacy replacement may give the same verified
+        // connector a different GDI name, so both forward and rollback paths rebind by EDID.
+        let restored = self.send_modes(display_id, &old_fit).is_ok()
+            && (self
+                .refresh_binding(display_id)
+                .is_some_and(|monitor| resolution_matches(monitor.mode, before.mode))
+                || self.wait_for_mode(display_id, before.mode.width, before.mode.height))
+            && self.apply_mode(display_id, before.mode);
+        if !restored {
+            crate::warn(&format!(
+                "手机屏 #{display_id} 恢复原模式未成功，保留归属与上次确认的配置以便重试"
+            ));
+        }
+        false
+    }
+
+    fn send_modes(&mut self, display_id: u32, fit: &ScreenFit) -> Result<(), VddError> {
         let monitor = VddMonitor {
             id: display_id,
             name: Some(MONITOR_NAME.to_string()),
             enabled: true,
-            modes: build_modes(&fit),
+            modes: build_modes(fit),
         };
-        let notified = if self.ipc.is_legacy() {
-            self.ipc.replace_legacy(&[display_id], &[monitor])
-        } else {
-            self.ipc.notify(&[monitor])
-        };
-        if notified.is_err() {
-            return false;
-        }
+        // Let the connected client choose the protocol. It may have changed since the last call.
+        self.ipc.replace_legacy(&[display_id], &[monitor])
+    }
 
-        // C2：与 C# 一致——新模式 4s 内没出现也照样更新 fits 并返回 true，
-        // 状态说新比例、实际可能还是旧比例（见 docs/display-parity.md）。
-        lock_maps(&self.maps).fits.insert(display_id, fit.clone());
-        let (base_width, base_height) = fit.pixel_size(fit.base_width());
+    fn refresh_binding(&self, display_id: u32) -> Option<MonitorSnapshot> {
+        if !lock_maps(&self.maps).device_names.contains_key(&display_id) {
+            return None;
+        }
+        let matches: Vec<_> = self
+            .api
+            .active_monitors()
+            .into_iter()
+            .filter(|monitor| monitor.virtual_display_id == Some(display_id))
+            .take(2)
+            .collect();
+        if matches.len() != 1 {
+            return None;
+        }
+        let monitor = matches.into_iter().next()?;
+        lock_maps(&self.maps)
+            .device_names
+            .insert(display_id, monitor.device_name.clone());
+        Some(monitor)
+    }
+
+    fn wait_for_mode(&self, display_id: u32, width: i32, height: i32) -> bool {
         let start = Instant::now();
-        while start.elapsed() < self.timings.reshape {
-            if self.api.has_display_mode(&device_name, base_width, base_height) {
-                break;
+        loop {
+            if let Some(monitor) = self.refresh_binding(display_id)
+                && self
+                    .api
+                    .has_display_mode(&monitor.device_name, width, height)
+            {
+                return true;
+            }
+            if start.elapsed() >= self.timings.reshape {
+                return false;
             }
             sleep_for(self.timings.reshape_poll);
         }
-        self.set_width(display_id, fit.base_width());
-        true
     }
 
     /// 撤屏（C# `RetireAsync`）：等它真的下线，顺手把走丢的光标捞回来。
@@ -757,94 +827,158 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         }
     }
 
-    /// 把某块屏切到给定模式（C# `SetModeAsync`，`permanently` 在 C# 里也没用）。
-    ///
-    /// C4：C# 用 `StableId` 匹配 `displayId`；手机屏的 id 是候选编号（0..3），
-    /// 理论上可能与某块真实屏的 StableId 撞号而改错屏（照抄不修）。
+    /// Restore an external physical display from `other_displays()`. Driver connector IDs
+    /// belong to a different namespace and must never select a virtual screen here.
     fn set_mode(&mut self, display_id: u32, mode: DisplayModeInfo) {
-        let Some(target) = self
+        let phone_names = lock_maps(&self.maps).phone_names();
+        let targets: Vec<_> = self
             .api
             .active_monitors()
             .into_iter()
-            .find(|m| m.stable_id == display_id)
-        else {
+            .filter(|monitor| {
+                monitor.stable_id == display_id
+                    && monitor.virtual_display_id.is_none()
+                    && !is_virtual_monitor(monitor)
+                    && !phone_names.contains(&normalized(&monitor.device_name))
+            })
+            .take(2)
+            .collect();
+        let [target] = targets.as_slice() else {
             return;
         };
-        if target.mode.width != mode.width
-            || target.mode.height != mode.height
-            || (target.mode.refresh_rate - mode.refresh_rate).abs() >= 1.0
-        {
-            self.api.set_resolution(
+        let mut actual = target.clone();
+        if !resolution_matches(target.mode, mode) {
+            if !self.api.set_resolution(
                 &target.device_name,
                 mode.width,
                 mode.height,
                 mode.refresh_rate,
-            );
+            ) {
+                crate::warn(&format!("恢复显示器 {} 的分辨率失败", target.device_name));
+                return;
+            }
+            sleep_for(self.timings.resolution_settle);
+            let start = Instant::now();
+            loop {
+                let Some(observed) = self.api.active_monitors().into_iter().find(|monitor| {
+                    monitor.stable_id == display_id
+                        && normalized(&monitor.device_name) == normalized(&target.device_name)
+                        && monitor.adapter_id == target.adapter_id
+                        && monitor.source_id == target.source_id
+                        && monitor.virtual_display_id.is_none()
+                        && !is_virtual_monitor(monitor)
+                }) else {
+                    return;
+                };
+                if resolution_matches(observed.mode, mode) {
+                    actual = observed;
+                    break;
+                }
+                if start.elapsed() >= self.timings.reshape {
+                    crate::warn(&format!(
+                        "恢复显示器 {} 后的实际分辨率未达到目标",
+                        target.device_name
+                    ));
+                    return;
+                }
+                sleep_for(self.timings.reshape_poll);
+            }
         }
-        if target.mode.dpi_scale_percent != mode.dpi_scale_percent {
-            self.api.set_dpi_scale(
-                target.adapter_id,
-                target.source_id,
-                mode.dpi_scale_percent,
-            );
+        if actual.mode.dpi_scale_percent != mode.dpi_scale_percent {
+            self.api
+                .set_dpi_scale(actual.adapter_id, actual.source_id, mode.dpi_scale_percent);
         }
     }
 
-    /// 切到某个逻辑宽度：先改分辨率，再把 DPI 拉到 200%（C# `SetWidthAsync`）。
-    fn set_width(&mut self, display_id: u32, width: i32) {
-        let (fit, device_name) = {
+    /// 确认目标分辨率和刷新率，再应用 ScreenFit 指定的 DPI。
+    fn set_width(&mut self, display_id: u32, width: i32) -> bool {
+        let fit = {
             let maps = lock_maps(&self.maps);
-            let (Some(fit), Some(name)) = (
-                maps.fits.get(&display_id).cloned(),
-                maps.device_names.get(&display_id).cloned(),
-            ) else {
-                return;
+            let Some(fit) = maps.fits.get(&display_id).cloned() else {
+                return false;
             };
-            (fit, name)
+            fit
         };
+        self.apply_fit(display_id, &fit, width)
+    }
 
+    fn apply_fit(&self, display_id: u32, fit: &ScreenFit, width: i32) -> bool {
         let (pixel_width, pixel_height) = fit.pixel_size(width);
-        let current = find_monitor_of(&self.api, &self.maps, display_id);
-        let needs_resolution = match &current {
-            Some(m) => m.mode.width != pixel_width || m.mode.height != pixel_height,
-            None => true,
+        self.apply_mode(
+            display_id,
+            DisplayModeInfo {
+                width: pixel_width,
+                height: pixel_height,
+                refresh_rate: 60.0,
+                dpi_scale_percent: fit.target_dpi_percent(width),
+            },
+        )
+    }
+
+    fn apply_mode(&self, display_id: u32, mode: DisplayModeInfo) -> bool {
+        let Some(current) = bound_monitor_of(&self.api, &self.maps, display_id) else {
+            crate::warn(&format!(
+                "手机屏 #{display_id} 的显示器身份已失效，未修改模式"
+            ));
+            return false;
         };
+        let needs_resolution = !resolution_matches(current.mode, mode);
+        let mut after = current;
         if needs_resolution {
             let started = std::time::Instant::now();
-            if !self
-                .api
-                .set_resolution(&device_name, pixel_width, pixel_height, 60.0)
-            {
-                return;
+            if !self.api.set_resolution(
+                &after.device_name,
+                mode.width,
+                mode.height,
+                mode.refresh_rate,
+            ) {
+                return false;
             }
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if ms >= 200.0 {
                 crate::info(&format!(
-                    "屏幕：换分辨率到 {pixel_width}x{pixel_height} 用了 {ms:.0}ms（{device_name}）"
+                    "屏幕：换分辨率到 {}x{} 用了 {ms:.0}ms（{}）",
+                    mode.width, mode.height, after.device_name
                 ));
             }
             sleep_for(self.timings.resolution_settle);
+            let start = Instant::now();
+            loop {
+                let Some(observed) = bound_monitor_of(&self.api, &self.maps, display_id) else {
+                    return false;
+                };
+                if resolution_matches(observed.mode, mode) {
+                    after = observed;
+                    break;
+                }
+                if start.elapsed() >= self.timings.reshape {
+                    crate::warn(&format!(
+                        "手机屏 #{display_id} 的实际模式仍为 {}×{} @ {} Hz，目标为 {}×{} @ {} Hz",
+                        observed.mode.width,
+                        observed.mode.height,
+                        observed.mode.refresh_rate,
+                        mode.width,
+                        mode.height,
+                        mode.refresh_rate
+                    ));
+                    return false;
+                }
+                sleep_for(self.timings.reshape_poll);
+            }
         }
-
-        // 模式未改变时，当前快照已经包含可用的 DPI；实际改过模式才重新枚举。
-        let after = if needs_resolution {
-            find_monitor_of(&self.api, &self.maps, display_id)
-        } else {
-            current
-        };
-        if let Some(after) = after {
-            // C# v1.3：目标 DPI 由 `ScreenFit.TargetDpiPercent(width)` 决定——
-            // 电脑屏超过 3840×2400 的 2 倍阈值时是 100%，否则 200%。
-            let target_dpi = fit.target_dpi_percent(width);
+        {
+            let target_dpi = mode.dpi_scale_percent;
             if after.mode.dpi_scale_percent != target_dpi {
                 let started = std::time::Instant::now();
-                self.api.set_dpi_scale(after.adapter_id, after.source_id, target_dpi);
+                self.api
+                    .set_dpi_scale(after.adapter_id, after.source_id, target_dpi);
                 let ms = started.elapsed().as_secs_f64() * 1000.0;
                 if ms >= 200.0 {
                     crate::info(&format!("屏幕：换 DPI 到 {target_dpi}% 用了 {ms:.0}ms"));
                 }
             }
         }
+        true
     }
 }
 
@@ -862,6 +996,32 @@ fn find_monitor_of<A: DisplayApi>(
     api.active_monitors()
         .into_iter()
         .find(|m| normalized(&m.device_name) == wanted)
+}
+
+fn bound_monitor_of<A: DisplayApi>(
+    api: &A,
+    maps: &Mutex<ScreenMaps>,
+    display_id: u32,
+) -> Option<MonitorSnapshot> {
+    let device_name = lock_maps(maps).device_names.get(&display_id).cloned()?;
+    let matches: Vec<_> = api
+        .active_monitors()
+        .into_iter()
+        .filter(|monitor| monitor.virtual_display_id == Some(display_id))
+        .take(2)
+        .collect();
+    let [monitor] = matches.as_slice() else {
+        return None;
+    };
+    (normalized(&monitor.device_name) == normalized(&device_name)).then(|| monitor.clone())
+}
+
+fn resolution_matches(actual: DisplayModeInfo, target: DisplayModeInfo) -> bool {
+    actual.width == target.width
+        && actual.height == target.height
+        && actual.refresh_rate.is_finite()
+        && target.refresh_rate.is_finite()
+        && (actual.refresh_rate - target.refresh_rate).abs() < 0.5
 }
 
 fn is_online_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>, display_id: u32) -> bool {
@@ -1564,6 +1724,14 @@ impl DisplayApi for WinDisplay {
     }
 
     fn restart_virtual_display_device(&self) -> bool {
+        if !crate::is_elevated() {
+            crate::warn("驱动管道未就绪，可从设置重试连接或修复驱动");
+            return false;
+        }
+        if self.active_monitors().iter().any(is_virtual_monitor) {
+            crate::warn("检测到虚拟显示器在线，跳过适配器重启");
+            return false;
+        }
         let Some(instance_id) = find_virtual_display_instance_id() else {
             return false;
         };
@@ -1577,8 +1745,16 @@ impl DisplayApi for WinDisplay {
             .stderr(std::process::Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .status();
-        if status.is_err() {
-            return false;
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                crate::warn(&format!("重启虚拟显示器设备失败：{status}"));
+                return false;
+            }
+            Err(error) => {
+                crate::warn(&format!("无法运行虚拟显示器设备重启：{error}"));
+                return false;
+            }
         }
 
         let start = Instant::now();
@@ -2250,12 +2426,21 @@ mod tests {
         devices: HashMap<u32, String>,
         /// 新屏上线时系统先给它挑的分辨率；`None` = 正好是基准档（1080×1900）。
         online_mode: Option<(i32, i32)>,
+        online_refresh_rate: Option<f64>,
+        resolution_error: bool,
+        ignore_resolution_changes: bool,
+        ignore_mode_registration: bool,
+        next_device_name: Option<String>,
+        fail_next_legacy_add: bool,
         /// 非 `None` 时所有 `notify` 都失败（模拟驱动拒收/管道已断）。
         notify_error: Option<String>,
     }
 
     impl World {
         fn driver_online(&mut self, id: u32) {
+            if let Some(name) = self.next_device_name.take() {
+                self.devices.insert(id, name);
+            }
             let Some(device) = self.devices.get(&id).cloned() else {
                 return;
             };
@@ -2266,10 +2451,16 @@ mod tests {
                 Rect::new(1920.0, 0.0, width as f64, height as f64),
                 Rect::new(1920.0, 0.0, width as f64, height as f64),
                 false,
-                DisplayModeInfo { width, height, refresh_rate: 60.0, dpi_scale_percent: 100 },
+                DisplayModeInfo {
+                    width,
+                    height,
+                    refresh_rate: self.online_refresh_rate.unwrap_or(60.0),
+                    dpi_scale_percent: 100,
+                },
             );
             monitor.virtual_display_id = Some(id);
-            self.monitors.retain(|m| m.device_name != device);
+            self.monitors
+                .retain(|m| m.device_name != device && m.virtual_display_id != Some(id));
             self.monitors.push(monitor);
         }
 
@@ -2297,15 +2488,28 @@ mod tests {
                 .contains(&(device_name.to_string(), width, height))
         }
 
-        fn set_resolution(&self, device_name: &str, width: i32, height: i32, refresh_rate: f64) -> bool {
+        fn set_resolution(
+            &self,
+            device_name: &str,
+            width: i32,
+            height: i32,
+            refresh_rate: f64,
+        ) -> bool {
             let mut world = self.0.lock().unwrap();
-            world.resolutions.push((device_name.to_string(), width, height, refresh_rate));
+            world
+                .resolutions
+                .push((device_name.to_string(), width, height, refresh_rate));
+            if world.resolution_error {
+                return false;
+            }
             world.modes.insert((device_name.to_string(), width, height));
-            for monitor in world.monitors.iter_mut() {
-                if monitor.device_name == device_name {
-                    monitor.mode.width = width;
-                    monitor.mode.height = height;
-                    monitor.mode.refresh_rate = refresh_rate;
+            if !world.ignore_resolution_changes {
+                for monitor in world.monitors.iter_mut() {
+                    if monitor.device_name == device_name {
+                        monitor.mode.width = width;
+                        monitor.mode.height = height;
+                        monitor.mode.refresh_rate = refresh_rate;
+                    }
                 }
             }
             true
@@ -2313,7 +2517,9 @@ mod tests {
 
         fn set_dpi_scale(&self, adapter_id: AdapterLuid, source_id: u32, percent: i32) -> bool {
             let mut world = self.0.lock().unwrap();
-            world.dpi_calls.push((adapter_id.low_part, source_id, percent));
+            world
+                .dpi_calls
+                .push((adapter_id.low_part, source_id, percent));
             for monitor in world.monitors.iter_mut() {
                 if monitor.adapter_id == adapter_id && monitor.source_id == source_id {
                     monitor.mode.dpi_scale_percent = percent;
@@ -2339,7 +2545,12 @@ mod tests {
                 Rect::new(x as f64, y as f64, width as f64, height as f64),
                 Rect::new(x as f64, y as f64, width as f64, height as f64),
                 false,
-                DisplayModeInfo { width, height, refresh_rate: 60.0, dpi_scale_percent: 100 },
+                DisplayModeInfo {
+                    width,
+                    height,
+                    refresh_rate: 60.0,
+                    dpi_scale_percent: 100,
+                },
             );
             monitor.virtual_display_id = Some(display_id);
             world.monitors.push(monitor);
@@ -2381,26 +2592,59 @@ mod tests {
                     .map(|m| m.name.clone().unwrap_or_default())
                     .collect(),
             );
-            let ids: Vec<u32> = monitors.iter().map(|m| m.id).collect();
-            for id in ids {
-                if world.online_ids.contains(&id) {
-                    world.driver_online(id);
+            for monitor in monitors {
+                if world.online_ids.contains(&monitor.id) {
+                    world.driver_online(monitor.id);
+                }
+                if !world.ignore_mode_registration
+                    && let Some(device) = world.devices.get(&monitor.id).cloned()
+                {
+                    for mode in &monitor.modes {
+                        world
+                            .modes
+                            .insert((device.clone(), mode.width as i32, mode.height as i32));
+                    }
                 }
             }
             Ok(())
         }
 
-        fn replace_legacy(&mut self, remove_ids: &[u32], add: &[VddMonitor]) -> Result<(), VddError> {
+        fn replace_legacy(
+            &mut self,
+            remove_ids: &[u32],
+            add: &[VddMonitor],
+        ) -> Result<(), VddError> {
+            if !self.0.lock().unwrap().legacy {
+                return self.notify(add);
+            }
             let mut world = self.0.lock().unwrap();
             world.removed.extend_from_slice(remove_ids);
+            if world.fail_next_legacy_add {
+                world.fail_next_legacy_add = false;
+                for &id in remove_ids {
+                    world.driver_offline(id);
+                }
+                return Err(VddError::Io(std::io::ErrorKind::BrokenPipe.into()));
+            }
             let ids: Vec<u32> = add.iter().map(|m| m.id).collect();
             world.notified.push(ids.clone());
             world.notified_names.push(
-                add.iter().map(|m| m.name.clone().unwrap_or_default()).collect(),
+                add.iter()
+                    .map(|m| m.name.clone().unwrap_or_default())
+                    .collect(),
             );
-            for id in ids {
-                if world.online_ids.contains(&id) {
-                    world.driver_online(id);
+            for monitor in add {
+                if world.online_ids.contains(&monitor.id) {
+                    world.driver_online(monitor.id);
+                }
+                if !world.ignore_mode_registration
+                    && let Some(device) = world.devices.get(&monitor.id).cloned()
+                {
+                    for mode in &monitor.modes {
+                        world
+                            .modes
+                            .insert((device.clone(), mode.width as i32, mode.height as i32));
+                    }
                 }
             }
             Ok(())
@@ -2427,9 +2671,6 @@ mod tests {
             Ok(())
         }
 
-        fn is_legacy(&self) -> bool {
-            self.0.lock().unwrap().legacy
-        }
     }
 
     fn fast_timings() -> Timings {
@@ -2724,6 +2965,164 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_failed_or_unconfirmed_modes_and_retires_the_owned_screen() {
+        for (name, reject, ignore, refresh) in [
+            ("rejected", true, false, 60.0),
+            ("unconfirmed", false, true, 60.0),
+            ("wrong-refresh", false, true, 90.0),
+        ] {
+            let path = owned_path(name);
+            let mut world = world_with_phone(&[0]);
+            world.online_mode = Some(if refresh == 60.0 {
+                (1920, 1080)
+            } else {
+                (1080, 1900)
+            });
+            world.online_refresh_rate = Some(refresh);
+            world.resolution_error = reject;
+            world.ignore_resolution_changes = ignore;
+            let (mut screen, shared) = screen_with_owned(world, &path);
+            screen.timings.reshape = Duration::ZERO;
+
+            let error = screen.create(ScreenFit::standard()).expect_err(name);
+            assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+            assert_eq!(
+                error.pending_display_id,
+                Some(0),
+                "the core still has to settle the original display layout"
+            );
+            assert_eq!(shared.lock().unwrap().removed, vec![0]);
+            assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+            assert!(lock_maps(&screen.maps).fits.is_empty());
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn failed_create_reports_pending_retirement_when_cleanup_is_rejected() {
+        let path = owned_path("failed-create-retire");
+        let mut world = world_with_phone(&[0]);
+        world.online_mode = Some((1920, 1080));
+        world.resolution_error = true;
+        world.remove_error = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).unwrap_err();
+        assert_eq!(error.pending_display_id, Some(0));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(lock_maps(&screen.maps).device_names.contains_key(&0));
+        assert_eq!(shared.lock().unwrap().removed, vec![0]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reshape_requires_registered_mode_and_actual_readback_before_committing_fit() {
+        for skip_registration in [true, false] {
+            let (mut screen, shared) = screen(world_with_phone(&[0]));
+            let old_fit = ScreenFit::standard();
+            let id = screen.create(old_fit.clone()).unwrap();
+            {
+                let mut world = shared.lock().unwrap();
+                world.ignore_mode_registration = skip_registration;
+                world.ignore_resolution_changes = !skip_registration;
+                world.modes.clear();
+            }
+            screen.timings.reshape = Duration::ZERO;
+            let new_fit =
+                ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+            assert!(!screen.reshape(id, new_fit));
+            assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+            let world = shared.lock().unwrap();
+            let actual = world
+                .monitors
+                .iter()
+                .find(|m| m.virtual_display_id == Some(id))
+                .unwrap();
+            assert_eq!(
+                (actual.mode.width, actual.mode.height),
+                old_fit.pixel_size(old_fit.base_width())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_reshape_rebinds_verified_id_when_the_gdi_name_changes() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.next_device_name = Some(r"\\.\DISPLAY9".into());
+        }
+        let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+        screen.timings.reshape = Duration::ZERO;
+        assert!(screen.reshape(id, fit.clone()));
+        assert_eq!(
+            lock_maps(&screen.maps)
+                .device_names
+                .get(&id)
+                .map(String::as_str),
+            Some(r"\\.\DISPLAY9")
+        );
+        let world = shared.lock().unwrap();
+        let actual = world
+            .monitors
+            .iter()
+            .find(|m| m.virtual_display_id == Some(id))
+            .unwrap();
+        assert_eq!(
+            (actual.mode.width, actual.mode.height),
+            fit.pixel_size(fit.base_width())
+        );
+    }
+
+    #[test]
+    fn legacy_reshape_restores_the_previous_screen_after_partial_ipc_failure() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let old_fit = ScreenFit::standard();
+        let id = screen.create(old_fit.clone()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.fail_next_legacy_add = true;
+        }
+        let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+        assert!(!screen.reshape(id, fit));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+        let world = shared.lock().unwrap();
+        let actual = world
+            .monitors
+            .iter()
+            .find(|m| m.virtual_display_id == Some(id))
+            .unwrap();
+        assert_eq!(
+            (actual.mode.width, actual.mode.height),
+            old_fit.pixel_size(old_fit.base_width())
+        );
+    }
+
+    #[test]
+    fn managed_mode_changes_reject_a_reused_gdi_name_without_matching_edid() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            let monitor = world
+                .monitors
+                .iter_mut()
+                .find(|m| m.virtual_display_id == Some(id))
+                .unwrap();
+            monitor.virtual_display_id = None;
+            monitor.device_string = "NVIDIA".into();
+            world.resolutions.clear();
+            world.dpi_calls.clear();
+        }
+        screen.set_width(id, 600);
+        let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+    }
+
+    #[test]
     fn create_skips_candidate_that_never_comes_online() {
         // 只有 1 号候选能上线，0 号会等超时。
         let (mut screen, shared) = screen(world_with_phone(&[1]));
@@ -2919,14 +3318,14 @@ mod tests {
             .api
             .active_monitors()
             .into_iter()
-            .find(|m| m.mode.width == 1080)
+            .find(|m| m.is_primary)
             .map(|m| m.stable_id)
-            .expect("手机屏");
+            .expect("实体主屏");
 
         // 分辨率一样、DPI 也一样 → 什么都不该下发。
         screen.set_mode(
             stable,
-            DisplayModeInfo { width: 1080, height: 1900, refresh_rate: 60.0, dpi_scale_percent: TARGET_DPI_PERCENT },
+            DisplayModeInfo { width: 1920, height: 1080, refresh_rate: 60.0, dpi_scale_percent: 100 },
         );
         {
             let world = shared.lock().unwrap();
@@ -2934,18 +3333,78 @@ mod tests {
             assert!(world.dpi_calls.is_empty());
         }
 
-        // 换成 720 逻辑宽 → 1440×2536 物理像素，同时 DPI 已经是 200% 不用再设。
+        // 恢复新的实体屏模式，DPI 保持 100%。
         screen.set_mode(
             stable,
-            DisplayModeInfo { width: 1440, height: 2536, refresh_rate: 60.0, dpi_scale_percent: TARGET_DPI_PERCENT },
+            DisplayModeInfo { width: 1440, height: 2536, refresh_rate: 60.0, dpi_scale_percent: 100 },
         );
         {
             let world = shared.lock().unwrap();
             assert_eq!(
                 world.resolutions,
-                vec![(r"\\.\DISPLAY2".to_string(), 1440, 2536, 60.0)]
+                vec![(r"\\.\DISPLAY1".to_string(), 1440, 2536, 60.0)]
             );
         }
+    }
+
+    #[test]
+    fn physical_mode_restore_ignores_virtual_and_duplicate_stable_ids() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let phone_stable = shared
+            .lock()
+            .unwrap()
+            .monitors
+            .iter()
+            .find(|m| m.virtual_display_id == Some(id))
+            .unwrap()
+            .stable_id;
+        shared.lock().unwrap().resolutions.clear();
+        screen.set_mode(phone_stable, mode(1440, 900));
+        assert!(shared.lock().unwrap().resolutions.is_empty());
+
+        let physical_stable = {
+            let mut world = shared.lock().unwrap();
+            let mut duplicate = world
+                .monitors
+                .iter()
+                .find(|m| m.is_primary)
+                .unwrap()
+                .clone();
+            duplicate.device_name = r"\\.\DISPLAY8".into();
+            let stable = duplicate.stable_id;
+            world.monitors.push(duplicate);
+            stable
+        };
+        screen.set_mode(physical_stable, mode(1440, 900));
+        assert!(shared.lock().unwrap().resolutions.is_empty());
+    }
+
+    #[test]
+    fn physical_mode_restore_does_not_confuse_a_driver_id_with_its_stable_id() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world
+                .monitors
+                .iter_mut()
+                .find(|m| m.is_primary)
+                .unwrap()
+                .stable_id = id;
+            world
+                .monitors
+                .iter_mut()
+                .find(|m| m.virtual_display_id == Some(id))
+                .unwrap()
+                .stable_id = id;
+            world.resolutions.clear();
+        }
+        screen.set_mode(id, mode(1440, 900));
+        assert_eq!(
+            shared.lock().unwrap().resolutions,
+            vec![(r"\\.\DISPLAY1".into(), 1440, 900, 60.0)]
+        );
     }
 
     #[test]
@@ -3197,7 +3656,7 @@ mod tests {
             is_primary,
             mode,
             adapter_id: AdapterLuid::default(),
-            source_id: 0,
+            source_id: stable_id(device_name, AdapterLuid::default(), 0),
         }
     }
 }

@@ -4,7 +4,8 @@ Snug 是配合网易 UU 远程使用的 Windows 工具。它在电脑上创建�
 
 这是独立维护的 Rust 重写版，从 **v1.0.0** 开始发布，交付含驱动的单个 EXE。它源自 macOS 的
 [Snug](https://github.com/zephyr4123/snug) 和 Windows 的 C# 移植版
-[SnugWin](https://github.com/nicocart/snug-win)，保留两者的来源与版权声明。版本变更见 [更新记录](CHANGELOG.md)。
+[SnugWin](https://github.com/nicocart/snug-win)。虚拟显示器由
+[MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs) 提供。版本变更见 [更新记录](CHANGELOG.md)。
 
 ## 下载
 
@@ -12,6 +13,14 @@ Snug 是配合网易 UU 远程使用的 Windows 工具。它在电脑上创建�
 把文件放在当前用户可写的目录，双击即可启动。程序内嵌虚拟显示器驱动安装包和安装脚本。
 
 主界面以普通权限运行。缺少虚拟显示器驱动时，首次安装会单独请求管理员权限。已安装的驱动若只允许管理员访问，首次建屏时程序会请求提升驱动代理的权限。
+
+## 虚拟显示器驱动
+
+Snug 用 virtual-display-rs 创建和撤销手机屏，由 Windows 设置实际显示模式，UU 负责采集和传输画面。Snug 为手机屏配置固定分辨率和 60 Hz，应用切换时保持当前分辨率。
+
+在“通用 → 驱动与日志”可查看系统安装的驱动版本、设备问题代码和管道访问状态。如果驱动连接中断或取消了管理员授权，可以点“重试驱动连接”。分辨率应用失败时，屏幕详情页允许重新应用同一尺寸。
+
+Snug 内嵌上游 `v0.3.1` 安装包。修复了两处画面资源释放问题的 `0.4.0.1` 驱动在独立分支开发，接入发行版前需完成发行签名和真机验收。见 [驱动开发分支](https://github.com/mirakyux/snug-win-rust/tree/feature/driver-0.4.0.1)。
 
 ## 更新
 
@@ -45,6 +54,7 @@ assets/
   phone-models.json   机型库（853 款：手机 / 平板 / 电脑），与 C# 版共用
   *.ico               应用与托盘图标
 docs/                 移植对照、验收单、多屏与线程模型、体积预算
+driver/               虚拟显示器驱动安装脚本
 references/           上游源码的浅克隆，仅供对照，已在 .gitignore 中
 tools/refdump/        C# 参考实现的对拍生成器（几何 / ScreenFit 真值 TSV）
 ```
@@ -63,7 +73,7 @@ v1.0.5 的手机界面按原版的运行中、全部和搜索页面调整：
 ```powershell
 snug.exe --preview-all
 snug.exe --preview-search=edge
-snug.exe --preview-settings=screens    # 也可选 interaction 或 general
+snug.exe --preview-settings=screens    # 也可选 interaction、general 或 diagnostics
 snug.exe --preview --preview-output=preview.png
 ```
 
@@ -93,7 +103,7 @@ snug.exe --preview --preview-output=preview.png
 **不弹窗、不抢焦点**，手机屏就绪了才把界面摆上虚拟屏。换 exe 目录后会自动把任务里的
 路径改过去。
 
-主界面默认使用普通权限；驱动安装通过同一 EXE 的一次性 UAC 任务执行。当前驱动管道要求管理员权限，首次建屏会请求受限 VDD 代理的 UAC；取消或失败后本次运行不再重复请求，需重启 GUI 后再试。自动更新仅在普通权限下执行，使用 EXE 同级的独占暂存目录；受保护安装目录请手动替换 EXE。需要管理提升权限的应用窗口时，可在设置里显式选择“以管理员重启”，更新前应退出并普通启动。
+自动更新仅在普通权限下执行，使用 EXE 同级的独占暂存目录。受保护安装目录请手动替换 EXE。需要管理提升权限的应用窗口时，可在设置里显式选择“以管理员重启”，更新前应退出并以普通权限启动。
 
 与原版的差别与取舍理由集中在 [`docs/upstream-watch.md`](docs/upstream-watch.md)；
 多屏形态（单窗口 + 屏幕菜单切换）见 [`docs/multi-screen.md`](docs/multi-screen.md)；
@@ -137,4 +147,4 @@ cargo build --release -p snug-app --offline --target-dir target\release-check
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+Snug 应用使用 MIT 许可证。内嵌的上游 `v0.3.1` 驱动安装包使用 AGPLv3，附有对应版本的源码和许可证链接。详见 [应用许可证](LICENSE) 与 [第三方声明](THIRD_PARTY_NOTICES.md)。

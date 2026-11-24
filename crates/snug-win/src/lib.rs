@@ -14,6 +14,7 @@
 //! | `uu` | `UUSensor` | 覆盖窗口、UIA 控制端表、TCP peer、GameViewerServer 日志 |
 
 pub mod display;
+pub mod driver_health;
 pub mod touch;
 pub mod uia;
 pub mod vdd;

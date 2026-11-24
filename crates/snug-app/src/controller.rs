@@ -695,6 +695,24 @@ impl Controller {
         self.enqueue(move |desks| desks.put_back(Some(&id)));
     }
 
+    pub fn retry_failed_screen(&self, screen_id: Option<&str>) {
+        if let Some(id) = self.resolve_screen(screen_id) {
+            self.enqueue(move |desks| {
+                if let Some(desk) = desks.desk_for_screen(Some(&id)) {
+                    desk.retry_failed_screen();
+                }
+            });
+        }
+    }
+
+    pub fn retry_resolution(&self, screen_id: String) {
+        self.enqueue(move |desks| {
+            if let Some(desk) = desks.desk_for_screen(Some(&screen_id)) {
+                desk.retry_resolution();
+            }
+        });
+    }
+
     pub fn adjust_zoom(&self, screen_id: Option<&str>, delta: i32) {
         let Some(id) = self.resolve_screen(screen_id) else {
             return;

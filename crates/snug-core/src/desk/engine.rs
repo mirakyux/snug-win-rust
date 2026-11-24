@@ -637,8 +637,19 @@ impl Desk {
     /// 对应 C# `SettleDisplays`：撤屏后系统还没下线 / 要持久化其它屏模式时善后。
     pub fn settle_displays(&self) {
         self.inner.slot.run(|core: &mut DeskCore| {
+            let was_retiring = core.retiring.is_some();
             core.settle_displays();
-            if core.state().screen_phase == PhoneScreenPhase::Off && core.retiring.is_none() {
+            let retry_waiting = core
+                .shared
+                .pending_retry
+                .lock()
+                .expect("retry")
+                .as_ref()
+                .is_some_and(|retry| !retry.finished.load(Ordering::SeqCst));
+            if (core.state().screen_phase == PhoneScreenPhase::Off
+                || (was_retiring && !retry_waiting))
+                && core.retiring.is_none()
+            {
                 core.reconcile();
             }
         });
@@ -728,31 +739,22 @@ impl Desk {
 
     /// 对应 C# `SetFit`：换手机屏比例（按需重建宽度）。
     pub fn set_fit(&self, fit: ScreenFit) {
+        let retry_failed = self.state().notice == Some(DeskNotice::ReshapeFailed);
         {
             let mut current = self.inner.shared.fit.lock().expect("desk fit");
-            if *current == fit {
+            if *current == fit && !retry_failed {
                 return;
             }
             *current = fit;
         }
         self.inner.slot.run(move |core: &mut DeskCore| {
-            if core.state().screen_phase == PhoneScreenPhase::Off {
-                return;
-            }
-            if core.state().work.is_none() && core.display.is_some() {
-                core.begin(DeskWork::new(DeskWorkKind::Reshaping));
-            }
-            let fit = core.fit();
-            if let Some(display) = core.display
-                && core.shared.displays.fit_of(display.id).as_ref() != Some(&fit)
-            {
-                core.begin(DeskWork::new(DeskWorkKind::Reshaping));
-                core.reshape(display.id);
-            }
-            if core.state().work.as_ref().map(|work| work.kind) == Some(DeskWorkKind::Reshaping) {
-                core.set_state(core.state().with_work(None));
-            }
+            core.apply_requested_fit();
         });
+    }
+
+    /// Explicit Apply can retry even after another action cleared the failure notice.
+    pub fn retry_resolution(&self) {
+        self.inner.slot.run(|core: &mut DeskCore| core.apply_requested_fit());
     }
 
     /// 对应 C# `DismissScreen`：用户在手机上主动退出这次手机屏。
@@ -790,6 +792,20 @@ impl Desk {
     /// `reenter_screen` 的旧名字，保留给已经接好的调用方。
     pub fn reenter(&self) {
         self.reenter_screen();
+    }
+
+    /// Retry a failed creation after the user reconnects the driver.
+    pub fn retry_failed_screen(&self) {
+        self.inner.slot.run(|core: &mut DeskCore| {
+            if core.wanted()
+                && !core.state().dismissed
+                && core.state().screen_phase == PhoneScreenPhase::Failed
+                && core.display.is_none()
+            {
+                core.cancel_retry();
+                core.reconcile();
+            }
+        });
     }
 
     /// 对应 C# `DetachPlacementForTransfer`：把正铺着的记录摘出来，给跨屏转移用。
@@ -1207,6 +1223,15 @@ impl DeskCore {
                 self.log(format!("手机屏 #{id} 已就绪（{width} 宽）"));
             }
             Err(error) => {
+                if let Some(id) = error.pending_display_id {
+                    self.retiring = Some(Retiring {
+                        id,
+                        before,
+                        permanently: !self.remote(),
+                        retry_after: self.now() + RETIRE_RETRY_DELAY,
+                    });
+                    self.warn(format!("加屏失败的手机屏 #{id} 需确认撤屏并恢复布局，保留自动善后状态"));
+                }
                 let state =
                     self.state().with_screen_phase(PhoneScreenPhase::Failed).with_display(None);
                 self.set_state(state);
@@ -1836,6 +1861,21 @@ impl DeskCore {
             self.match_width();
         } else {
             self.refill("屏幕配置变了");
+        }
+    }
+
+    fn apply_requested_fit(&mut self) {
+        let state = self.state();
+        if state.screen_phase != PhoneScreenPhase::Ready {
+            return;
+        }
+        if let Some(display) = self.display
+            && (self.shared.displays.fit_of(display.id).as_ref() != Some(&self.fit())
+                || state.notice == Some(DeskNotice::ReshapeFailed))
+        {
+            self.begin(DeskWork::new(DeskWorkKind::Reshaping));
+            self.reshape(display.id);
+            self.set_state(self.state().with_work(None));
         }
     }
 
@@ -3114,6 +3154,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_driver_recovery_retries_after_creation_backoff_is_exhausted() {
+        let harness = Harness::new();
+        harness.displays.fail_creates(4);
+        harness.desk.set_wanted(true);
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Failed);
+        assert_eq!(harness.displays.create_calls(), 4);
+
+        harness.desk.retry_failed_screen();
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
+        assert_eq!(harness.displays.create_calls(), 5);
+    }
+
+    #[test]
     fn screen_lives_at_least_minimum_lifetime() {
         let harness = Harness::new();
         harness.desk.set_wanted(true);
@@ -3195,6 +3250,34 @@ mod tests {
         harness.desk.settle_displays();
         harness.desk.idle();
         assert!(!harness.desk.retiring(), "下线后善后完成");
+    }
+
+    #[test]
+    fn failed_create_keeps_pending_retirement_until_confirmed_offline() {
+        let harness = Harness::new();
+        harness.displays.fail_after_online();
+        harness.desk.set_wanted(true);
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Failed);
+        assert!(harness.desk.retiring());
+        assert_eq!(harness.displays.create_calls(), 1);
+        harness.desk.inner.slot.run(|core| core.cancel_retry());
+        harness.desk.idle();
+
+        harness.desk.settle_displays();
+        harness.desk.idle();
+        assert_eq!(
+            harness.displays.create_calls(),
+            1,
+            "must not create another screen while the failed one is online"
+        );
+
+        harness.displays.bring_offline();
+        harness.desk.settle_displays();
+        harness.desk.idle();
+        assert!(!harness.desk.retiring());
+        assert_eq!(harness.displays.create_calls(), 2);
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
     }
 
     #[test]
@@ -3683,6 +3766,27 @@ mod tests {
             "放回时应恢复最大化，实际 {:?}",
             harness.windows.full_screen_calls()
         );
+    }
+
+    #[test]
+    fn failed_reshape_can_reapply_the_same_requested_fit() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let old_fit = harness.displays.fit_of(1001);
+        let requested = ScreenFit::new(1.2);
+        harness.displays.fail_reshapes(1);
+        harness.desk.set_fit(requested.clone());
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::ReshapeFailed));
+        assert_eq!(harness.displays.fit_of(1001), old_fit);
+        assert_eq!(harness.displays.reshape_calls(), 1);
+
+        harness.desk.dismiss_notice();
+        harness.desk.retry_resolution();
+        harness.desk.idle();
+        assert_eq!(harness.displays.reshape_calls(), 2);
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::Reshaped));
+        assert_eq!(harness.displays.fit_of(1001), Some(requested));
     }
 
     #[test]

@@ -59,6 +59,9 @@ pub struct FakeDisplays {
     fit: Mutex<Option<ScreenFit>>,
     others: Mutex<Vec<OtherDisplay>>,
     fail_creates: AtomicUsize,
+    fail_after_online: AtomicBool,
+    fail_reshapes: AtomicUsize,
+    reshape_calls: AtomicUsize,
     create_calls: AtomicUsize,
     create_names: Mutex<Vec<String>>,
     retire_calls: AtomicUsize,
@@ -76,6 +79,9 @@ impl Default for FakeDisplays {
             fit: Mutex::new(None),
             others: Mutex::new(Vec::new()),
             fail_creates: AtomicUsize::new(0),
+            fail_after_online: AtomicBool::new(false),
+            fail_reshapes: AtomicUsize::new(0),
+            reshape_calls: AtomicUsize::new(0),
             create_calls: AtomicUsize::new(0),
             create_names: Mutex::new(Vec::new()),
             retire_calls: AtomicUsize::new(0),
@@ -93,6 +99,19 @@ impl FakeDisplays {
 
     pub fn fail_creates(&self, times: usize) {
         self.fail_creates.store(times, Ordering::SeqCst);
+    }
+
+    pub fn fail_after_online(&self) {
+        self.fail_after_online.store(true, Ordering::SeqCst);
+        self.keep_online_after_retire();
+    }
+
+    pub fn fail_reshapes(&self, times: usize) {
+        self.fail_reshapes.store(times, Ordering::SeqCst);
+    }
+
+    pub fn reshape_calls(&self) -> usize {
+        self.reshape_calls.load(Ordering::SeqCst)
     }
 
     pub fn create_calls(&self) -> usize {
@@ -163,11 +182,20 @@ impl PhoneDisplays for FakeDisplays {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_creates.load(Ordering::SeqCst) > 0 {
             self.fail_creates.fetch_sub(1, Ordering::SeqCst);
-            return Err(PhoneScreenException::new(PhoneScreenErrorKind::CreateFailed));
+            return Err(PhoneScreenException::new(
+                PhoneScreenErrorKind::CreateFailed,
+            ));
         }
         *self.active.lock().expect("active") = Some(1001);
         *self.fit.lock().expect("fit") = Some(fit.clone());
         *self.width.lock().expect("width") = fit.base_width();
+
+        if self.fail_after_online.swap(false, Ordering::SeqCst) {
+            return Err(
+                PhoneScreenException::new(PhoneScreenErrorKind::CreateFailed)
+                    .with_pending_display(1001),
+            );
+        }
 
         if let Some((id, mode)) = self.drift_on_create.lock().expect("drift").take() {
             if let Some(other) = self
@@ -184,6 +212,11 @@ impl PhoneDisplays for FakeDisplays {
     }
 
     fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool {
+        self.reshape_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_reshapes.load(Ordering::SeqCst) > 0 {
+            self.fail_reshapes.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
         if self.active.lock().expect("active").as_ref() != Some(&display_id) {
             return false;
         }

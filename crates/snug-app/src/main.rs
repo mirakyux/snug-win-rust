@@ -32,6 +32,7 @@ fn main() -> eframe::Result<()> {
             .map(|tab| match tab {
                 "general" => settings::SettingsTab::Home,
                 "interaction" => settings::SettingsTab::Gestures,
+                "diagnostics" => settings::SettingsTab::Diagnostics,
                 _ => settings::SettingsTab::Screens,
             })
     });

@@ -67,6 +67,8 @@ pub enum PhoneScreenErrorKind {
 pub struct PhoneScreenException {
     pub kind: PhoneScreenErrorKind,
     pub detail: String,
+    /// A verified screen whose failed creation still needs retirement or topology settlement.
+    pub pending_display_id: Option<u32>,
 }
 
 impl PhoneScreenException {
@@ -78,11 +80,24 @@ impl PhoneScreenException {
             }
             PhoneScreenErrorKind::NeverOnline => "手机屏已创建但系统未将其上线",
         };
-        Self { kind, detail: detail.to_string() }
+        Self {
+            kind,
+            detail: detail.to_string(),
+            pending_display_id: None,
+        }
     }
 
     pub fn with_detail(kind: PhoneScreenErrorKind, detail: impl Into<String>) -> Self {
-        Self { kind, detail: detail.into() }
+        Self {
+            kind,
+            detail: detail.into(),
+            pending_display_id: None,
+        }
+    }
+
+    pub fn with_pending_display(mut self, display_id: u32) -> Self {
+        self.pending_display_id = Some(display_id);
+        self
     }
 }
 

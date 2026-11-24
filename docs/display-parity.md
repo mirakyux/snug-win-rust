@@ -17,23 +17,12 @@
 | 日志 | 补了 C# 的四处 Warn：SetResolution 返回码、建屏 8s 超时、撤屏 remove 失败、SetDpi 失败。查询路径不加日志 | 见源码 `crate::warn` |
 | 取消 | C# 每个等待循环都有 CancellationToken；Rust `PhoneDisplays` 接口没有 token，退出时最长等 8s/4s/10s。**留债**，见 `impl PhoneDisplays for WinPhoneDisplays` 的 `TODO(取消)` | trait impl |
 
-## 照抄不修的共同风险（C# 也一样，改了就产生行为差异）
+## 显示模式确认与归属
 
-1. **create**：notify 成功但 8s 未上线 → 尝试 remove；remove 失败会留孤儿屏（下次启动
-   `CleanupOrphans` 才清）。
-2. **create**：上线后 `SetWidth` 改分辨率失败 → 仍返回成功、fits 已记；屏在线但分辨率/DPI
-   可能不对。
-3. **reshape**：新模式 4s 内没出现 → 仍更新 fits 并返回 true（状态说新比例、实际可能旧比例）。
-4. **retire**：先删本地状态再发删除；删除失败 → 屏还在但应用已忘记（孤儿屏）。
-5. **try_attach**：`ChangeDisplaySettingsEx(CDS_NORESET)` 成功、紧接着 apply 失败 → 注册表里
-   留下挂起模式；若随后的 `SetDisplayConfig(EXTEND)` 也失败，挂起变更留到下次。
-6. **SetModeAsync**：C# 用 `StableId` 匹配 `displayId`；手机屏 id 是候选编号 0..3，
-   理论上可能与真实屏的 StableId 撞号而改错屏。
-7. **WaitForOnline（已收紧）**：验证 Cherry monitor interface、PnP 父适配器 HardwareID 与有效 EDID serial；
-   serial 必须等于本次 connector ID，且 CCD source 唯一。不确定时跳过候选，不用分辨率或“第一个新屏”猜，
-   避免把用户刚接入的实体显示器当成 Snug 屏。
-   未上线屏的扩展路径同样使用 monitor interface 校验。此保护只覆盖建屏认领；
-   运行中 `find_monitor_of` / `set_width` 仍依赖缓存的 GDI 名，用户随后切换克隆拓扑时的持续保护尚未完成。
+- 建屏和改分辨率时，读回 Windows 的实际宽高、刷新率后才报告成功。建屏模式失败进入撤屏与布局恢复流程，修改模式失败会尝试恢复上次确认的模式。
+- 建屏认领验证 Cherry 显示器接口、PnP 父适配器硬件 ID 与 EDID 序列号。写入手机屏模式前复核绑定，GDI 名称变化时按唯一 EDID 重新绑定。通用的实体屏模式恢复只接受唯一的非虚拟目标。
+- 撤屏未确认时保留归属和设备映射，由已有善后流程重试。建屏超时且未确认归属的编号会跳过。
+- `ChangeDisplaySettingsEx(CDS_NORESET)` 成功但后续应用失败时，Windows 仍可能保留挂起模式。热插拔与克隆拓扑需在实际系统上验证。
 
 ## 与 C# 完全等价、但实现不同的地方
 

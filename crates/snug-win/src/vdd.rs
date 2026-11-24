@@ -170,6 +170,34 @@ fn pipe_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!(r"\\.\pipe\{name}"))
 }
 
+/// Check the caller's actual access without issuing a driver command.
+pub(crate) fn probe_access(name: &str) -> crate::driver_health::PipeAccess {
+    use crate::driver_health::PipeAccess;
+    let path = pipe_path(name);
+    let open = |duplex| {
+        OpenOptions::new()
+            .read(duplex)
+            .write(true)
+            .security_qos_flags(0x0001_0000)
+            .open(&path)
+    };
+    match open(true) {
+        Ok(_) => PipeAccess::Direct(VddProtocol::V2),
+        Err(error) => match error.raw_os_error() {
+            Some(5) => match open(false) {
+                Ok(_) => PipeAccess::Direct(VddProtocol::Legacy),
+                Err(error) if error.raw_os_error() == Some(5) => PipeAccess::RequiresElevation,
+                Err(error) if error.raw_os_error() == Some(231) => PipeAccess::Busy,
+                Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) => PipeAccess::Missing,
+                _ => PipeAccess::Unavailable,
+            },
+            Some(2 | 3) => PipeAccess::Missing,
+            Some(231) => PipeAccess::Busy,
+            _ => PipeAccess::Unavailable,
+        },
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VddError {
     #[error("连不上虚拟屏管道 {name}：{source}")]
@@ -213,6 +241,10 @@ enum Liveness {
 /// 一条管道句柄。真机是 [`PipeFile`]，单测换成假实现。
 trait PipeHandle: Read + Write + Send {
     fn probe(&mut self) -> Liveness;
+
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        self.read(buf).map(Some)
+    }
 }
 
 struct PipeFile(std::fs::File);
@@ -237,6 +269,15 @@ impl PipeHandle for PipeFile {
     fn probe(&mut self) -> Liveness {
         peek_liveness(self.0.as_raw_handle())
     }
+
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        let available = available_bytes(self.0.as_raw_handle())? as usize;
+        if available == 0 {
+            return Ok(None);
+        }
+        let length = available.min(buf.len());
+        self.read(&mut buf[..length]).map(Some)
+    }
 }
 
 /// `PeekNamedPipe` 探测对端是否还在。驱动重启（`pnputil /restart-device`）之后，
@@ -245,10 +286,14 @@ impl PipeHandle for PipeFile {
 /// 这里用一行 `extern` 声明，而不是 `windows` crate 的 `Win32_System_Pipes` feature：
 /// 只为一个函数开一个 feature 不划算（Cargo.toml 由 Chief 统一改，能不惊动就不惊动）。
 fn peek_liveness(handle: RawHandle) -> Liveness {
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    const ERROR_BROKEN_PIPE: i32 = 109;
-    const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
+    match available_bytes(handle) {
+        Ok(_) => Liveness::Alive,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Liveness::Unknown,
+        Err(_) => Liveness::Dead,
+    }
+}
 
+fn available_bytes(handle: RawHandle) -> std::io::Result<u32> {
     unsafe extern "system" {
         fn PeekNamedPipe(
             h_named_pipe: *mut core::ffi::c_void,
@@ -260,24 +305,21 @@ fn peek_liveness(handle: RawHandle) -> Liveness {
         ) -> i32;
     }
 
+    let mut available = 0;
     let ok = unsafe {
         PeekNamedPipe(
             handle as *mut core::ffi::c_void,
             std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut available,
             std::ptr::null_mut(),
         )
     };
     if ok != 0 {
-        return Liveness::Alive;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(ERROR_ACCESS_DENIED) => Liveness::Unknown,
-        Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => Liveness::Dead,
-        // 其它错误（无效句柄之类）也当断了，让下一次操作重新连。
-        _ => Liveness::Dead,
+        Ok(available)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -312,30 +354,54 @@ impl VddClient {
     }
 
     pub(crate) fn direct(name: impl Into<String>) -> Self {
-        Self { name: name.into(), connection: None, connector: Box::new(connect), use_broker: false, broker_protocol: None }
+        Self {
+            name: name.into(),
+            connection: None,
+            connector: Box::new(connect),
+            use_broker: false,
+            broker_protocol: None,
+        }
     }
 
     /// 单测入口：换掉真正去 `CreateFile` 的连接器。
     #[cfg(test)]
     fn with_connector(name: &str, connector: Connector) -> Self {
-        Self { name: name.to_string(), connection: None, connector, use_broker: false, broker_protocol: None }
+        Self {
+            name: name.to_string(),
+            connection: None,
+            connector,
+            use_broker: false,
+            broker_protocol: None,
+        }
     }
 
     pub fn protocol(&self) -> Option<VddProtocol> {
-        if self.use_broker { self.broker_protocol } else { self.connection.as_ref().map(|c| c.protocol) }
+        self.connection
+            .as_ref()
+            .map(|c| c.protocol)
+            .or(self.broker_protocol)
     }
 
     pub fn is_legacy(&self) -> bool {
         self.protocol() == Some(VddProtocol::Legacy)
     }
 
-    /// 让驱动的显示器状态变成给定这一组。
+    pub(crate) fn probe_connection(&mut self) -> Result<VddProtocol, VddError> {
+        self.state()?;
+        self.protocol().ok_or(VddError::NotConnected)
+    }
+
+    /// Create monitors while preserving existing V2 entries, including disabled monitors.
     pub fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
-        if self.use_broker {
-            return self.broker(crate::vdd_broker::Request::Notify { monitors: monitors.to_vec() }).map(|_| ());
+        if self.needs_broker() {
+            return self
+                .broker(crate::vdd_broker::Request::Notify {
+                    monitors: monitors.to_vec(),
+                })
+                .map(|_| ());
         }
         match self.ensure()? {
-            VddProtocol::V2 => self.write_framed(&serialize_notify(monitors)),
+            VddProtocol::V2 => self.update_v2_monitors(monitors, false),
             VddProtocol::Legacy => self.write_legacy_retry(&serialize_legacy_add(monitors)),
         }
     }
@@ -346,13 +412,16 @@ impl VddClient {
         remove_ids: &[u32],
         add_monitors: &[VddMonitor],
     ) -> Result<(), VddError> {
-        if self.use_broker {
-            return self.broker(crate::vdd_broker::Request::ReplaceLegacy {
-                remove_ids: remove_ids.to_vec(), monitors: add_monitors.to_vec(),
-            }).map(|_| ());
+        if self.needs_broker() {
+            return self
+                .broker(crate::vdd_broker::Request::ReplaceLegacy {
+                    remove_ids: remove_ids.to_vec(),
+                    monitors: add_monitors.to_vec(),
+                })
+                .map(|_| ());
         }
         match self.ensure()? {
-            VddProtocol::V2 => self.write_framed(&serialize_notify(add_monitors)),
+            VddProtocol::V2 => self.update_v2_monitors(add_monitors, true),
             VddProtocol::Legacy => {
                 self.write_legacy_retry(&serialize_remove(remove_ids))?;
                 std::thread::sleep(Duration::from_millis(120));
@@ -362,8 +431,10 @@ impl VddClient {
     }
 
     pub fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
-        if self.use_broker {
-            return self.broker(crate::vdd_broker::Request::Remove { ids: ids.to_vec() }).map(|_| ());
+        if self.needs_broker() {
+            return self
+                .broker(crate::vdd_broker::Request::Remove { ids: ids.to_vec() })
+                .map(|_| ());
         }
         let json = serialize_remove(ids);
         match self.ensure()? {
@@ -374,8 +445,10 @@ impl VddClient {
 
     pub fn remove_all(&mut self) -> Result<(), VddError> {
         if self.use_broker {
-            return Err(VddError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                "VDD broker does not allow removing displays without explicit owned IDs")));
+            return Err(VddError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "VDD broker does not allow removing displays without explicit owned IDs",
+            )));
         }
         let json = serialize_remove_all();
         match self.ensure()? {
@@ -386,41 +459,130 @@ impl VddClient {
 
     /// 请求当前状态（仅 v2 支持应答）。
     pub fn state(&mut self) -> Result<Option<Vec<VddMonitor>>, VddError> {
-        if self.use_broker {
-            return self.broker(crate::vdd_broker::Request::State).map(|reply| reply.monitors);
+        if self.needs_broker() {
+            return self
+                .broker(crate::vdd_broker::Request::State)
+                .map(|reply| reply.monitors);
         }
         match self.ensure()? {
             VddProtocol::Legacy => Ok(None),
             VddProtocol::V2 => {
                 self.write_framed(&serialize_state_request())?;
-                let mut buf = [0u8; 64 * 1024];
-                let read_result = {
-                    let Some(connection) = self.connection.as_mut() else {
-                        return Ok(None);
-                    };
-                    connection.pipe.read(&mut buf)
-                };
-                let read = match read_result {
-                    Ok(read) => read,
-                    Err(error) => {
-                        // 读失败同样说明连接死了，丢掉，下次重连。
-                        self.connection = None;
-                        return Err(VddError::Io(error));
-                    }
-                };
-                if read == 0 {
-                    return Ok(None);
+                let result = self.read_v2_state();
+                if result.is_err() {
+                    self.connection = None;
                 }
-                let text = String::from_utf8_lossy(&buf[..read]);
-                let text = text.trim_end_matches('\u{4}');
-                Ok(parse_state_reply(text))
+                result.map(Some)
             }
         }
     }
 
-    fn broker(&mut self, request: crate::vdd_broker::Request) -> Result<crate::vdd_broker::Reply, VddError> {
-        let reply = crate::vdd_broker::request(request)?;
-        self.broker_protocol = reply.legacy.map(|legacy| if legacy { VddProtocol::Legacy } else { VddProtocol::V2 });
+    fn needs_broker(&mut self) -> bool {
+        if !self.use_broker {
+            return false;
+        }
+        if let Some(connection) = self.connection.as_mut() {
+            if connection.pipe.probe() != Liveness::Dead {
+                return false;
+            }
+            self.connection = None;
+        }
+        match (self.connector)(&self.name) {
+            Ok(connection) => {
+                self.connection = Some(connection);
+                self.broker_protocol = None;
+                false
+            }
+            Err(VddError::Connect { source, .. }) => {
+                source.kind() == std::io::ErrorKind::PermissionDenied
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn update_v2_monitors(
+        &mut self,
+        updates: &[VddMonitor],
+        replacing: bool,
+    ) -> Result<(), VddError> {
+        let Some(mut state) = self.state()? else {
+            return Err(VddError::Io(std::io::Error::other(
+                "未取得虚拟屏列表，未写入全量状态",
+            )));
+        };
+        if !replacing
+            && updates
+                .iter()
+                .any(|update| state.iter().any(|monitor| monitor.id == update.id))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "虚拟屏编号已被占用",
+            )
+            .into());
+        }
+        merge_monitors(&mut state, updates);
+        self.write_framed(&serialize_notify(&state))
+    }
+
+    fn read_v2_state(&mut self) -> Result<Vec<VddMonitor>, VddError> {
+        use std::io::{Error, ErrorKind};
+        const MAX_BYTES: usize = 128 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pipe = &mut self.connection.as_mut().ok_or(VddError::NotConnected)?.pipe;
+        let mut frame = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut received = 0;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::new(ErrorKind::TimedOut, "读取驱动状态超时").into());
+            }
+            let Some(read) = pipe.read_ready(&mut chunk)? else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            if read == 0 {
+                return Err(Error::new(ErrorKind::BrokenPipe, "驱动未返回完整状态").into());
+            }
+            received += read;
+            if received > MAX_BYTES {
+                return Err(Error::new(ErrorKind::InvalidData, "驱动状态超过大小限制").into());
+            }
+            for &byte in &chunk[..read] {
+                if byte != EOT {
+                    frame.push(byte);
+                    continue;
+                }
+                if let Ok(text) = std::str::from_utf8(&frame)
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(state) = value.get("State")
+                {
+                    return serde_json::from_value(state.clone())
+                        .map_err(|error| Error::new(ErrorKind::InvalidData, error).into());
+                }
+                frame.clear();
+            }
+        }
+    }
+
+    fn broker(
+        &mut self,
+        request: crate::vdd_broker::Request,
+    ) -> Result<crate::vdd_broker::Reply, VddError> {
+        let reply = match crate::vdd_broker::request(request) {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.broker_protocol = None;
+                return Err(error.into());
+            }
+        };
+        self.broker_protocol = reply.legacy.map(|legacy| {
+            if legacy {
+                VddProtocol::Legacy
+            } else {
+                VddProtocol::V2
+            }
+        });
         Ok(reply)
     }
 
@@ -473,9 +635,22 @@ impl VddClient {
                 self.connection = None;
                 match self.ensure()? {
                     VddProtocol::Legacy => self.write_raw(json),
-                    VddProtocol::V2 => self.write_framed(json),
+                    VddProtocol::V2 => match serde_json::from_str::<serde_json::Value>(json) {
+                        Ok(value) if value.get("Add").is_none() => self.write_framed(json),
+                        _ => Err(std::io::Error::other("驱动协议已变化，请重新执行建屏").into()),
+                    },
                 }
             }
+        }
+    }
+}
+
+fn merge_monitors(state: &mut Vec<VddMonitor>, updates: &[VddMonitor]) {
+    for update in updates {
+        if let Some(monitor) = state.iter_mut().find(|monitor| monitor.id == update.id) {
+            *monitor = update.clone();
+        } else {
+            state.push(update.clone());
         }
     }
 }
@@ -488,7 +663,12 @@ fn connect(name: &str) -> Result<Connection, VddError> {
 
     loop {
         // A pipe-name squatter must not impersonate the elevated VDD helper.
-        match OpenOptions::new().read(true).write(true).security_qos_flags(0x0001_0000).open(&path) {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(0x0001_0000)
+            .open(&path)
+        {
             Ok(file) => {
                 return Ok(Connection {
                     protocol: VddProtocol::V2,
@@ -498,13 +678,25 @@ fn connect(name: &str) -> Result<Connection, VddError> {
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
                     // 驱动只开 INBOUND 时，双向打开会被拒；退回只写。
-                    if let Ok(file) = OpenOptions::new().write(true).security_qos_flags(0x0001_0000).open(&path) {
-                        return Ok(Connection {
-                            protocol: VddProtocol::Legacy,
-                            pipe: Box::new(PipeFile(file)),
-                        });
+                    match OpenOptions::new()
+                        .write(true)
+                        .security_qos_flags(0x0001_0000)
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            return Ok(Connection {
+                                protocol: VddProtocol::Legacy,
+                                pipe: Box::new(PipeFile(file)),
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            first_error = Some(error);
+                            break;
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
                     }
-                    first_error.get_or_insert(err);
                 } else if first_error.is_none() {
                     first_error = Some(err);
                 }
@@ -707,6 +899,7 @@ mod tests {
         alive: bool,
         connects: usize,
         writes: Vec<Vec<u8>>,
+        replies: std::collections::VecDeque<Vec<u8>>,
         /// 接下来多少次写要失败（模拟 `ERROR_BROKEN_PIPE`）。
         fail_writes: usize,
     }
@@ -714,8 +907,15 @@ mod tests {
     struct FakePipe(Arc<Mutex<FakeWorld>>);
 
     impl Read for FakePipe {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Ok(0)
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut world = self.0.lock().unwrap();
+            let Some(mut reply) = world.replies.pop_front() else { return Ok(0) };
+            let length = reply.len().min(buf.len());
+            buf[..length].copy_from_slice(&reply[..length]);
+            if length < reply.len() {
+                world.replies.push_front(reply.split_off(length));
+            }
+            Ok(length)
         }
     }
 
@@ -746,7 +946,11 @@ mod tests {
     }
 
     fn fake_world(protocol: VddProtocol) -> Arc<Mutex<FakeWorld>> {
-        Arc::new(Mutex::new(FakeWorld { protocol: Some(protocol), alive: true, ..Default::default() }))
+        let mut world = FakeWorld { protocol: Some(protocol), alive: true, ..Default::default() };
+        if protocol == VddProtocol::V2 {
+            world.replies.extend((0..2).map(|_| frame("{\"State\":[]}")));
+        }
+        Arc::new(Mutex::new(world))
     }
 
     fn fake_client(world: &Arc<Mutex<FakeWorld>>) -> VddClient {
@@ -756,6 +960,7 @@ mod tests {
             Box::new(move |_name| {
                 let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
                 state.connects += 1;
+                state.alive = true;
                 let protocol = state.protocol.unwrap_or(VddProtocol::V2);
                 Ok(Connection { protocol, pipe: Box::new(FakePipe(shared.clone())) })
             }),
@@ -778,7 +983,7 @@ mod tests {
 
         client.notify(&[monitor()]).expect("下一次调用应重新连接并成功");
         assert_eq!(world.lock().unwrap().connects, 2);
-        assert_eq!(world.lock().unwrap().writes.len(), 2);
+        assert_eq!(world.lock().unwrap().writes.len(), 4);
     }
 
     #[test]
@@ -811,6 +1016,37 @@ mod tests {
 
         let state = world.lock().unwrap();
         assert_eq!(state.connects, 2, "探测到断线必须重新 CreateFile");
-        assert_eq!(state.writes.len(), 2);
+        assert_eq!(state.writes.len(), 4);
+    }
+
+    #[test]
+    fn v2_update_preserves_other_monitors_and_waits_for_the_state_frame() {
+        let world = fake_world(VddProtocol::V2);
+        let other = VddMonitor { id: 9, ..monitor() };
+        let changed = frame("{\"Changed\":[]}");
+        let reply = frame(&serde_json::json!({ "State": [other.clone()] }).to_string());
+        world.lock().unwrap().replies = [changed, reply[..7].to_vec(), reply[7..].to_vec()].into();
+        fake_client(&world).notify(&[monitor()]).unwrap();
+        let state = world.lock().unwrap();
+        assert_eq!(state.writes, vec![frame("\"State\""), frame(&serialize_notify(&[other, monitor()]))]);
+    }
+
+    #[test]
+    fn v2_never_replaces_the_list_when_the_state_reply_is_incomplete() {
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [b"{\"State\":[]}".to_vec()].into();
+        assert!(fake_client(&world).notify(&[monitor()]).is_err());
+        assert_eq!(world.lock().unwrap().writes, vec![frame("\"State\"")]);
+    }
+
+    #[test]
+    fn v2_creation_never_overwrites_a_disabled_monitor_with_the_same_id() {
+        let world = fake_world(VddProtocol::V2);
+        let disabled = VddMonitor { enabled: false, ..monitor() };
+        let reply = frame(&serde_json::json!({ "State": [disabled] }).to_string());
+        world.lock().unwrap().replies = [reply].into();
+        assert!(matches!(fake_client(&world).notify(&[monitor()]),
+            Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(world.lock().unwrap().writes, vec![frame("\"State\"")]);
     }
 }

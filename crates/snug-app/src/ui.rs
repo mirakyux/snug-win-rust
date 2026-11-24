@@ -135,6 +135,10 @@ pub struct PhoneHomeApp {
     pub pipe_ready: bool,
     /// 上次查驱动状态的时间（设置窗开着时每帧都会问一次，按 250ms 节流）。
     pipe_checked: Option<std::time::Instant>,
+    driver_health: Option<snug_win::driver_health::DriverHealth>,
+    driver_health_checked: Option<std::time::Instant>,
+    driver_retry: Option<std::sync::mpsc::Receiver<Result<snug_win::VddProtocol, String>>>,
+    driver_connection_result: Option<String>,
     pub controller: Controller,
     /// Hidden-window repaint worker; joined during app shutdown.
     ui_heartbeat: UiHeartbeat,
@@ -281,6 +285,10 @@ impl PhoneHomeApp {
             paths,
             pipe_ready,
             pipe_checked: None,
+            driver_health: None,
+            driver_health_checked: None,
+            driver_retry: None,
+            driver_connection_result: None,
             controller,
             ui_heartbeat,
             library_ui: MobileLibraryUi::default(),
@@ -970,9 +978,37 @@ impl PhoneHomeApp {
     /// 把界面读到的运行态喂给设置窗（对应 C# 每次打开设置窗时的 `Refresh`）。
     fn refresh_settings_status(&mut self) {
         self.refresh_pipe_state();
+        if self.settings.needs_logs()
+            && self
+                .driver_health_checked
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(3))
+        {
+            self.driver_health = Some(snug_win::driver_health::DriverHealth::probe());
+            self.driver_health_checked = Some(std::time::Instant::now());
+        }
         let state = self.state();
+        let failed_resolution_screen = (state.notice
+            == Some(snug_core::desk::DeskNotice::ReshapeFailed))
+        .then(|| {
+            self.active_screen
+                .clone()
+                .or_else(|| self.config.primary_touch_screen().map(|screen| screen.id))
+        })
+        .flatten();
+        let driver_connection_result = match snug_win::driver_health::broker_status() {
+            snug_win::vdd_broker::BrokerStatus::Failed(failure) if self.driver_retry.is_none() => {
+                Some(failure.to_string())
+            }
+            snug_win::vdd_broker::BrokerStatus::Connected => self.driver_connection_result
+                .clone().or_else(|| Some("驱动权限代理已连接".into())),
+            _ => self.driver_connection_result.clone(),
+        };
         let status = StatusInfo {
             pipe_available: self.pipe_ready,
+            driver_health: self.driver_health.clone(),
+            driver_reconnecting: self.driver_retry.is_some(),
+            driver_connection_result,
+            failed_resolution_screen,
             elevated: self.elevated,
             phone_screen_ready: state.screen_phase == PhoneScreenPhase::Ready,
             can_reenter: self.controller.can_reenter(),
@@ -981,11 +1017,61 @@ impl PhoneHomeApp {
             self_contained: true,
         };
         self.settings.set_status(status);
-        self.settings.set_autostart(Self::startup_service().is_enabled());
-        self.settings.set_manual_override(self.controller.manual_override());
+        self.settings
+            .set_autostart(Self::startup_service().is_enabled());
+        self.settings
+            .set_manual_override(self.controller.manual_override());
         // 日志框：只在"驱动与日志"页增量刷新，别每帧把整个文件读进文本框。
         if self.settings.needs_logs() {
             self.refresh_logs();
+        }
+    }
+
+    fn poll_driver_retry(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(retry) = &self.driver_retry else {
+            return;
+        };
+        let message = match retry.try_recv() {
+            Ok(Ok(protocol)) => {
+                if self.preview.is_none() {
+                    self.controller
+                        .retry_failed_screen(self.active_screen.as_deref());
+                }
+                match protocol {
+                    snug_win::VddProtocol::V2 => "连接成功 · 双向协议".into(),
+                    snug_win::VddProtocol::Legacy => "连接成功 · 旧版协议".into(),
+                }
+            }
+            Ok(Err(error)) => error,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "驱动连接任务意外停止".into(),
+        };
+        crate::info!("驱动：{message}");
+        self.driver_retry = None;
+        self.driver_health_checked = None;
+        self.driver_connection_result = Some(message);
+    }
+
+    fn retry_driver_connection(&mut self, ctx: &egui::Context) {
+        if self.driver_retry.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        match std::thread::Builder::new()
+            .name("snug-driver-retry".into())
+            .spawn(move || {
+                let _ = tx.send(snug_win::driver_health::retry_connection());
+                repaint.request_repaint();
+            }) {
+            Ok(_) => {
+                self.driver_retry = Some(rx);
+                self.driver_connection_result = None;
+            }
+            Err(error) => {
+                self.driver_connection_result = Some(format!("无法启动连接任务：{error}"))
+            }
         }
     }
 
@@ -1086,6 +1172,8 @@ impl PhoneHomeApp {
                     Err(err) => crate::warn!("设置：启动驱动安装任务失败 {err}"),
                 }
             }
+            SettingsAction::RetryDriverConnection => self.retry_driver_connection(ctx),
+            SettingsAction::RetryResolution(id) => self.controller.retry_resolution(id),
             SettingsAction::DismissScreen => self.dismiss_active_screen(ctx),
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
@@ -1250,6 +1338,7 @@ impl eframe::App for PhoneHomeApp {
         for action in self.settings.take_actions() {
             self.apply_setting(action, ctx);
         }
+        self.poll_driver_retry();
         if self.settings.is_open() {
             self.refresh_settings_status();
         }

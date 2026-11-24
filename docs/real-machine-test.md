@@ -41,8 +41,8 @@ $env:SNUGWIN_HOME = $testData
 要看到的：
 
 - 托盘出现 `snugwin-idle.ico`，提示文字 `SnugWin - 手机屏：关`
-- 双击托盘 / 右键"打开设置与诊断..." → 设置窗五个页签可翻（控制中心 / 手势与交互 / 驱动与日志 / 关于与更新 / 多屏与设备）
-- 设置窗"驱动与日志"页显示管道就绪（这台机器驱动已装）
+- 双击托盘打开设置，能切换「屏幕」「交互」「通用」三页
+- 在「通用 → 驱动与日志」能看到已安装的驱动版本和管道访问状态
 - `$testData\logs\snug-YYYYMMDD.log` 里有启动行、数据目录行、托盘就绪行
 - 关闭设置窗、托盘"退出 SnugWin（先还原窗口）"能干净退出，托盘图标消失
 
@@ -52,7 +52,7 @@ $env:SNUGWIN_HOME = $testData
 
 前提：C# 正式版已经退出（托盘右键退出），否则两边会抢同一个驱动管道。
 GUI 保持普通权限；驱动管道拒绝普通权限访问时，首次真实建屏会请求受限 VDD 代理的 UAC。
-取消或代理失败后，本次 GUI 生命周期内不再反复请求 UAC；修正问题后重启 GUI 再试。
+取消授权或代理连接失败时，程序等待用户操作。到「通用 → 驱动与日志」点击「重试驱动连接」。
 
 ```powershell
 Stop-Process -Name SnugWin.App -ErrorAction SilentlyContinue
@@ -67,7 +67,7 @@ $env:SNUGWIN_HOME = "$env:USERPROFILE\snug-rs-test"
 2. 手机屏阶段 `Preparing` → `Ready`，日志 `手机屏 #N 已就绪（W 宽）`，`display_id` 有值
 3. `手机屏界面：铺满资源库，搬到 (x, y) W×H` —— 我们自己的 egui 窗口被 `SetWindowPos` 搬到了虚拟屏上
    （收成底部条时是 `收成底部指示条`，预览窗是 `预览窗：预览（只读），搬到 …`）
-4. Windows 显示设置里多出 `Virtual Display` 一块，分辨率符合机型比例
+4. Windows 显示设置里多出 `Virtual Display` 一块，分辨率符合屏幕设置，刷新率为 60 Hz
 5. App 资源库里能列出真实运行中的窗口
 
 退出时检查归位：被搬到手机屏上的窗口回到原屏幕原位，虚拟屏撤掉，`phone-screen.json` 记下状态。
