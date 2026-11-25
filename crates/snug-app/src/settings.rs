@@ -22,7 +22,9 @@
 
 use eframe::egui;
 use snug_core::config::ScreenResolution;
-use snug_core::{AppConfig, AppThemeMode, PhoneChoice, PhoneScreenSpec, ScreenConfig};
+use snug_core::{AppConfig, AppThemeMode, PhoneChoice, PhoneScreenMode, PhoneScreenSpec, ScreenConfig};
+
+mod desktop;
 
 fn screen_spec_text(screen: &ScreenConfig) -> String {
     let fit = snug_core::ScreenPlan::fit_of(screen);
@@ -32,6 +34,20 @@ fn screen_spec_text(screen: &ScreenConfig) -> String {
 
 /// 字号放大档位（C# `ZoomCombo` 的 0~4），与 core 的 `MIN_ZOOM_STEPS`/`MAX_ZOOM_STEPS` 一致。
 pub const ZOOM_LABELS: [&str; 5] = ["0 级（默认）", "+1 级", "+2 级", "+3 级", "+4 级"];
+
+pub(crate) const PHONE_SCREEN_MODES: [PhoneScreenMode; 3] = [
+    PhoneScreenMode::Off,
+    PhoneScreenMode::WhileConnected,
+    PhoneScreenMode::Always,
+];
+
+pub(crate) fn phone_screen_mode_label(mode: PhoneScreenMode) -> &'static str {
+    match mode {
+        PhoneScreenMode::Off => "关闭",
+        PhoneScreenMode::WhileConnected => "连接时显示",
+        PhoneScreenMode::Always => "始终显示",
+    }
+}
 
 /// 保留旧五种入口及索引；界面只呈现屏幕、交互、通用三类。
 /// `Home` 为通用，`Diagnostics` / `About` 进入通用的对应折叠段。
@@ -106,10 +122,6 @@ pub enum SettingsOutcome {
 /// 需要 app 层去执行的动作（本模块不做任何副作用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsAction {
-    /// 手机屏总开关（C# `SetPhoneScreenEnabled`），控制器可实时响应。
-    SetPhoneScreen(bool),
-    /// 手动强制开关（C# `SetManualOverride`），属于控制器运行态、不写配置。
-    SetManualOverride(bool),
     /// 开机自启（C# `SetAutoStartEnabled` → `StartupTaskService`），会真实建计划任务。
     SetAutoStart(bool),
     /// 检查更新（C# `OnCheckUpdate`）。
@@ -132,6 +144,7 @@ pub enum SettingsAction {
     ReenterScreen,
     /// 首页的「预览界面」（C# `OpenScreenPreview`）。
     OpenPreview,
+    OpenProjection,
     /// 用户明确确认后收起本次手机屏，不关闭应用或修改自动开屏配置。
     DismissScreen,
 }
@@ -139,9 +152,13 @@ pub enum SettingsAction {
 /// 运行态快照：由 app 层喂进来，界面只读（对应 C# 里从 `_controller` 读的那些字段）。
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
+    pub autostart: Option<bool>,
+    pub autostart_changing: bool,
+    pub autostart_error: Option<String>,
     /// `snug_win::vdd::is_driver_pipe_available`：`\\.\pipe\virtualdisplaydriver` 是否在。
     pub pipe_available: bool,
     pub driver_health: Option<snug_win::driver_health::DriverHealth>,
+    pub driver_broker_connected: bool,
     pub driver_reconnecting: bool,
     pub driver_connection_result: Option<String>,
     pub failed_resolution_screen: Option<String>,
@@ -162,8 +179,12 @@ pub struct StatusInfo {
 impl Default for StatusInfo {
     fn default() -> Self {
         Self {
+            autostart: None,
+            autostart_changing: false,
+            autostart_error: None,
             pipe_available: false,
             driver_health: None,
+            driver_broker_connected: false,
             driver_reconnecting: false,
             driver_connection_result: None,
             failed_resolution_screen: None,
@@ -268,7 +289,7 @@ pub enum ChangeImpact {
 
 /// 对比两份配置，得出影响面。判定顺序从“最重”到“最轻”。
 pub fn classify_change(before: &AppConfig, after: &AppConfig) -> ChangeImpact {
-    if before.screens != after.screens {
+    if before.screens != after.screens || before.crossdesk_enabled != after.crossdesk_enabled {
         return ChangeImpact::Screens;
     }
     if before.phone != after.phone || before.zoom_steps != after.zoom_steps {
@@ -288,8 +309,7 @@ pub fn classify_change(before: &AppConfig, after: &AppConfig) -> ChangeImpact {
     if before.theme != after.theme {
         return ChangeImpact::Theme;
     }
-    // phone_screen / auto_check_updates / welcomed / last_version 都不需要“重来”：
-    // 前两个由控制器实时响应，后两个不是设置界面能改的。
+    // 手机屏显示模式和自动更新检查在运行中生效。
     ChangeImpact::None
 }
 
@@ -473,9 +493,6 @@ pub struct SettingsWindow {
     status: StatusInfo,
     update: UpdateUiState,
     /// 计划任务状态（由 `StartupService` 查询后喂进来，不在 `AppConfig` 里）。
-    autostart: bool,
-    /// 手动强制手机屏（控制器运行态，不在 `AppConfig` 里）。
-    manual_override: bool,
     /// 诊断页的日志文本（app 层追加）。
     logs: String,
     /// 待执行动作队列。
@@ -495,7 +512,7 @@ pub struct SettingsWindow {
     show_updates: bool,
     show_diagnostics: bool,
     reset_scroll: bool,
-    /// 只在设置页内确认本次收屏，避免与自动开屏总开关混淆。
+    /// 只在设置页内确认本次收屏，避免与手机屏显示模式混淆。
     confirm_dismiss: bool,
 }
 
@@ -512,8 +529,6 @@ impl SettingsWindow {
             tab: SettingsTab::Screens,
             status: StatusInfo::default(),
             update: UpdateUiState::Idle,
-            autostart: false,
-            manual_override: false,
             logs: String::new(),
             actions: Vec::new(),
             baseline: None,
@@ -572,6 +587,40 @@ impl SettingsWindow {
         self.open
     }
 
+    pub fn close(&mut self) {
+        self.open = false;
+        self.baseline = None;
+        self.last_hint = None;
+    }
+
+    /// Both windows display the same runtime status while keeping their own navigation.
+    pub fn sync_runtime_from(&mut self, source: &Self) {
+        self.status = source.status.clone();
+        self.update = source.update.clone();
+        if self.needs_logs() && self.logs != source.logs {
+            self.logs.clone_from(&source.logs);
+        }
+    }
+
+    pub fn sync_committed_screens(&mut self, before: &AppConfig, after: &AppConfig) {
+        if before.screens == after.screens && before.phone == after.phone {
+            return;
+        }
+        let previous = before.effective_screens();
+        let current = after.effective_screens();
+        self.resolution_drafts.retain(|id, _| {
+            let old = previous.iter().find(|screen| screen.id == *id);
+            let new = current.iter().find(|screen| screen.id == *id);
+            old.zip(new).is_some_and(|(old, new)| old.resolution == new.resolution)
+        });
+        if let Some(id) = &self.screen_detail
+            && let Some(screen) = current.iter().find(|screen| screen.id == *id)
+            && previous.iter().any(|old| old.id == *id && old.name != screen.name)
+        {
+            self.screen_name_draft.clone_from(&screen.name);
+        }
+    }
+
     #[cfg(test)]
     pub fn tab(&self) -> SettingsTab {
         self.tab
@@ -588,14 +637,6 @@ impl SettingsWindow {
 
     pub fn set_update_state(&mut self, update: UpdateUiState) {
         self.update = update;
-    }
-
-    pub fn set_autostart(&mut self, enabled: bool) {
-        self.autostart = enabled;
-    }
-
-    pub fn set_manual_override(&mut self, enabled: bool) {
-        self.manual_override = enabled;
     }
 
     pub fn set_logs(&mut self, logs: impl Into<String>) {
@@ -619,6 +660,14 @@ impl SettingsWindow {
     /// 设置画在当前手机屏窗口里。窄屏占满页面，宽屏保留桌面设置窗。
     /// `cfg` 是本模块唯一会改的外部状态；调用方在设置打开时不再绘制资源库。
     pub fn show(&mut self, ctx: &egui::Context, cfg: &mut AppConfig) -> SettingsOutcome {
+        self.show_on_surface(ctx, cfg, false)
+    }
+
+    pub fn show_desktop(&mut self, ctx: &egui::Context, cfg: &mut AppConfig) -> SettingsOutcome {
+        self.show_on_surface(ctx, cfg, true)
+    }
+
+    fn show_on_surface(&mut self, ctx: &egui::Context, cfg: &mut AppConfig, desktop: bool) -> SettingsOutcome {
         if !self.open {
             return SettingsOutcome::Idle;
         }
@@ -627,7 +676,9 @@ impl SettingsWindow {
             self.baseline = Some(before.clone());
         }
 
-        if ctx.screen_rect().width() < 720.0 {
+        if desktop {
+            self.desktop_layout(ctx, cfg);
+        } else if ctx.screen_rect().width() < 720.0 {
             self.show_mobile(ctx, cfg);
         } else {
             let mut titlebar_open = self.open;
@@ -771,7 +822,7 @@ impl SettingsWindow {
             ui.add_space(10.0);
             ui.label(egui::RichText::new(hint).small().color(palette.accent));
         }
-        if let Some(hint) = both_off_hint(cfg, self.autostart) {
+        if let Some(hint) = self.status.autostart.and_then(|enabled| both_off_hint(cfg, enabled)) {
             ui.add_space(6.0);
             ui.label(egui::RichText::new(hint).small().color(palette.warn));
         }
@@ -848,15 +899,15 @@ impl SettingsWindow {
         });
         ui.add_space(8.0);
         Self::card(ui, "启动与字号", |ui| {
-            if Self::labeled_checkbox(
-                ui,
-                &mut self.autostart,
-                "登录后后台启动",
-                "以普通权限常驻托盘",
-            ) {
-                self.actions
-                    .push(SettingsAction::SetAutoStart(self.autostart));
+            let mut enabled = self.status.autostart.unwrap_or(false);
+            let label = self.autostart_label();
+            let response = ui.add_enabled_ui(self.autostart_editable(), |ui| {
+                Self::labeled_checkbox(ui, &mut enabled, label, "登录后等待 20 秒，以普通权限常驻托盘")
+            });
+            if response.inner {
+                self.actions.push(SettingsAction::SetAutoStart(enabled));
             }
+            self.show_autostart_error(ui);
             ui.label("应用字号");
             ui.horizontal(|ui| {
                 if ui
@@ -883,6 +934,15 @@ impl SettingsWindow {
                 egui::RichText::new("对支持缩放的手机、平板应用窗口生效")
                     .small()
                     .weak(),
+            );
+        });
+        ui.add_space(8.0);
+        Self::card(ui, "远控", |ui| {
+            Self::labeled_checkbox(
+                ui,
+                &mut cfg.crossdesk_enabled,
+                "启用 CrossDesk（实验性）",
+                "尚未经过真机远控测试。手机端请使用绝对鼠标。",
             );
         });
         ui.add_space(8.0);
@@ -918,6 +978,27 @@ impl SettingsWindow {
         self.page_footer(ui, cfg);
     }
 
+    fn autostart_label(&self) -> &'static str {
+        if self.status.autostart_changing {
+            "正在保存登录自启设置…"
+        } else if self.status.autostart.is_none() {
+            "正在读取登录自启状态…"
+        } else {
+            "登录后后台启动"
+        }
+    }
+
+    fn autostart_editable(&self) -> bool {
+        self.status.autostart.is_some() && !self.status.autostart_changing
+    }
+
+    fn show_autostart_error(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.status.autostart_error {
+            let color = crate::theme::palette(ui.visuals().dark_mode).warn;
+            ui.colored_label(color, error);
+        }
+    }
+
     /// 屏幕列表只显示摘要，编辑和添加分别进入自己的表单。
     fn page_screens(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
         if self.adding_screen {
@@ -942,6 +1023,26 @@ impl SettingsWindow {
             }
             ui.add_space(8.0);
         }
+        ui.strong("手机屏显示");
+        let mode = cfg.phone_screen_mode();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for option in PHONE_SCREEN_MODES {
+                if ui
+                    .add(
+                        egui::Button::new(phone_screen_mode_label(option))
+                            .selected(mode == option)
+                            .min_size(egui::vec2(72.0, 48.0)),
+                    )
+                    .clicked()
+                    && mode != option
+                {
+                    cfg.set_phone_screen_mode(option);
+                }
+            }
+        });
+        ui.add_space(8.0);
+
         let screens = cfg.effective_screens();
         if screens.is_empty() {
             ui.label("还没有屏幕");
@@ -1009,15 +1110,6 @@ impl SettingsWindow {
             .weak(),
         );
         ui.add_space(8.0);
-        if Self::labeled_checkbox(
-            ui,
-            &mut cfg.phone_screen,
-            "连接后自动开屏",
-            "断开后还原窗口并撤屏",
-        ) {
-            self.actions
-                .push(SettingsAction::SetPhoneScreen(cfg.phone_screen));
-        }
         if ui
             .add_sized([ui.available_width(), 48.0], egui::Button::new("预览界面"))
             .clicked()
@@ -1389,7 +1481,9 @@ impl SettingsWindow {
             ui.label(match health.access {
                 PipeAccess::Direct(VddProtocol::V2) => "可直接连接 · 双向协议",
                 PipeAccess::Direct(VddProtocol::Legacy) => "可直接连接 · 旧版协议",
+                PipeAccess::RequiresElevation if self.status.driver_broker_connected => "已通过驱动代理连接",
                 PipeAccess::RequiresElevation => "连接需要管理员授权",
+                PipeAccess::ElevatedAccessDenied => "驱动拒绝已提权的 Snug 连接",
                 PipeAccess::Busy => "驱动管道繁忙",
                 PipeAccess::Missing => "驱动管道尚未出现",
                 PipeAccess::Unavailable => "驱动管道暂不可访问",
@@ -1424,15 +1518,6 @@ impl SettingsWindow {
             ui.label(elevation_text(self.status.elevated));
             if !self.status.elevated && ui.button("以管理员身份重启").clicked() {
                 self.actions.push(SettingsAction::RestartElevated);
-            }
-            if Self::labeled_checkbox(
-                ui,
-                &mut self.manual_override,
-                "手动强制开启手机屏",
-                "跳过自动探测，仅用于连接识别失败时的兜底",
-            ) {
-                self.actions
-                    .push(SettingsAction::SetManualOverride(self.manual_override));
             }
         });
         ui.add_space(10.0);
@@ -1550,6 +1635,26 @@ impl SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn committed_screen_edits_refresh_the_other_views_draft() {
+        let before = standard().sanitize();
+        let mut after = before.clone();
+        let screens = after.screens.as_mut().unwrap();
+        let original = screens.first_mut().unwrap();
+        let id = original.id.clone();
+        let mut desktop = SettingsWindow::new();
+        desktop.screen_detail = Some(id.clone());
+        desktop.screen_name_draft = original.name.clone();
+        desktop.resolution_drafts.insert(id.clone(), ResolutionDraft::from_screen(original));
+
+        original.name = "桌面修改后的名称".into();
+        original.resolution = Some(ScreenResolution { width: 1080, height: 1900 });
+        desktop.sync_committed_screens(&before, &after);
+
+        assert_eq!(desktop.screen_name_draft, "桌面修改后的名称");
+        assert!(!desktop.resolution_drafts.contains_key(&id));
+    }
     fn settle_settings(
         ctx: &egui::Context,
         window: &mut SettingsWindow,
@@ -1694,13 +1799,6 @@ mod tests {
         let output = settle_settings(&ctx, &mut window, &mut cfg);
         click_settings_label(&ctx, &output, "以管理员身份重启", &mut window, &mut cfg);
         assert_eq!(window.take_actions(), vec![SettingsAction::RestartElevated]);
-        let output = settle_settings(&ctx, &mut window, &mut cfg);
-        click_settings_label(&ctx, &output, "手动强制开启手机屏", &mut window, &mut cfg);
-        assert_eq!(
-            window.take_actions(),
-            vec![SettingsAction::SetManualOverride(true)]
-        );
-
         window.select_tab(SettingsTab::from_index(3));
         assert_eq!(window.tab(), SettingsTab::Home);
         assert!(!window.needs_logs());
@@ -2075,10 +2173,39 @@ mod tests {
     }
 
     #[test]
-    fn mobile_dismiss_requires_confirmation_and_preserves_automatic_screen_setting() {
+    fn mobile_screen_mode_changes_take_effect_without_editing_screen_profiles() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut cfg = standard().sanitize();
+        let profiles = cfg.effective_screens();
+        let mut window = SettingsWindow::new();
+        window.open();
+
+        for mode in [
+            PhoneScreenMode::Always,
+            PhoneScreenMode::Off,
+            PhoneScreenMode::WhileConnected,
+        ] {
+            let output = settle_settings(&ctx, &mut window, &mut cfg);
+            click_settings_label(
+                &ctx,
+                &output,
+                phone_screen_mode_label(mode),
+                &mut window,
+                &mut cfg,
+            );
+            assert_eq!(cfg.phone_screen_mode(), mode);
+            assert_eq!(cfg.effective_screens(), profiles);
+            assert!(window.take_actions().is_empty());
+        }
+    }
+
+    #[test]
+    fn mobile_dismiss_requires_confirmation_and_preserves_screen_mode() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx, false);
         let mut cfg = standard();
+        cfg.set_phone_screen_mode(PhoneScreenMode::Always);
         let mut window = SettingsWindow::new();
         window.status.phone_screen_ready = true;
         window.open();
@@ -2097,7 +2224,6 @@ mod tests {
                 },
             );
         }
-        let auto_screen = cfg.phone_screen;
         click_settings_label(&ctx, &output, "收起手机屏", &mut window, &mut cfg);
         assert!(
             window.take_actions().is_empty(),
@@ -2110,7 +2236,7 @@ mod tests {
         click_settings_label(&ctx, &output, "收起并还原窗口", &mut window, &mut cfg);
         assert_eq!(window.take_actions(), vec![SettingsAction::DismissScreen]);
         assert!(!window.is_open());
-        assert_eq!(cfg.phone_screen, auto_screen);
+        assert_eq!(cfg.phone_screen_mode(), PhoneScreenMode::Always);
     }
     #[test]
     fn zoom_index_and_label_clamp() {
@@ -2180,9 +2306,10 @@ mod tests {
     }
 
     #[test]
-    fn phone_screen_and_updates_need_no_restart() {        let before = standard();
+    fn phone_screen_mode_and_updates_need_no_restart() {
+        let before = standard();
         let mut after = before.clone();
-        after.phone_screen = false;
+        after.set_phone_screen_mode(PhoneScreenMode::Always);
         after.auto_check_updates = false;
         assert_eq!(classify_change(&before, &after), ChangeImpact::None);
         assert_eq!(change_hint(ChangeImpact::None), None);

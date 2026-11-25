@@ -1,13 +1,13 @@
 //! 托盘图标，移植自 C# 版 `App.xaml.cs` 的 `NotifyIcon` 部分。
 //!
-//! 菜单结构与 C# v1.3.0 逐项对齐：
+//! 托盘菜单：
 //! 1. `状态：…`（禁用，随状态刷新）
 //! 2. 分隔线
-//! 3. `打开设置与诊断...` → 设置窗第 0 页
+//! 3. `打开桌面设置...` → 实体屏上的设置窗
 //! 4. `预览手机界面...` → 桌面预览窗（对应 C# `OpenPhonePreview`）
 //! 5. `检查更新...` → 设置窗第 3 页（关于与更新）
 //! 6. `重新进入手机屏` → 撤销"收起手机屏"（C# `_reentryMenuItem`）
-//! 7. `手动开启手机屏（测试/兜底）`（可勾选）→ `SetManualOverride`
+//! 7. `手机屏显示` → 当前配置的三种显示模式
 //! 8. 分隔线
 //! 9. `退出 SnugWin（先还原窗口）`
 //!
@@ -20,8 +20,11 @@
 //! 平台细节：`tray-icon` 在创建它的线程上建一个隐藏窗口，消息由 winit/eframe
 //! 的消息泵分发，所以**必须在主线程创建**（和 C# 里 NotifyIcon 属于 UI 线程同理）。
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use snug_core::PhoneScreenMode;
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use crate::settings::{PHONE_SCREEN_MODES, phone_screen_mode_label};
 
 const ICON_SIZE: u32 = 32;
 const ICON_BYTES: usize = (ICON_SIZE * ICON_SIZE * 4) as usize;
@@ -39,8 +42,8 @@ pub enum TrayCommand {
     OpenPreview,
     /// 重新进入手机屏：撤销"收起"（C# `ReenterScreen`）。
     Reenter,
-    /// 手动强制手机屏（菜单里的勾选项）。
-    SetManualOverride(bool),
+    /// 选择手机屏的显示模式。
+    SetPhoneScreenMode(PhoneScreenMode),
     /// 退出（先还原窗口）。
     Quit,
 }
@@ -49,28 +52,39 @@ pub enum TrayCommand {
 pub struct Tray {
     _icon: TrayIcon,
     status_item: MenuItem,
-    manual_item: CheckMenuItem,
+    mode_items: [(PhoneScreenMode, CheckMenuItem); 3],
     reentry_item: MenuItem,
     settings_id: MenuId,
     update_id: MenuId,
     preview_id: MenuId,
     reentry_id: MenuId,
     quit_id: MenuId,
-    manual_id: MenuId,
     connected: bool,
     last_summary: String,
 }
 
 impl Tray {
     /// 建托盘。找不到 shell（如某些会话/服务环境）时返回 `None`，不 panic。
-    pub fn new(connected: bool) -> Option<Self> {
+    pub fn new(connected: bool, mode: PhoneScreenMode) -> Option<Self> {
         let status_item = MenuItem::new("状态：初始化中", false, None);
-        let settings = MenuItem::new("打开设置与诊断...", true, None);
+        let settings = MenuItem::new("打开桌面设置...", true, None);
         let preview = MenuItem::new("预览手机界面...", true, None);
         let update = MenuItem::new("检查更新...", true, None);
         // C# 里这一项默认 `Visible = false`，只在"手机屏被收起且还在会话里"时出现。
         let reentry = MenuItem::new("重新进入手机屏", false, None);
-        let manual = CheckMenuItem::new("手动开启手机屏（测试/兜底）", true, false, None);
+        let mode_items = PHONE_SCREEN_MODES.map(|option| {
+            let item = CheckMenuItem::new(
+                phone_screen_mode_label(option),
+                true,
+                option == mode,
+                None,
+            );
+            (option, item)
+        });
+        let modes = Submenu::new("手机屏显示", true);
+        for (_, item) in &mode_items {
+            modes.append(item).ok()?;
+        }
         let quit = MenuItem::new("退出 SnugWin（先还原窗口）", true, None);
 
         let menu = Menu::new();
@@ -81,7 +95,7 @@ impl Tray {
             &preview,
             &update,
             &reentry,
-            &manual,
+            &modes,
             &PredefinedMenuItem::separator(),
             &quit,
         ])
@@ -105,8 +119,7 @@ impl Tray {
         Some(Self {
             _icon: tray,
             status_item,
-            manual_id: manual.id().clone(),
-            manual_item: manual,
+            mode_items,
             reentry_id: reentry.id().clone(),
             reentry_item: reentry,
             settings_id: settings.id().clone(),
@@ -132,13 +145,14 @@ impl Tray {
                 if self.reentry_item.is_enabled() {
                     out.push(TrayCommand::Reenter);
                 }
-            } else if event.id == self.manual_id {
-                // muda 已经把勾选状态翻转过了，直接读当前值。
-                out.push(TrayCommand::SetManualOverride(
-                    self.manual_item.is_checked(),
-                ));
             } else if event.id == self.quit_id {
                 out.push(TrayCommand::Quit);
+            } else if let Some((mode, _)) = self
+                .mode_items
+                .iter()
+                .find(|(_, item)| item.id() == &event.id)
+            {
+                out.push(TrayCommand::SetPhoneScreenMode(*mode));
             }
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
@@ -179,10 +193,13 @@ impl Tray {
         }
     }
 
-    /// 外部改了手动强制状态（例如设置窗里改的），把勾选同步过来。
-    pub fn set_manual_override(&mut self, on: bool) {
-        if self.manual_item.is_checked() != on {
-            self.manual_item.set_checked(on);
+    /// 以已应用的配置为准，三个模式中只勾选当前一项。
+    pub fn set_phone_screen_mode(&self, mode: PhoneScreenMode) {
+        for (option, item) in &self.mode_items {
+            let checked = *option == mode;
+            if item.is_checked() != checked {
+                item.set_checked(checked);
+            }
         }
     }
 }

@@ -635,6 +635,18 @@ fn hwnd(handle: u64) -> HWND {
     HWND(handle as usize as *mut core::ffi::c_void)
 }
 
+fn own_hwnd(handle: u64) -> Option<HWND> {
+    let window = hwnd(handle);
+    let mut pid = 0;
+    let thread = unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    (thread != 0 && pid == std::process::id()).then_some(window)
+}
+
+fn set_window_bounds(window: HWND, x: i32, y: i32, width: i32, height: i32) -> bool {
+    unsafe { SetWindowPos(window, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) }
+        .is_ok()
+}
+
 fn rect_of(rect: RECT) -> Rect {
     Rect::new(
         rect.left as f64,
@@ -939,17 +951,7 @@ impl WindowApi for WinDesktop {
     }
 
     fn set_window_rect(&self, handle: u64, x: i32, y: i32, width: i32, height: i32) {
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd(handle),
-                None,
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+        set_window_bounds(hwnd(handle), x, y, width, height);
     }
 
     fn focus(&self, handle: u64) {
@@ -1020,21 +1022,34 @@ pub fn is_own_process(pid: i32) -> bool {
     pid == std::process::id() as i32
 }
 
+/// 读取本进程窗口在调用线程 DPI 坐标系里的原生矩形，包括隐藏窗口。
+pub fn own_window_rect(handle: u64) -> Option<Rect> {
+    WinDesktop::window_rect(own_hwnd(handle)?)
+}
+
+/// 在调用线程 DPI 坐标系里移动和调整本进程窗口，保持窗口状态与层级。
+pub fn position_own_window(handle: u64, bounds: Rect) -> bool {
+    let Some(window) = own_hwnd(handle) else {
+        return false;
+    };
+    let rounded = [bounds.x, bounds.y, bounds.width, bounds.height].map(f64::round);
+    if !rounded
+        .iter()
+        .all(|value| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(value))
+    {
+        return false;
+    }
+    let [x, y, width, height] = rounded.map(|value| value as i32);
+    width > 0 && height > 0 && set_window_bounds(window, x, y, width, height)
+}
+
 /// 异步唤醒本进程窗口的原生重绘，不依赖 egui 合并后的 repaint 请求。
 ///
 /// winit 在 `WM_PAINT` 中派发 `RedrawRequested`；投递消息不等待窗口线程，
 /// 也不改变窗口的可见性、位置或焦点。失效或其它进程的句柄一律拒绝。
 pub fn request_own_window_redraw(handle: u64) -> bool {
-    let window = hwnd(handle);
-    unsafe {
-        if !IsWindow(Some(window)).as_bool() {
-            return false;
-        }
-        let mut pid = 0;
-        GetWindowThreadProcessId(window, Some(&mut pid));
-        pid == std::process::id()
-            && PostMessageW(Some(window), WM_PAINT, WPARAM(0), LPARAM(0)).is_ok()
-    }
+    own_hwnd(handle)
+        .is_some_and(|window| unsafe { PostMessageW(Some(window), WM_PAINT, WPARAM(0), LPARAM(0)) }.is_ok())
 }
 
 /// 在本进程里找标题匹配的顶层可见窗口，返回它的句柄。
@@ -1092,7 +1107,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_redraw_repeats_without_a_rendered_frame_and_rejects_foreign_windows() {
+    fn native_helpers_manage_only_our_window_and_preserve_hidden_state() {
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetDesktopWindow, MSG, PM_REMOVE, PeekMessageW,
             WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -1126,12 +1141,24 @@ mod tests {
             assert_eq!(message.message, WM_PAINT);
         }
         assert!(!unsafe { IsWindowVisible(window.0) }.as_bool());
+        let bounds = Rect::new(120.0, 160.0, 480.0, 360.0);
+        let style = unsafe { GetWindowLongPtrW(window.0, GWL_STYLE) };
+        assert!(position_own_window(handle, bounds));
+        assert_eq!(own_window_rect(handle), Some(bounds));
+        assert_eq!(unsafe { GetWindowLongPtrW(window.0, GWL_STYLE) }, style);
+        assert_ne!(unsafe { GetForegroundWindow() }, window.0);
+        assert!(!unsafe { IsWindowVisible(window.0) }.as_bool());
         assert!(!request_own_window_redraw(0));
         let desktop = unsafe { GetDesktopWindow() };
         assert!(unsafe { IsWindow(Some(desktop)) }.as_bool());
-        assert!(!request_own_window_redraw(desktop.0 as usize as u64));
+        let foreign_handle = desktop.0 as usize as u64;
+        assert!(!request_own_window_redraw(foreign_handle));
+        assert!(own_window_rect(foreign_handle).is_none());
+        assert!(!position_own_window(foreign_handle, bounds));
         drop(window);
         assert!(!request_own_window_redraw(handle));
+        assert!(own_window_rect(handle).is_none());
+        assert!(!position_own_window(handle, bounds));
     }
 
     // ----- 纯函数 -----

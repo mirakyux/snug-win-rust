@@ -108,22 +108,47 @@ impl std::fmt::Display for ControllerTable {
 pub struct UUSignals {
     pub overlay_visible: bool,
     pub controllers: ControllerTable,
-    /// `None` 表示读不到 capture 状态。
+    /// 推流日志的辅助心跳。
     pub capture_active: Option<bool>,
+    /// 已确认的捕获清单或本机视频编码活动。
+    pub capture_evidence: UuCaptureEvidence,
+}
+
+/// An authenticated monitor binds every observation to one UU server generation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UuCaptureEvidence {
+    #[default]
+    Unknown,
+    /// UU 服务端持续使用视频编码引擎。
+    HardwareEncoding,
+    Active { generation: u64 },
+    Rebuilding { generation: u64 },
+    Stopped { generation: u64 },
 }
 
 impl UUSignals {
     /// 足以开始或恢复远程连接的证据。
     ///
-    /// Server 进程的可见窗口只是尺寸启发式，无法区分覆盖层与其它游戏窗口，
-    /// 所以只有 UIA 读到被控端控制表中的远程控制行才可准入。
+    /// 已读到的控制端表优先。控制端表不可读时，使用同一 UU 进程的捕获或视频编码活动。
     pub fn has_remote_evidence(&self) -> bool {
-        self.controllers.readable && !self.controllers.names.is_empty()
+        if self.controllers.readable {
+            !self.controllers.names.is_empty()
+        } else {
+            matches!(self.capture_evidence, UuCaptureEvidence::Active { .. } | UuCaptureEvidence::HardwareEncoding)
+        }
     }
 
     /// 采样中包含在场迹象。状态机还会检查日志是否有资格维持已有连接。
     pub fn is_present(&self) -> bool {
-        self.has_remote_evidence() || self.capture_active == Some(true)
+        self.has_remote_evidence() || self.is_capturing()
+    }
+
+    fn is_capturing(&self) -> bool {
+        match self.capture_evidence {
+            UuCaptureEvidence::Unknown => self.capture_active == Some(true),
+            UuCaptureEvidence::Active { .. } | UuCaptureEvidence::Rebuilding { .. } | UuCaptureEvidence::HardwareEncoding => true,
+            UuCaptureEvidence::Stopped { .. } => false,
+        }
     }
 }
 
@@ -206,10 +231,12 @@ impl ConnectionTracker {
         };
     }
 
-    /// 喂一次采样。日志心跳只能短暂维持已有连接，不能开始或恢复连接。
+    /// 喂一次采样。已确认的控制端或捕获可开启会话，日志心跳只用于短暂续期。
     pub fn update(&mut self, signals: &UUSignals, now: f64) -> Option<ConnectionEvent> {
         let remote_evidence = signals.has_remote_evidence();
-        if remote_evidence {
+        if remote_evidence
+            && (signals.controllers.readable || signals.capture_evidence != UuCaptureEvidence::HardwareEncoding)
+        {
             self.last_remote_evidence_at = Some(now);
         }
 
@@ -224,7 +251,7 @@ impl ConnectionTracker {
             .is_some_and(|last| now - last <= CAPTURE_CONTINUITY_WINDOW);
         let present = remote_evidence
             || (!signals.controllers.readable
-                && signals.capture_active == Some(true)
+                && signals.is_capturing()
                 && capture_is_recent);
         let names = signals.controllers.names.clone();
         if present {
@@ -347,6 +374,14 @@ impl SessionEpisode {
         Some(EpisodeChange::Ended)
     }
 
+    fn finish_verified_disconnect(&mut self, now: f64) -> bool {
+        if self.phase != Phase::Interrupted || now - self.interrupted_since < 0.5 {
+            return false;
+        }
+        self.phase = Phase::Idle;
+        true
+    }
+
     fn begin(&mut self) -> EpisodeChange {
         self.phase = Phase::Live;
         EpisodeChange::Began
@@ -373,6 +408,46 @@ pub struct RemoteSession {
     group: Vec<String>,
     departed: HashMap<String, f64>,
     episode_began_at: Option<f64>,
+    capture_retirement: CaptureRetirement,
+}
+
+/// Require a continuous observation of the same capture generation from an active episode.
+#[derive(Debug, Default, Clone)]
+struct CaptureRetirement {
+    generation: Option<u64>,
+    started_at: Option<f64>,
+    last_sample_at: Option<f64>,
+}
+
+impl CaptureRetirement {
+    const MIN_STOPPED: f64 = 2.0;
+    const MAX_SAMPLE_GAP: f64 = 3.0;
+
+    fn observe(&mut self, evidence: UuCaptureEvidence, eligible: bool, now: f64) -> bool {
+        use UuCaptureEvidence::*;
+        if self.last_sample_at.is_some_and(|last| now < last || now - last > Self::MAX_SAMPLE_GAP) {
+            *self = Self::default();
+        }
+        self.last_sample_at = Some(now);
+        match evidence {
+            Active { generation } => {
+                self.generation = Some(generation);
+                self.started_at = None;
+                false
+            }
+            Stopped { generation } if self.generation == Some(generation) && eligible => {
+                now - *self.started_at.get_or_insert(now) >= Self::MIN_STOPPED
+            }
+            Stopped { generation } | Rebuilding { generation } if self.generation == Some(generation) => {
+                self.started_at = None;
+                false
+            }
+            _ => {
+                *self = Self::default();
+                false
+            }
+        }
+    }
 }
 
 impl Default for RemoteSession {
@@ -389,6 +464,7 @@ impl RemoteSession {
             group: Vec::new(),
             departed: HashMap::new(),
             episode_began_at: None,
+            capture_retirement: CaptureRetirement::default(),
         }
     }
 
@@ -432,15 +508,13 @@ impl RemoteSession {
     pub fn update(&mut self, signals: &UUSignals, now: f64) -> Vec<SessionTransition> {
         let mut transitions = Vec::new();
         if self.episode.advance(now) == Some(EpisodeChange::Ended) {
-            transitions.push(SessionTransition::Ended);
-            self.group.clear();
-            self.departed.clear();
-            self.episode_began_at = None;
+            self.clear_episode(&mut transitions);
         }
 
         match self.tracker.update(signals, now) {
             Some(ConnectionEvent::Connected(controllers)) => {
                 if self.episode.connected(now) == EpisodeChange::Began {
+                    self.capture_retirement = CaptureRetirement::default();
                     self.episode_began_at = Some(now);
                     self.group = controllers.clone();
                     self.departed.clear();
@@ -464,11 +538,33 @@ impl RemoteSession {
             None => {}
         }
 
+        if self.in_episode() {
+            let eligible = signals.controllers.readable
+                && signals.controllers.names.is_empty()
+                && self.group.len() == 1
+                && self.departed.values().all(|at| now - *at > RECONNECT_WINDOW)
+                && self.tracker.quiet_passed(now);
+            if self.capture_retirement.observe(signals.capture_evidence, eligible, now)
+                && self.episode.finish_verified_disconnect(now)
+            {
+                self.clear_episode(&mut transitions);
+            }
+        }
+
         transitions
     }
 
     pub fn note_self_induced_change(&mut self, now: f64) {
         self.tracker.note_self_induced_change(now);
+        self.capture_retirement.started_at = None;
+    }
+
+    fn clear_episode(&mut self, transitions: &mut Vec<SessionTransition>) {
+        transitions.push(SessionTransition::Ended);
+        self.group.clear();
+        self.departed.clear();
+        self.episode_began_at = None;
+        self.capture_retirement = CaptureRetirement::default();
     }
 
     fn regroup(&mut self, names: &[String], now: f64) {
@@ -582,26 +678,31 @@ impl ControllerTableParser {
 
     pub fn parse_rows(rows: impl IntoIterator<Item = Vec<String>>) -> ControllerTable {
         let mut names: Vec<String> = Vec::new();
+        let mut has_unnamed_controller = false;
         for texts in rows {
             if !texts.iter().any(|text| text == CONTROL_MARK) {
                 continue;
             }
             // 控制端名字：第一个非空、不是"远程控制"、也不是"连接时长 …"的文本。
-            let name = texts.iter().find(|text| {
+            let Some(name) = texts.iter().find(|text| {
                 !text.trim().is_empty()
                     && *text != CONTROL_MARK
                     && !text.starts_with(DURATION_PREFIX)
-            });
-            if let Some(name) = name
-                && !names.contains(name)
-            {
+            }) else {
+                has_unnamed_controller = true;
+                continue;
+            };
+            if !names.contains(name) {
                 names.push(name.clone());
             }
         }
-        if names.is_empty() {
-            ControllerTable::unrecognized()
-        } else {
+        if !names.is_empty() {
             ControllerTable::from_names(names)
+        } else if has_unnamed_controller {
+            // A marked remote row with a missing name cannot establish that everyone left.
+            ControllerTable::unreadable()
+        } else {
+            ControllerTable::unrecognized()
         }
     }
 }
@@ -660,6 +761,7 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         for now in [0.0, 1.0, 2.0, 20.0] {
@@ -675,6 +777,7 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(names.iter().copied()),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         assert_eq!(
@@ -711,6 +814,7 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(names.iter().copied()),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         let began = session.update(&connected(&["iPhone 17"]), t0);
@@ -743,6 +847,7 @@ mod tests {
             overlay_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         for now in [0.0, 1.0, 3.0, 20.0] {
@@ -753,17 +858,73 @@ mod tests {
     }
 
     #[test]
+    fn complete_capture_can_admit_a_controller_hidden_in_the_tray() {
+        let mut session = RemoteSession::new();
+        let active = UUSignals {
+            capture_evidence: UuCaptureEvidence::Active { generation: 7 },
+            ..absent()
+        };
+        let incomplete = UUSignals {
+            capture_active: Some(true),
+            ..absent()
+        };
+        let rebuilding = UUSignals {
+            capture_evidence: UuCaptureEvidence::Rebuilding { generation: 7 },
+            ..absent()
+        };
+        let empty_table = UUSignals {
+            controllers: ControllerTable::unrecognized(),
+            ..active.clone()
+        };
+        assert!(session.update(&incomplete, 0.0).is_empty());
+        assert!(session.update(&rebuilding, 0.5).is_empty());
+        assert!(session.update(&empty_table, 1.0).is_empty());
+        assert_eq!(session.update(&active, 1.5), vec![SessionTransition::Began(Vec::new())]);
+        assert!(wants_phone_screen(session.controllers()));
+
+        let desktop = UUSignals {
+            controllers: ControllerTable::from_names(["Windows PC"]),
+            ..active.clone()
+        };
+        assert_eq!(
+            session.update(&desktop, 2.0),
+            vec![SessionTransition::ControllersChanged(vec!["Windows PC".into()])],
+        );
+        assert!(!wants_phone_screen(session.controllers()));
+        assert_eq!(session.update(&empty_table, 4.0), vec![SessionTransition::Interrupted]);
+        assert!(session.update(&rebuilding, 4.5).is_empty());
+        assert_eq!(session.update(&active, 5.0), vec![SessionTransition::Resumed(Vec::new())]);
+    }
+
+    #[test]
+    fn hardware_encoding_can_admit_but_log_alone_cannot_keep_it_connected() {
+        let mut session = RemoteSession::new();
+        let log_only = UUSignals { capture_active: Some(true), ..absent() };
+        let encoding = UUSignals {
+            capture_evidence: UuCaptureEvidence::HardwareEncoding,
+            ..log_only.clone()
+        };
+        assert!(session.update(&log_only, 0.0).is_empty());
+        assert_eq!(session.update(&encoding, 1.0), vec![SessionTransition::Began(Vec::new())]);
+        assert_eq!(session.update(&log_only, 2.6), vec![SessionTransition::Interrupted]);
+        assert_eq!(session.update(&log_only, 18.0), vec![SessionTransition::Ended]);
+        assert!(session.update(&log_only, 19.0).is_empty());
+    }
+
+    #[test]
     fn capture_log_cannot_extend_a_live_session_indefinitely() {
         let mut session = RemoteSession::new();
         let admitted = UUSignals {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         let capture_only = UUSignals {
             overlay_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         assert_eq!(
             session.update(&admitted, 0.0),
@@ -814,6 +975,7 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::unrecognized(),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         assert_eq!(tracker.update(&disconnected_page, 1.0), None, "仍按原防抖等待");
@@ -843,6 +1005,7 @@ mod tests {
             overlay_visible: false,
             controllers: unknown,
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         assert_eq!(tracker.update(&temporarily_unobservable, 10.0), None);
         assert!(tracker.is_connected(), "未知信号可以使用有界心跳连续性");
@@ -859,7 +1022,12 @@ mod tests {
         assert!(table.names.is_empty());
         let mut session = RemoteSession::new();
         for now in [0.0, 1.0, 10.0, 30.0] {
-            let signals = UUSignals { overlay_visible: true, controllers: table.clone(), capture_active: Some(true) };
+            let signals = UUSignals {
+                overlay_visible: true,
+                controllers: table.clone(),
+                capture_active: Some(true),
+                capture_evidence: UuCaptureEvidence::Unknown,
+            };
             assert!(session.update(&signals, now).is_empty());
             assert!(!session.in_episode());
         }
@@ -872,6 +1040,7 @@ mod tests {
             overlay_visible: false,
             controllers: ControllerTable::from_names(["iPhone (Phone)"]),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
 
         assert_eq!(
@@ -888,11 +1057,13 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         let quiet = UUSignals {
             overlay_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(false),
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         let local_game_log = UUSignals {
             capture_active: Some(true),
@@ -928,12 +1099,14 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17", "iPad Air"]),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         session.update(&two, 1.0);
         let one = UUSignals {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         session.update(&one, 2.0);
         assert_eq!(
@@ -1007,15 +1180,14 @@ mod tests {
             vec!["iPad Air".to_string()]
         );
 
-        // 行里只有"远程控制"和时长时，没有名字 → 读到了但没有控制端。
+        // 只有远程标记和时长时，仍需把它视为可能在场的控制端。
         let only_marker = UuElement::table_node(vec![UuElement::row_node(vec![
             UuElement::text_node("远程控制"),
             UuElement::text_node("连接时长 00:01"),
         ])]);
         let tree = UuElement::other_node(vec![UuElement::text_node("本机被控中"), only_marker]);
         let table = ControllerTableParser::parse_windows(&[tree]);
-        assert!(table.names.is_empty());
-        assert!(table.readable, "读得到表，只是没认出控制端");
+        assert_eq!(table, ControllerTable::unreadable(), "带远程标记的匿名行不能当作空表");
     }
 
     #[test]
@@ -1030,9 +1202,87 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         };
         assert_eq!(signals.to_string(), "overlay=是 控制端=[iPhone 17] capture=未知");
         assert!(signals.is_present());
+    }
+
+    #[test]
+    fn verified_capture_stop_retires_a_single_controller_early() {
+        let mut session = RemoteSession::new();
+        let active = UUSignals {
+            capture_evidence: UuCaptureEvidence::Active { generation: 7 },
+            ..present_signals()
+        };
+        let stopped = UUSignals {
+            capture_active: Some(true), // Keep the older log heartbeat separate.
+            capture_evidence: UuCaptureEvidence::Stopped { generation: 7 },
+            controllers: ControllerTable::unrecognized(),
+            ..absent()
+        };
+        assert!(matches!(session.update(&active, 0.0).as_slice(), [SessionTransition::Began(_)]));
+        assert!(session.update(&stopped, 0.5).is_empty());
+        assert_eq!(session.update(&stopped, 2.0), vec![SessionTransition::Interrupted]);
+        assert_eq!(session.update(&stopped, 2.5), vec![SessionTransition::Ended]);
+        assert!(!session.in_episode());
+    }
+
+    #[test]
+    fn uncertain_or_multi_controller_capture_uses_the_normal_reconnect_window() {
+        let first = present_signals();
+        let anonymous_controller = ControllerTableParser::parse_rows([vec![
+            CONTROL_MARK.into(),
+            format!("{DURATION_PREFIX} 00:12"),
+        ]]);
+        for (initial, controllers, lost_feed) in [
+            (first.controllers.clone(), ControllerTable::unreadable(), false),
+            (first.controllers.clone(), anonymous_controller, false),
+            (ControllerTable::from_names(["phone", "tablet"]), ControllerTable::unrecognized(), false),
+            (first.controllers.clone(), ControllerTable::unrecognized(), true),
+        ] {
+            let mut session = RemoteSession::new();
+            let active = UUSignals {
+                controllers: initial,
+                capture_evidence: UuCaptureEvidence::Active { generation: 7 },
+                ..first.clone()
+            };
+            let stopped = UUSignals {
+                controllers,
+                capture_evidence: UuCaptureEvidence::Stopped { generation: 7 },
+                ..absent()
+            };
+            session.update(&active, 0.0);
+            session.update(&stopped, 0.5);
+            assert_eq!(session.update(&stopped, 2.0), vec![SessionTransition::Interrupted]);
+            if lost_feed {
+                assert!(session.update(&absent(), 2.25).is_empty());
+            }
+            for now in [2.5, 3.5, 4.5] {
+                assert!(session.update(&stopped, now).is_empty());
+                assert!(session.in_episode());
+            }
+            assert_eq!(session.update(&stopped, 17.1), vec![SessionTransition::Ended]);
+        }
+    }
+
+    #[test]
+    fn topology_churn_and_capture_rebuilding_reset_the_verified_stop_window() {
+        use UuCaptureEvidence::*;
+        let mut retirement = CaptureRetirement::default();
+        assert!(!retirement.observe(Active { generation: 7 }, false, 0.0));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 1.0));
+        assert!(!retirement.observe(Rebuilding { generation: 7 }, true, 2.0));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 2.5));
+        assert!(!retirement.observe(Stopped { generation: 7 }, false, 3.5));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 4.5));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 5.5));
+        assert!(retirement.observe(Stopped { generation: 7 }, true, 6.5));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 10.0));
+        assert!(!retirement.observe(Stopped { generation: 7 }, true, 12.0));
+        assert!(!retirement.observe(Active { generation: 7 }, false, 13.0));
+        assert!(!retirement.observe(Stopped { generation: 8 }, true, 14.0));
+        assert!(!retirement.observe(Stopped { generation: 8 }, true, 16.0));
     }
 
     fn absent() -> UUSignals {
@@ -1040,6 +1290,7 @@ mod tests {
             overlay_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(false),
+            capture_evidence: UuCaptureEvidence::Unknown,
         }
     }
 
@@ -1048,6 +1299,7 @@ mod tests {
             overlay_visible: true,
             controllers: ControllerTable::from_names(["iPhone 17"]),
             capture_active: None,
+            capture_evidence: UuCaptureEvidence::Unknown,
         }
     }
 }

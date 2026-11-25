@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use snug_core::desk::PhoneScreenPhase;
-use snug_core::{AppConfig, Paths};
+use snug_core::{AppConfig, Paths, PhoneScreenMode};
 
 use crate::controller::{Controller, TouchEvent};
+use crate::desktop_settings::DesktopSettings;
 use crate::library::Library;
 use crate::mobile_library::{LibraryAction, MobileLibraryUi};
 use crate::settings::{ChangeImpact, SettingsAction, SettingsOutcome, SettingsTab, SettingsWindow, StatusInfo};
@@ -124,6 +125,52 @@ mod heartbeat_tests {
     }
 }
 
+struct AutostartProbe {
+    enabled: bool,
+    error: Option<String>,
+}
+
+struct AutostartJob {
+    changing: bool,
+    receiver: std::sync::mpsc::Receiver<AutostartProbe>,
+}
+
+struct DriverProbe {
+    pipe_ready: bool,
+    health: Option<snug_win::driver_health::DriverHealth>,
+}
+
+fn start_settings_probe<T: Send + 'static>(
+    ctx: &egui::Context,
+    name: &str,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::sync::mpsc::Receiver<T>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let repaint = ctx.clone();
+    std::thread::Builder::new().name(name.into()).spawn(move || {
+        let result = probe();
+        if sender.send(result).is_ok() {
+            repaint.request_repaint();
+        }
+    })?;
+    Ok(receiver)
+}
+
+#[test]
+fn settings_status_probe_does_not_wait_for_windows() {
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::Duration;
+
+    let (release, waiting) = mpsc::channel();
+    let result = start_settings_probe(&egui::Context::default(), "test-settings-probe", move || {
+        waiting.recv_timeout(Duration::from_secs(2)) == Ok(())
+    })
+    .unwrap();
+    assert_eq!(result.try_recv(), Err(TryRecvError::Empty));
+    release.send(()).unwrap();
+    assert_eq!(result.recv_timeout(Duration::from_secs(2)), Ok(true));
+}
+
 pub struct PhoneHomeApp {
     pub config: AppConfig,
     pub paths: Paths,
@@ -133,12 +180,17 @@ pub struct PhoneHomeApp {
     /// 会让设置窗在装完驱动后还写着「未检测到」（真机反馈）。所以这个字段是缓存，
     /// 由 [`Self::refresh_settings_status`] 定时刷新。
     pub pipe_ready: bool,
-    /// 上次查驱动状态的时间（设置窗开着时每帧都会问一次，按 250ms 节流）。
-    pipe_checked: Option<std::time::Instant>,
+    driver_probe_checked: Option<std::time::Instant>,
+    driver_probe: Option<std::sync::mpsc::Receiver<DriverProbe>>,
     driver_health: Option<snug_win::driver_health::DriverHealth>,
     driver_health_checked: Option<std::time::Instant>,
     driver_retry: Option<std::sync::mpsc::Receiver<Result<snug_win::VddProtocol, String>>>,
     driver_connection_result: Option<String>,
+    autostart: Option<bool>,
+    autostart_checked: Option<std::time::Instant>,
+    autostart_job: Option<AutostartJob>,
+    autostart_requested: Option<bool>,
+    autostart_error: Option<String>,
     pub controller: Controller,
     /// Hidden-window repaint worker; joined during app shutdown.
     ui_heartbeat: UiHeartbeat,
@@ -146,6 +198,8 @@ pub struct PhoneHomeApp {
     /// 手机屏的逻辑宽度（点），用于把界面元素按屏宽等比放大。
     /// 设置窗（无人操作时它自己返回 `Idle`，不画任何东西）。
     pub settings: SettingsWindow,
+    desktop_settings: DesktopSettings,
+    display_layout: crate::display_layout::DisplayLayout,
     /// 本进程是否管理员（设置窗要显示，重启提权也要用）。
     pub elevated: bool,
     /// 设置里点了"以管理员身份重启"，下一帧收尾退出。
@@ -266,11 +320,13 @@ impl PhoneHomeApp {
         start_minimized: bool,
         controller: Controller,
         ui_heartbeat: UiHeartbeat,
+        display_layout: crate::display_layout::DisplayLayout,
     ) -> Self {
         let settings = SettingsWindow::new();
+        let desktop_settings = DesktopSettings::new(&config, controller.display_service());
         // 托盘必须在主线程建（它建的那个隐藏窗口靠 eframe 的消息泵分发），
         // 而 `new` 就是在 `run_native` 的创建回调里跑的。
-        let tray = match Tray::new(false) {
+        let tray = match Tray::new(false, config.phone_screen_mode()) {
             Some(tray) => {
                 crate::info!("托盘已就绪");
                 Some(tray)
@@ -284,15 +340,23 @@ impl PhoneHomeApp {
             config,
             paths,
             pipe_ready,
-            pipe_checked: None,
+            driver_probe_checked: None,
+            driver_probe: None,
             driver_health: None,
             driver_health_checked: None,
             driver_retry: None,
             driver_connection_result: None,
+            autostart: None,
+            autostart_checked: None,
+            autostart_job: None,
+            autostart_requested: None,
+            autostart_error: None,
             controller,
             ui_heartbeat,
             library_ui: MobileLibraryUi::default(),
             settings,
+            desktop_settings,
+            display_layout,
             elevated: snug_win::is_elevated(),
             request_exit: false,
             tray,
@@ -655,19 +719,27 @@ impl PhoneHomeApp {
             return;
         }
         self.finished = true;
+        let (desktop_config, _) = self.desktop_settings.take_changes();
+        if let Some(config) = desktop_config {
+            self.config = config;
+        }
+        self.desktop_settings.close();
         crate::info!("收尾：开始（撤托盘 + 撤屏 + 归位窗口 + 存配置）");
         self.ui_heartbeat.stop();
         // 托盘要先撤掉：进程退出后留着图标，explorer 会留一个"幽灵图标"直到鼠标划过。
         self.tray = None;
         // 先让状态机收干净（窗口归位、手机屏撤除），再存配置。
         self.controller.shutdown();
-        let file = self.paths.config_file();
-        let json = self.config.to_json();
-        match std::fs::write(&file, json) {
-            Ok(()) => crate::info!("收尾：配置已保存 {}", file.display()),
-            Err(err) => crate::warn!("收尾：配置保存失败 {}：{err}", file.display()),
-        }
+        self.save_config();
         crate::info!("收尾：完成");
+    }
+
+    fn save_config(&self) {
+        let file = self.paths.config_file();
+        match self.config.save(&file) {
+            Ok(()) => crate::info!("配置已保存 {}", file.display()),
+            Err(err) => crate::warn!("配置保存失败 {}：{err}", file.display()),
+        }
     }
 
     /// 让界面窗口跟着手机屏走：屏在就把窗口搬上去，屏没了就藏起来。
@@ -739,6 +811,9 @@ impl PhoneHomeApp {
             if self.phone_window.is_none() {
                 self.phone_window = snug_win::find_own_window(WINDOW_TITLE);
             }
+            if self.last_offscreen != Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
             if let Some(hwnd) = self.phone_window
                 && self.last_offscreen != Some(true)
             {
@@ -748,7 +823,6 @@ impl PhoneHomeApp {
                     self.last_offscreen = Some(true);
                 }
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             return;
         };
         self.last_offscreen = Some(false);
@@ -812,7 +886,6 @@ impl PhoneHomeApp {
                 crate::warn!("搬动手机屏界面失败（SetWindowPos 返回失败）");
             }
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
 
     /// 预览窗该摆在哪：主屏工作区里按机型比例居中。
@@ -975,17 +1048,79 @@ impl PhoneHomeApp {
         snug_win::StartupService::for_current_exe()
     }
 
-    /// 把界面读到的运行态喂给设置窗（对应 C# 每次打开设置窗时的 `Refresh`）。
-    fn refresh_settings_status(&mut self) {
-        self.refresh_pipe_state();
-        if self.settings.needs_logs()
-            && self
-                .driver_health_checked
-                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(3))
-        {
-            self.driver_health = Some(snug_win::driver_health::DriverHealth::probe());
-            self.driver_health_checked = Some(std::time::Instant::now());
+    fn autostart_change_pending(&self) -> bool {
+        self.autostart_requested.is_some()
+            || self.autostart_job.as_ref().is_some_and(|job| job.changing)
+    }
+
+    fn poll_autostart(&mut self, ctx: &egui::Context, settings_open: bool) {
+        const QUERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        if let Some(job) = &self.autostart_job {
+            let mut connect_driver = false;
+            match job.receiver.try_recv() {
+                Ok(sample) => {
+                    self.autostart = Some(sample.enabled);
+                    connect_driver = job.changing && sample.enabled && sample.error.is_none();
+                    if job.changing || sample.error.is_some() {
+                        self.autostart_error = sample.error;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.autostart_error = Some("后台启动状态读取失败".into());
+                }
+            }
+            self.autostart_job = None;
+            self.autostart_checked = settings_open.then(std::time::Instant::now);
+            if connect_driver {
+                self.start_driver_task(ctx, snug_win::driver_health::retry_connection_without_prompt);
+            }
         }
+        if !settings_open {
+            self.autostart_checked = None;
+        }
+        if self.autostart_requested == Some(true) && self.driver_retry.is_some() {
+            return;
+        }
+        let requested = self.autostart_requested.take();
+        if requested.is_none()
+            && (!settings_open || self.autostart_checked.is_some_and(|last| last.elapsed() < QUERY_INTERVAL))
+        {
+            return;
+        }
+        match start_settings_probe(ctx, "snug-autostart", move || {
+            let service = Self::startup_service();
+            let change = requested.map(|enabled| {
+                if enabled {
+                    crate::driver::prepare_for_login()?;
+                }
+                service.set_enabled(enabled).map_err(|error| error.to_string())
+            });
+            let enabled = service.is_enabled();
+            let error = match change {
+                Some(Err(error)) => Some(error),
+                Some(Ok(())) if requested != Some(enabled) => Some("未能确认后台启动设置已生效".into()),
+                _ => None,
+            };
+            if let Some(error) = &error {
+                crate::warn!("设置：后台启动设置失败：{error}");
+            } else if requested.is_some() {
+                crate::info!("设置：开机自启 → {enabled}（任务 {}）", service.task_name());
+            }
+            AutostartProbe { enabled, error }
+        }) {
+            Ok(receiver) => self.autostart_job = Some(AutostartJob { changing: requested.is_some(), receiver }),
+            Err(error) => {
+                self.autostart_checked = Some(std::time::Instant::now());
+                self.autostart_error = Some(format!("后台启动状态读取失败：{error}"));
+            }
+        }
+    }
+
+    /// 把界面读到的运行态喂给设置窗（对应 C# 每次打开设置窗时的 `Refresh`）。
+    fn refresh_settings_status(&mut self, ctx: &egui::Context) {
+        let needs_logs = self.settings.needs_logs() || self.desktop_settings.needs_logs();
+        self.poll_driver_probe(ctx, needs_logs);
         let state = self.state();
         let failed_resolution_screen = (state.notice
             == Some(snug_core::desk::DeskNotice::ReshapeFailed))
@@ -995,7 +1130,9 @@ impl PhoneHomeApp {
                 .or_else(|| self.config.primary_touch_screen().map(|screen| screen.id))
         })
         .flatten();
-        let driver_connection_result = match snug_win::driver_health::broker_status() {
+        let broker_status = snug_win::driver_health::broker_status();
+        let driver_broker_connected = matches!(broker_status, snug_win::vdd_broker::BrokerStatus::Connected);
+        let driver_connection_result = match broker_status {
             snug_win::vdd_broker::BrokerStatus::Failed(failure) if self.driver_retry.is_none() => {
                 Some(failure.to_string())
             }
@@ -1004,8 +1141,12 @@ impl PhoneHomeApp {
             _ => self.driver_connection_result.clone(),
         };
         let status = StatusInfo {
+            autostart: self.autostart,
+            autostart_changing: self.autostart_change_pending(),
+            autostart_error: self.autostart_error.clone(),
             pipe_available: self.pipe_ready,
             driver_health: self.driver_health.clone(),
+            driver_broker_connected,
             driver_reconnecting: self.driver_retry.is_some(),
             driver_connection_result,
             failed_resolution_screen,
@@ -1017,14 +1158,57 @@ impl PhoneHomeApp {
             self_contained: true,
         };
         self.settings.set_status(status);
-        self.settings
-            .set_autostart(Self::startup_service().is_enabled());
-        self.settings
-            .set_manual_override(self.controller.manual_override());
         // 日志框：只在"驱动与日志"页增量刷新，别每帧把整个文件读进文本框。
-        if self.settings.needs_logs() {
+        if needs_logs {
             self.refresh_logs();
         }
+        if self.desktop_settings.is_open() {
+            self.desktop_settings.sync_runtime_from(&self.settings);
+        }
+    }
+
+    pub fn open_desktop_settings(&mut self, tab: SettingsTab) {
+        crate::info!("桌面设置：收到打开请求");
+        self.desktop_settings.open(tab);
+    }
+
+    fn apply_desktop_settings(&mut self, ctx: &egui::Context) {
+        let (config, actions) = self.desktop_settings.take_changes();
+        if let Some(config) = config {
+            let before = std::mem::replace(&mut self.config, config);
+            self.apply_settings_change(ctx, &before, SettingsOutcome::Changed);
+        }
+        for action in actions {
+            self.apply_setting(action, ctx);
+        }
+    }
+
+    fn apply_settings_change(&mut self, ctx: &egui::Context, before: &AppConfig, outcome: SettingsOutcome) {
+        if outcome != SettingsOutcome::Changed {
+            return;
+        }
+        let mode = self.config.phone_screen_mode();
+        if mode != before.phone_screen_mode() {
+            crate::info!("设置：手机屏显示方式 → {mode:?}");
+            self.controller.set_phone_screen_mode(mode);
+            self.save_config();
+        }
+        self.settings.sync_committed_screens(before, &self.config);
+        self.desktop_settings.sync_config(&self.config);
+        let impact = crate::settings::classify_change(before, &self.config);
+        if let Some(hint) = crate::settings::change_hint(impact) {
+            crate::info!("设置：{hint}");
+        }
+        match impact {
+            ChangeImpact::RebuildPhoneScreen => {
+                self.controller.apply_screens(&self.config);
+                self.controller.set_default_zoom(self.config.zoom_steps);
+            }
+            ChangeImpact::ReloadGestures => self.controller.apply_gesture_settings(&self.config),
+            ChangeImpact::Screens => self.controller.apply_screens(&self.config),
+            ChangeImpact::Theme | ChangeImpact::RefreshHomeBar | ChangeImpact::None => {}
+        }
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
     fn poll_driver_retry(&mut self) {
@@ -1051,21 +1235,26 @@ impl PhoneHomeApp {
         self.driver_retry = None;
         self.driver_health_checked = None;
         self.driver_connection_result = Some(message);
+        self.controller.complete_driver_startup();
     }
 
-    fn retry_driver_connection(&mut self, ctx: &egui::Context) {
+    pub(crate) fn prepare_driver_at_startup(&mut self, ctx: &egui::Context, started_at_login: bool) {
+        self.start_driver_task(ctx, move || crate::driver::prepare_at_startup(started_at_login));
+        if self.driver_retry.is_none() {
+            self.controller.complete_driver_startup();
+        }
+    }
+
+    fn start_driver_task(
+        &mut self,
+        ctx: &egui::Context,
+        task: impl FnOnce() -> Result<snug_win::VddProtocol, String> + Send + 'static,
+    ) {
         if self.driver_retry.is_some() {
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let repaint = ctx.clone();
-        match std::thread::Builder::new()
-            .name("snug-driver-retry".into())
-            .spawn(move || {
-                let _ = tx.send(snug_win::driver_health::retry_connection());
-                repaint.request_repaint();
-            }) {
-            Ok(_) => {
+        match start_settings_probe(ctx, "snug-driver-connect", task) {
+            Ok(rx) => {
                 self.driver_retry = Some(rx);
                 self.driver_connection_result = None;
             }
@@ -1075,39 +1264,50 @@ impl PhoneHomeApp {
         }
     }
 
-    /// 重新查一次驱动管道状态（250ms 节流；只在设置窗开着时被调）。
-    ///
-    /// 没有这一步，自动装完驱动后设置窗会一直显示「未检测到」——因为它读的是启动
-    /// 那一刻的值。状态翻转记一行日志，便于和安装日志对上时间。
-    fn refresh_pipe_state(&mut self) {
-        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-        let now = std::time::Instant::now();
-        let stale = self
-            .pipe_checked
-            .map(|last| now.duration_since(last) >= INTERVAL)
-            .unwrap_or(true);
-        if !stale {
+    fn poll_driver_probe(&mut self, ctx: &egui::Context, diagnostics_open: bool) {
+        const PIPE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        if let Some(receiver) = &self.driver_probe {
+            match receiver.try_recv() {
+                Ok(probe) => {
+                    if probe.pipe_ready != self.pipe_ready {
+                        let status = if probe.pipe_ready { "就绪" } else { "未就绪" };
+                        crate::info!("驱动：管道状态 → {status}");
+                        self.pipe_ready = probe.pipe_ready;
+                    }
+                    if let Some(health) = probe.health {
+                        self.driver_health = Some(health);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    crate::warn!("驱动：诊断任务未返回结果");
+                }
+            }
+            self.driver_probe = None;
+        }
+        let probe_health = diagnostics_open
+            && self.driver_health_checked.is_none_or(|last| last.elapsed() >= HEALTH_INTERVAL);
+        if !probe_health && self.driver_probe_checked.is_some_and(|last| last.elapsed() < PIPE_INTERVAL) {
             return;
         }
-        self.pipe_checked = Some(now);
-        let live = crate::driver::pipe_available();
-        if live != self.pipe_ready {
-            crate::info!(
-                "驱动：管道状态 {} → {}",
-                if self.pipe_ready { "就绪" } else { "未就绪" },
-                if live { "就绪" } else { "未就绪" }
-            );
-            self.pipe_ready = live;
+        let now = std::time::Instant::now();
+        self.driver_probe_checked = Some(now);
+        if probe_health {
+            self.driver_health_checked = Some(now);
+        }
+        match start_settings_probe(ctx, "snug-driver-status", move || DriverProbe {
+            pipe_ready: crate::driver::pipe_available(),
+            health: probe_health.then(snug_win::driver_health::DriverHealth::probe),
+        }) {
+            Ok(receiver) => self.driver_probe = Some(receiver),
+            Err(error) => crate::warn!("驱动：无法启动诊断任务：{error}"),
         }
     }
 
     /// 执行设置窗排出来的动作。副作用都在这里落地，`settings.rs` 本身不做事。
     fn apply_setting(&mut self, action: SettingsAction, ctx: &egui::Context) {
         match action {
-            SettingsAction::SetPhoneScreen(on) => {
-                crate::info!("设置：手机屏 → {on}");
-                self.controller.set_phone_screen(on);
-            }
             SettingsAction::ReenterScreen => {
                 crate::info!("设置：进入手机屏");
                 self.controller.reenter();
@@ -1116,19 +1316,10 @@ impl PhoneHomeApp {
                 crate::info!("设置：预览界面");
                 self.open_preview(ctx);
             }
-            SettingsAction::SetManualOverride(on) => {
-                crate::info!("设置：手动强制手机屏 → {on}");
-                self.controller.set_manual_override(on);
-            }
+            SettingsAction::OpenProjection => {} // Consumed by the desktop viewport.
             SettingsAction::SetAutoStart(on) => {
-                let service = Self::startup_service();
-                match service.set_enabled(on) {
-                    Ok(()) => {
-                        crate::info!("设置：开机自启 → {on}（任务 {}）", service.task_name());
-                        self.settings.set_autostart(service.is_enabled());
-                    }
-                    Err(err) => crate::warn!("设置：开机自启失败（{on}）：{err}"),
-                }
+                self.autostart_requested = Some(on);
+                self.autostart_error = None;
             }
             SettingsAction::OpenLogDirectory => {
                 let dir = self.paths.log_directory();
@@ -1139,15 +1330,17 @@ impl PhoneHomeApp {
                 }
             }
             SettingsAction::OpenRepository => {
-                // 仓库地址只在根 Cargo.toml 的 repository 里写一份；没配就明说，不猜 URL。
                 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
-                if REPOSITORY.is_empty() {
-                    crate::warn!("设置：仓库地址未配置（Cargo.toml 缺 repository），无法打开");
-                } else if let Err(err) = snug_win::system_paths::system_tool("cmd.exe")
-                    .and_then(|path| std::process::Command::new(path)
-                    .args(["/c", "start", "", REPOSITORY])
-                    .spawn())
-                {
+                let repository = if REPOSITORY.is_empty() {
+                    snug_win::update::ReleaseRepo::from_default()
+                        .map(|repo| format!("https://github.com/{}", repo.slug()))
+                } else {
+                    Some(REPOSITORY.to_owned())
+                };
+                let result = repository
+                    .ok_or_else(|| std::io::Error::other("未配置有效的仓库地址"))
+                    .and_then(|url| snug_win::apps::open_web_url(&url));
+                if let Err(err) = result {
                     crate::warn!("打开仓库主页失败：{err}");
                 }
             }
@@ -1167,12 +1360,15 @@ impl PhoneHomeApp {
             SettingsAction::CheckUpdate => self.start_update_check(),
             SettingsAction::InstallUpdate => self.start_install_update(),
             SettingsAction::InstallDriver => {
-                match crate::driver::spawn_install() {
-                    Ok(()) => crate::info!("设置：已请求使用内嵌包安装/修复虚拟屏驱动"),
-                    Err(err) => crate::warn!("设置：启动驱动安装任务失败 {err}"),
+                if !self.autostart_change_pending() {
+                    self.start_driver_task(ctx, crate::driver::install_and_connect);
                 }
             }
-            SettingsAction::RetryDriverConnection => self.retry_driver_connection(ctx),
+            SettingsAction::RetryDriverConnection => {
+                if !self.autostart_change_pending() {
+                    self.start_driver_task(ctx, crate::driver::retry_connection);
+                }
+            }
             SettingsAction::RetryResolution(id) => self.controller.retry_resolution(id),
             SettingsAction::DismissScreen => self.dismiss_active_screen(ctx),
             SettingsAction::ApplyGestureSettings => {
@@ -1237,10 +1433,13 @@ impl eframe::App for PhoneHomeApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        self.apply_desktop_settings(ctx);
         self.poll_preview_capture(ctx);
         // 手势钩子跟着手机屏与配置走（区域没变时什么都不做）。
         // 缩放、摆窗和触控共享本帧的显示器快照，避免每帧重复全量枚举。
-        let phone_layout = self.controller.phone_layout_of(self.active_screen.as_deref());
+        let state = self.state();
+        let phone_id = if state.screen_phase == PhoneScreenPhase::Ready { state.display_id } else { None };
+        let phone_layout = self.display_layout.refresh(self.desktop_settings.is_open(), phone_id);
 
         // 选区结束 → 在选区上方弹"复制"气泡（C# `ShowCopySelectionBubble`）。
         for event in self.controller.take_selection_events() {
@@ -1272,9 +1471,7 @@ impl eframe::App for PhoneHomeApp {
             match command {
                 TrayCommand::OpenSettings(tab) => {
                     let tab = if tab == 0 { SettingsTab::Screens } else { SettingsTab::from_index(tab) };
-                    crate::debug!("托盘：打开设置第 {} 页（{}）", tab.index(), tab.nav_title());
-                    self.settings.select_tab(tab);
-                    self.settings.open();
+                    self.open_desktop_settings(tab);
                     ctx.request_repaint();
                 }
                 TrayCommand::OpenPreview => {
@@ -1286,8 +1483,10 @@ impl eframe::App for PhoneHomeApp {
                     self.controller.reenter();
                     ctx.request_repaint();
                 }
-                TrayCommand::SetManualOverride(on) => {
-                    self.apply_setting(SettingsAction::SetManualOverride(on), ctx);
+                TrayCommand::SetPhoneScreenMode(mode) => {
+                    let before = self.config.clone();
+                    self.config.set_phone_screen_mode(mode);
+                    self.apply_settings_change(ctx, &before, SettingsOutcome::Changed);
                 }
                 TrayCommand::Quit => {
                     crate::info!("托盘：退出（先还原窗口）");
@@ -1300,12 +1499,11 @@ impl eframe::App for PhoneHomeApp {
         {
             let state = self.state();
             let summary = Self::phase_text(state.screen_phase).to_string();
-            let connected = state.screen_phase == PhoneScreenPhase::Ready;
-            let manual = self.controller.manual_override();
+            let ready = state.screen_phase == PhoneScreenPhase::Ready;
             let reenter = self.controller.can_reenter();
             if let Some(tray) = &mut self.tray {
-                tray.set_status(&summary, connected);
-                tray.set_manual_override(manual);
+                tray.set_status(&summary, ready);
+                tray.set_phone_screen_mode(self.config.phone_screen_mode());
                 tray.set_reenter_available(reenter);
             }
         }
@@ -1339,42 +1537,25 @@ impl eframe::App for PhoneHomeApp {
             self.apply_setting(action, ctx);
         }
         self.poll_driver_retry();
-        if self.settings.is_open() {
-            self.refresh_settings_status();
+        let settings_open = self.settings.is_open() || self.desktop_settings.is_open();
+        self.poll_autostart(ctx, settings_open);
+        if settings_open {
+            self.refresh_settings_status(ctx);
+        }
+        if !self.request_exit && self.desktop_settings.is_open() {
+            let state = self.state();
+            let display_id = state.display_id.filter(|_| {
+                state.screen_phase == PhoneScreenPhase::Ready
+                    && self.config.phone_screen_mode() != PhoneScreenMode::Off
+            });
+            self.desktop_settings.show(ctx, self.display_layout.desktop_monitors(), display_id);
         }
         // 设置窗画在手机屏这块界面上：用户是在手机（UU 远程）上操作的，独立窗口开在
         // 电脑主屏反而看不见。顶部有「返回」可以关掉，标题栏的 X 也能关。
         let showing_settings = self.settings.is_open();
         let before = self.config.clone();
-        match self.settings.show(ctx, &mut self.config) {
-            SettingsOutcome::Changed => {
-                let impact = crate::settings::classify_change(&before, &self.config);
-                if let Some(hint) = crate::settings::change_hint(impact) {
-                    crate::info!("设置：{hint}");
-                }
-                match impact {
-                    ChangeImpact::RebuildPhoneScreen => {
-                        // 机型/方向变了：屏愿望里的 fit 跟着变，状态机按新比例重建。
-                        self.controller.apply_screens(&self.config);
-                        self.controller.set_default_zoom(self.config.zoom_steps);
-                    }
-                    ChangeImpact::ReloadGestures => {
-                        self.controller.apply_gesture_settings(&self.config)
-                    }
-                    // 主题在每帧开头按 `config.theme` 自动对齐，这里不用做事。
-                    ChangeImpact::Theme => {}
-                    // 屏列表交给状态机（C# `DeskSet.SetWishes`）。
-                    ChangeImpact::Screens => {
-                        self.controller.apply_screens(&self.config);
-                    }
-                    ChangeImpact::RefreshHomeBar | ChangeImpact::None => {}
-                }
-            }
-            SettingsOutcome::CloseRequested => {
-                crate::info!("设置：已关闭");
-            }
-            SettingsOutcome::Idle => {}
-        }
+        let outcome = self.settings.show(ctx, &mut self.config);
+        self.apply_settings_change(ctx, &before, outcome);
         if self.request_exit {
             // 同样先收尾：关窗之后 Rust 侧可能一行都跑不到。
             self.finish();

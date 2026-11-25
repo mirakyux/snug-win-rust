@@ -201,6 +201,7 @@ pub fn parse_latest_release(json: &str) -> Option<UpdateReleaseInfo> {
 
 /// 开机启动任务（对应 C# `StartupTaskDefinition`）。
 pub const TASK_NAME: &str = "SnugWinAutoStart";
+pub const STARTUP_DELAY: &str = "PT20S";
 /// 静默启动参数。
 pub const MINIMIZED_ARG: &str = "--minimized";
 
@@ -222,6 +223,7 @@ pub fn build_task_xml(exe_path: &str, working_directory: Option<&str>) -> String
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <Delay>{STARTUP_DELAY}</Delay>
     </LogonTrigger>
   </Triggers>
   <Principals>
@@ -415,6 +417,7 @@ mod tests {
 
         assert!(xml.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<Delay>PT20S</Delay>"));
         assert!(!xml.contains("HighestAvailable"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));

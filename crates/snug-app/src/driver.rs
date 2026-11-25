@@ -5,7 +5,7 @@
 //!
 //! 1. 启动时探一下命名管道（`snug_win::vdd::is_driver_pipe_available`）；
 //! 2. 没有，就在后台释放 exe 内嵌的驱动包，跑 `Install-SnugDriver.ps1 -Action Install`；
-//! 3. 脚本自己校验安装包与证书的 SHA-256，装完等管道起来，然后把手让给建屏流程。
+//! 3. 安装脚本校验安装包与证书的 SHA-256，启动流程等管道可用后提前准备驱动连接。
 //! 4. 子进程结束后清理临时脚本、压缩包和解压目录，exe 旁无需 `driver\`。
 //!
 //! 全程在后台线程：装驱动要几十秒（msiexec），不能卡住界面。
@@ -282,24 +282,102 @@ fn codepage_to_string(bytes: &[u8], code_page: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&wide))
 }
 
-/// 起一个后台线程做 [`ensure_installed`]，不挡启动。
-pub fn spawn_ensure_installed() -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("snug-driver-install".to_string())
-        .spawn(|| {
-            let _ = ensure_installed();
-        })
-        .map(|_| ())
+const DRIVER_NOT_READY: &str = "驱动尚未就绪。请在桌面设置中连接驱动或安装修复。";
+const LOGIN_PIPE_WAIT: Duration = Duration::from_secs(20);
+
+fn login_startup_enabled() -> bool {
+    std::env::var_os("SNUGWIN_HOME").is_none()
+        && snug_win::StartupService::for_current_exe().is_enabled()
 }
 
-/// 设置页显式请求安装/修复，不套用启动时“已安装就只等管道”的快速路径。
-pub fn spawn_install() -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("snug-driver-install".to_string())
-        .spawn(|| {
-            let _ = install_bundled();
-        })
-        .map(|_| ())
+fn login_broker_registered() -> Result<bool, String> {
+    snug_win::vdd_task::is_enabled().map_err(|error| format!("读取登录后的驱动授权失败：{error}"))
+}
+
+fn connect_without_installing() -> Result<snug_win::VddProtocol, String> {
+    if !pipe_available() && !(driver_installed() && wait_for_pipe(LOGIN_PIPE_WAIT)) {
+        return Err(DRIVER_NOT_READY.into());
+    }
+    snug_win::driver_health::retry_connection_without_prompt()
+}
+
+/// Prepare the driver for a future standard-permission sign-in.
+pub fn prepare_for_login() -> Result<(), String> {
+    use snug_win::driver_health::{DriverHealth, PipeAccess};
+
+    if std::env::var_os("SNUGWIN_HOME").is_some() || login_broker_registered()? {
+        return Ok(());
+    }
+    let elevated = snug_win::elevation::try_is_elevated().map_err(|error| error.to_string())?;
+    if !pipe_available() {
+        if !driver_installed() {
+            if !elevated {
+                return crate::privileged::install_driver_for_login()
+                    .map_err(|error| error.to_string());
+            }
+            if !install_bundled() {
+                return Err(DRIVER_NOT_READY.into());
+            }
+        } else if !wait_for_pipe(LOGIN_PIPE_WAIT) {
+            return Err(DRIVER_NOT_READY.into());
+        }
+    }
+    match DriverHealth::probe().access {
+        PipeAccess::Direct(_) if !elevated => Ok(()),
+        // The current elevated token cannot tell us whether the next sign-in's standard
+        // token will have access. Prepare the same limited broker in that case.
+        PipeAccess::Direct(_) | PipeAccess::RequiresElevation => {
+            crate::privileged::set_unattended_driver(true).map_err(|error| error.to_string())
+        }
+        PipeAccess::Busy => Err("驱动控制管道忙，请稍后再试。".into()),
+        _ => Err(DRIVER_NOT_READY.into()),
+    }
+}
+
+pub fn prepare_at_startup(started_at_login: bool) -> Result<snug_win::VddProtocol, String> {
+    if started_at_login {
+        return connect_without_installing();
+    }
+    let elevated = snug_win::elevation::try_is_elevated().map_err(|error| error.to_string())?;
+    let login_enabled = login_startup_enabled();
+    if !elevated {
+        if login_enabled {
+            prepare_for_login()?;
+            return connect_without_installing();
+        }
+        if login_broker_registered()? {
+            return connect_without_installing();
+        }
+    }
+    if !ensure_installed() {
+        return Err(DRIVER_NOT_READY.into());
+    }
+    let connected = snug_win::driver_health::retry_connection()?;
+    if elevated && login_enabled && let Err(error) = prepare_for_login() {
+        crate::warn!("登录后的驱动准备未完成：{error}");
+    }
+    Ok(connected)
+}
+
+pub fn retry_connection() -> Result<snug_win::VddProtocol, String> {
+    let elevated = snug_win::elevation::try_is_elevated().map_err(|error| error.to_string())?;
+    if !elevated && login_startup_enabled() {
+        prepare_for_login()?;
+        return snug_win::driver_health::retry_connection_without_prompt();
+    }
+    snug_win::driver_health::retry_connection()
+}
+
+pub fn install_and_connect() -> Result<snug_win::VddProtocol, String> {
+    let elevated = snug_win::elevation::try_is_elevated().map_err(|error| error.to_string())?;
+    if !elevated && login_startup_enabled() && matches!(login_broker_registered(), Ok(false)) {
+        crate::privileged::install_driver_for_login().map_err(|error| error.to_string())?;
+        return snug_win::driver_health::retry_connection_without_prompt();
+    }
+    if !install_bundled() {
+        return Err("驱动安装或修复未完成。请查看运行日志。".into());
+    }
+    retry_connection()
 }
 
 /// `CREATE_NO_WINDOW`：别给用户闪一个蓝框 PowerShell 出来。

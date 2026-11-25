@@ -11,22 +11,23 @@
 //!    最近一次增长也最多保持 15 秒）。
 //!
 //! [`UuSensor::sample`] 只出原始信号，不替上层做判断；合成规则在 core 的
-//! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 为 `None` 表示"读不到"，
-//! 与 `false`（确定没在推流）区分开——C# 读不到时给 `false`，这里按需求给 `None`。
+//! `ConnectionTracker` / `RemoteSession` 里。`capture_active` 是辅助日志心跳，确定停止需要
+//! 独立的 `capture_evidence`。兼容已有捕获监视器的只读入口由 `SNUG_UU_CAPTURE_FEED=1` 启用。
 //!
 //! 推流 `.slog` 增长不是远程连接的充分证据：本地运行 GameViewer/游戏时日志也可能增长，
 //! 已经造成无远程时虚拟屏反复弹出（历史复现见 `docs/upstream-watch.md`）。因此当前策略是：
-//! 新连接与断线恢复都要求 UIA 在控制表中读到远程控制行；`.slog` 只能在最近该证据后的
-//! 15 秒内维持既有连接。`client_visible` 仍只是诊断字段：“服务进程有可见且大于 10×10
-//! 的顶层窗口”启发式，尚未确认窗口身份一定是远控覆盖层，因此不参与准入。TCP 对端只作诊断。
+//! UIA 读到远程控制行时可开始或恢复连接。控制表不可读时，可由完整捕获监视确认，
+//! 或通过当前服务进程的持续硬件视频编码判断。
+//! `.slog` 只能在最近该证据后的 15 秒内维持既有连接。
+//! `client_visible` 仍只是诊断字段：“服务进程有可见且大于 10×10
+//! 的顶层窗口”启发式，尚未确认窗口身份一定是远控覆盖层，因此不参与准入。TCP 对端可否决提前撤屏。
 //!
-//! 取舍：若 UU 在托盘隐藏且会话开始时既无覆盖窗又读不到控制端，自动开屏不会触发；
-//! 用户可用手动强制模式开启。不能通过把现有 TCP/日志阈值调得更短解决两类状态的歧义。
+//! UU 隐藏在托盘时，控制端表可能读不到。可选捕获监视需要确认同一 UU 进程的捕获已开始。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use snug_core::session::{ControllerTable, UUSignals};
+use snug_core::session::{ControllerTable, UUSignals, UuCaptureEvidence};
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -43,6 +44,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::wide::from_wide;
 
+#[path = "uu_capture_feed.rs"]
+mod capture_feed;
+use capture_feed::CaptureFeed;
+#[path = "uu_gpu_encoding.rs"]
+mod gpu_encoding;
+use gpu_encoding::{EncodingActivity, sample_video_encode};
+
 // ---------------------------------------------------------------------------
 // 信号集
 // ---------------------------------------------------------------------------
@@ -56,12 +64,14 @@ pub struct UuSignalSet {
     pub client_visible: bool,
     /// UIA 读到的控制端表；`readable == false` 表示读不到。
     pub controllers: ControllerTable,
-    /// `None` = 读不到（进程不在、日志目录读不到），`Some(false)` = 确定没在推流。
+    /// `None` 表示日志不可读，`Some(false)` 表示当前未观察到日志增长。
     ///
     /// 取值就是推流日志的"持续增长"（C# `CaptureActive`）。它只能短暂维持最近有远端证据的
     /// 会话，不能独自开启新连接或从断开中恢复。
     pub capture_active: Option<bool>,
-    /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`）。**只作诊断**，不参与判定。
+    /// 本机捕获监视器或持续的硬件编码活动。
+    pub capture_evidence: UuCaptureEvidence,
+    /// 有活动 TCP 对端（C# `HasActivePeerTcpConnection`），可否决提前撤屏。
     pub peer_active: bool,
     /// 推流日志的"持续增长"（与 `capture_active` 同值，保留原名供诊断/校准读）。
     ///
@@ -80,6 +90,7 @@ impl UuSignalSet {
             overlay_visible: self.client_visible,
             controllers: self.controllers.clone(),
             capture_active: self.capture_active,
+            capture_evidence: self.capture_evidence,
         }
     }
 
@@ -90,6 +101,7 @@ impl UuSignalSet {
             client_visible: false,
             controllers: ControllerTable::unreadable(),
             capture_active: Some(false),
+            capture_evidence: UuCaptureEvidence::Unknown,
             peer_active: false,
             log_growth: Some(false),
             controller_diagnosis: None,
@@ -281,6 +293,10 @@ pub trait UuProbe: Send + Sync {
     ) -> (ControllerTable, Option<ControllerDiagnosis>);
     /// TCP 表；`None` = 读不到（不要当成"没有连接"）。
     fn tcp_rows(&self) -> Option<Vec<TcpRow>>;
+    /// 是否观察到当前服务进程的 GPU 视频编码。
+    fn video_encoding(&self, _pid: i32) -> bool {
+        false
+    }
     /// `ResolveServerLogDir`：按候选目录找存在的那个。
     fn server_log_dir(&self, server_pid: i32) -> Option<String>;
     /// `Directory.EnumerateFiles(dir, "streamer_log_controlled_*_<pid>.slog")`
@@ -299,6 +315,8 @@ pub struct UuSensor {
     probe: Box<dyn UuProbe>,
     manual: AtomicBool,
     log: Mutex<LogGrowth>,
+    encoding: Mutex<EncodingActivity>,
+    capture_feed: Option<Mutex<CaptureFeed>>,
     /// 上次记过的控制端诊断（用来做"状态变化才记一条"）。
     last_diagnosis: Mutex<Option<ControllerDiagnosis>>,
 }
@@ -306,7 +324,9 @@ pub struct UuSensor {
 impl UuSensor {
     /// 真机传感器。
     pub fn new() -> Self {
-        Self::with_probe(Box::new(WinProbe))
+        let mut sensor = Self::with_probe(Box::new(WinProbe));
+        sensor.capture_feed = CaptureFeed::configured().map(Mutex::new);
+        sensor
     }
 
     /// 换一套探测实现（测试用）。
@@ -315,6 +335,8 @@ impl UuSensor {
             probe,
             manual: AtomicBool::new(false),
             log: Mutex::new(LogGrowth::default()),
+            encoding: Mutex::new(EncodingActivity::default()),
+            capture_feed: None,
             last_diagnosis: Mutex::new(None),
         }
     }
@@ -338,6 +360,7 @@ impl UuSensor {
                 client_visible: true,
                 controllers: ControllerTable::from_names(["手动开启 (Phone)"]),
                 capture_active: Some(true),
+                capture_evidence: UuCaptureEvidence::Unknown,
                 peer_active: false,
                 log_growth: None,
                 controller_diagnosis: None,
@@ -382,15 +405,26 @@ impl UuSensor {
 
         let log_growth = self.log_signal(server_pid, log_files.as_deref(), now);
 
-        // SLOG 单独会在本地使用时增长；它不负责开始新会话，只作为已有会话的心跳。
-        // TCP 对端也只作诊断，因为真实远程会话可能仅走 UDP。
+        // SLOG 单独会在本地使用时增长；它只作为已有会话的心跳。
         let capture_active = log_growth;
+        let capture_evidence = self.capture_feed.as_ref()
+            .and_then(|feed| feed.lock().ok().map(|mut feed| feed.sample(server_pid)))
+            .unwrap_or_default();
+        let encoding = server_pid.is_some_and(|pid| self.probe.video_encoding(pid));
+        let encoding_active = self.encoding.lock().unwrap().observe(server_pid, encoding, now);
+        // A positive peer signal vetoes early retirement. UDP sessions need not have a TCP peer.
+        let capture_evidence = match capture_evidence {
+            UuCaptureEvidence::Stopped { .. } if peer_active => UuCaptureEvidence::Unknown,
+            UuCaptureEvidence::Unknown if encoding_active => UuCaptureEvidence::HardwareEncoding,
+            evidence => evidence,
+        };
 
         UuSignalSet {
             client_running: client_pid.is_some(),
             client_visible,
             controllers,
             capture_active,
+            capture_evidence,
             peer_active,
             log_growth,
             controller_diagnosis,
@@ -579,6 +613,10 @@ impl UuProbe for WinProbe {
 
     fn has_visible_window(&self, pid: i32) -> bool {
         !search_windows(pid, true).is_empty()
+    }
+
+    fn video_encoding(&self, pid: i32) -> bool {
+        sample_video_encode(pid)
     }
 
     fn visible_windows(&self, pid: i32) -> Vec<u64> {

@@ -359,6 +359,13 @@ impl DeskSet {
         self.reenter_all_dismissed_touch();
     }
 
+    /// 会话切换时清除临时收起状态，保留已启用的虚拟屏。
+    pub fn reset_retained_screen_session(&self, restore_windows: bool) {
+        for desk in self.desks.values() {
+            desk.reset_retained_screen_session(restore_windows);
+        }
+    }
+
     /// 把一行日志送进 set 级的 log 通道（`DeskSetEvents::log`）。
     fn log(&self, message: impl Into<String>) {
         if let Some(sink) = &self.events.log {
@@ -636,9 +643,10 @@ mod tests {
         harness.set.idle();
         let old = harness.set.state_of("a").unwrap().display_id.unwrap();
         harness.displays.fail_retires(1);
+        harness.set.set_remote(false);
         harness.set.set_wishes(Vec::new());
-        harness.set.idle();
         harness.set.set_wishes(vec![harness.wish("a")]);
+        harness.set.set_remote(true);
         harness.set.idle();
         let new = harness.set.state_of("a").unwrap().display_id.unwrap();
         assert_ne!(old, new);
@@ -647,6 +655,35 @@ mod tests {
         harness.set.idle();
         assert!(!harness.displays.is_online(old));
         assert!(harness.displays.is_online(new));
+    }
+
+    #[test]
+    fn retained_screen_returns_the_remote_window_without_rebuilding_the_display() {
+        let mut harness = DeskSetHarness::new();
+        let wishes = vec![harness.wish("a")];
+        harness.set.set_remote(true);
+        harness.set.set_wishes(wishes.clone());
+        harness.set.idle();
+        let display = harness.set.state_of("a").unwrap().display_id;
+        let key = WindowKey::new(45, 0x103);
+        let original = Rect::new(10.0, 20.0, 900.0, 600.0);
+        harness.windows.insert(key, original);
+        harness.set.pull("a", window(key, Some("Code.exe"), "README.md"));
+        harness.set.idle();
+        assert_ne!(harness.windows.frame_of(key), Some(original));
+
+        harness.set.set_remote(false);
+        harness.set.set_wishes(wishes);
+        harness.set.reset_retained_screen_session(true);
+        harness.set.idle();
+
+        let state = harness.set.state_of("a").unwrap();
+        assert_eq!(state.display_id, display);
+        assert_eq!(state.screen_phase, PhoneScreenPhase::Ready);
+        assert!(state.placed.is_none());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+        assert_eq!(harness.displays.create_calls().len(), 1);
+        assert_eq!(harness.displays.retire_calls(), 0);
     }
 
     #[test]

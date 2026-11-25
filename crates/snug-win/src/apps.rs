@@ -21,7 +21,7 @@ use snug_core::apps::sorted as sorted_apps;
 use snug_core::desk::{AppControl, WindowControl};
 use snug_core::windows::{AppInfo, RunningApp, WindowInfo};
 use snug_core::WindowKey;
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, HWND, LPARAM, SIZE, WAIT_TIMEOUT, WPARAM,
 };
@@ -51,7 +51,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     ExtractIconExW, SHCreateItemFromParsingName, SHGetKnownFolderItem, SHGetKnownFolderPath,
-    ShellExecuteExW, BHID_EnumItems, FOLDERID_AppsFolder, FOLDERID_CommonPrograms,
+    ShellExecuteExW, ShellExecuteW, BHID_EnumItems, FOLDERID_AppsFolder, FOLDERID_CommonPrograms,
     FOLDERID_Programs, IEnumShellItems, IShellItem, IShellItemImageFactory, SEE_MASK_NOASYNC,
     SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SIIGBF, SIIGBF_BIGGERSIZEOK,
     SIIGBF_ICONONLY, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
@@ -1224,13 +1224,10 @@ struct ComApartment(bool);
 impl ComApartment {
     fn enter() -> Option<Self> {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        // 只有 S_OK（本次真正初始化）才配对 CoUninitialize；S_FALSE 表示线程早就
-        // 初始化过，多减一次会把别人的 COM 拆了。已经在 MTA 里的线程沿用它。
-        if hr == windows::Win32::Foundation::S_OK {
+        // S_OK 和 S_FALSE 都增加初始化计数。已经在 MTA 的线程沿用现有套间。
+        if hr == windows::Win32::Foundation::S_OK || hr == windows::Win32::Foundation::S_FALSE {
             Some(Self(true))
-        } else if hr == windows::Win32::Foundation::S_FALSE
-            || hr == windows::Win32::Foundation::RPC_E_CHANGED_MODE
-        {
+        } else if hr == windows::Win32::Foundation::RPC_E_CHANGED_MODE {
             Some(Self(false))
         } else {
             None
@@ -1244,6 +1241,20 @@ impl Drop for ComApartment {
             unsafe { CoUninitialize() };
         }
     }
+}
+
+/// Open a web address in the user's default browser.
+pub fn open_web_url(url: &str) -> std::io::Result<()> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains('\0') {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "无效的网页地址"));
+    }
+    let _com = ComApartment::enter().ok_or_else(|| std::io::Error::other("无法初始化 Windows Shell"))?;
+    let url = HSTRING::from(url);
+    let result = unsafe { ShellExecuteW(None, w!("open"), &url, None, None, SW_SHOWNORMAL) }.0 as isize;
+    if result <= 32 {
+        return Err(std::io::Error::other(format!("Windows Shell 未能打开网页（代码 {result}）")));
+    }
+    Ok(())
 }
 
 impl AppSystem for WinSystem {

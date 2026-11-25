@@ -60,6 +60,34 @@ impl AppThemeMode {
     }
 }
 
+/// 由 Snug 管理的虚拟屏何时启用。单块屏幕仍有独立的启用状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhoneScreenMode {
+    Off,
+    #[default]
+    WhileConnected,
+    Always,
+}
+
+impl PhoneScreenMode {
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::WhileConnected => "WhileConnected",
+            Self::Always => "Always",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "whileconnected" => Some(Self::WhileConnected),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
 /// 用户明确应用的虚拟屏物理像素；与机型本身的规格分别保存。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScreenResolution {
@@ -167,7 +195,10 @@ impl Default for ScreenConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
+    /// 旧版单屏字段，与屏列表中主手机屏的启用状态保持一致。
     pub phone_screen: bool,
+    phone_screen_mode: PhoneScreenMode,
+    pub crossdesk_enabled: bool,
     pub gestures: bool,
     pub gesture_scroll: bool,
     pub gesture_long_press_right_click: bool,
@@ -189,6 +220,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             phone_screen: true,
+            phone_screen_mode: PhoneScreenMode::default(),
+            crossdesk_enabled: false,
             gestures: true,
             gesture_scroll: true,
             gesture_long_press_right_click: true,
@@ -207,6 +240,14 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn phone_screen_mode(&self) -> PhoneScreenMode {
+        self.phone_screen_mode
+    }
+
+    pub fn set_phone_screen_mode(&mut self, mode: PhoneScreenMode) {
+        self.phone_screen_mode = mode;
+    }
+
     /// 兜底与规范化（C# `Sanitize`）：夹取缩放、迁移旧配置、清理屏列表、同步 `phone`。
     pub fn sanitize(mut self) -> Self {
         let fallback_phone = if self.phone.screen.is_valid() {
@@ -362,7 +403,9 @@ impl AppConfig {
         let Some(obj) = value.as_object() else {
             return cfg;
         };
-        cfg.phone_screen = get_bool(obj, "phonescreen").unwrap_or(cfg.phone_screen);
+        let legacy_phone_screen = get_bool(obj, "phonescreen");
+        cfg.phone_screen = legacy_phone_screen.unwrap_or(cfg.phone_screen);
+        cfg.crossdesk_enabled = get_bool(obj, "crossdeskenabled").unwrap_or(false);
         cfg.gestures = get_bool(obj, "gestures").unwrap_or(cfg.gestures);
         cfg.gesture_scroll = get_bool(obj, "gesturescroll").unwrap_or(cfg.gesture_scroll);
         cfg.gesture_long_press_right_click = get_bool(obj, "gesturelongpressrightclick")
@@ -397,11 +440,30 @@ impl AppConfig {
             screen.resolution = Some(legacy_resolution(&screen));
             cfg.screens = Some(vec![screen]);
         }
-        cfg.sanitize()
+        let mut cfg = cfg.sanitize();
+        cfg.phone_screen_mode = get_value(obj, "phonescreenmode")
+            .and_then(Value::as_str)
+            .and_then(PhoneScreenMode::parse)
+            .unwrap_or_else(|| {
+                if legacy_phone_screen.unwrap_or(cfg.phone_screen) {
+                    PhoneScreenMode::WhileConnected
+                } else {
+                    PhoneScreenMode::Off
+                }
+            });
+        cfg
     }
 
     /// 写回磁盘用的 JSON（与 C# v1.3 字段一致：PascalCase + 新增 Screens/Theme）。
     pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.to_value()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        crate::store::JsonFileStore::new(path).save(&self.to_value())
+    }
+
+    fn to_value(&self) -> Value {
         let screens: Vec<Value> = self
             .effective_screens()
             .iter()
@@ -421,8 +483,10 @@ impl AppConfig {
                 value
             })
             .collect();
-        let value = serde_json::json!({
+        serde_json::json!({
             "PhoneScreen": self.phone_screen,
+            "PhoneScreenMode": self.phone_screen_mode.config_value(),
+            "CrossDeskEnabled": self.crossdesk_enabled,
             "Gestures": self.gestures,
             "GestureScroll": self.gesture_scroll,
             "GestureLongPressRightClick": self.gesture_long_press_right_click,
@@ -436,8 +500,7 @@ impl AppConfig {
             "Screens": screens,
             "Welcomed": self.welcomed,
             "LastVersion": self.last_version,
-        });
-        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+        })
     }
 }
 
@@ -669,12 +732,46 @@ mod tests {
     fn defaults_match_mac_upstream() {
         let cfg = AppConfig::default();
         assert!(cfg.phone_screen);
+        assert_eq!(cfg.phone_screen_mode(), PhoneScreenMode::WhileConnected);
         assert!(cfg.gestures);
         assert!(!cfg.screenshot);
         assert_eq!(cfg.zoom_steps, 2);
         assert_eq!(cfg.phone, PhoneChoice::standard());
         assert_eq!(cfg.theme, AppThemeMode::Light);
         assert!(cfg.screens.is_none(), "默认还没有屏列表，等 sanitize 迁移");
+    }
+
+    #[test]
+    fn legacy_phone_toggle_migrates_independently_of_the_screen_list() {
+        for (enabled, expected) in [
+            (true, PhoneScreenMode::WhileConnected),
+            (false, PhoneScreenMode::Off),
+        ] {
+            let mut legacy = AppConfig::default().sanitize().to_value();
+            let values = legacy.as_object_mut().unwrap();
+            values.remove("PhoneScreenMode");
+            values.insert("PhoneScreen".into(), Value::Bool(enabled));
+            let migrated = AppConfig::from_value(&legacy);
+            assert_eq!(migrated.phone_screen_mode(), expected);
+            assert!(migrated.effective_screens()[0].enabled);
+        }
+        let bad_mode = r#"{"PhoneScreen": false, "PhoneScreenMode": "Unknown"}"#;
+        assert_eq!(AppConfig::from_json_or_default(bad_mode).phone_screen_mode(), PhoneScreenMode::Off);
+    }
+
+    #[test]
+    fn phone_screen_mode_survives_edits_and_save() {
+        for mode in [PhoneScreenMode::Off, PhoneScreenMode::WhileConnected, PhoneScreenMode::Always] {
+            let mut config = AppConfig::default().sanitize();
+            config.set_phone_screen_mode(mode);
+            let updated = config.with_screen_updated(ScreenConfig::LEGACY_PHONE_ID, |mut screen| {
+                screen.enabled = false;
+                screen
+            });
+            let restored = AppConfig::from_json_or_default(&updated.to_json());
+            assert_eq!(restored.phone_screen_mode(), mode);
+            assert!(!restored.effective_screens()[0].enabled);
+        }
     }
 
     #[test]

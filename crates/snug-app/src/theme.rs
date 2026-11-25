@@ -76,6 +76,7 @@ pub fn palette(dark: bool) -> Palette {
 
 /// 把这一档主题应用到 egui（控件默认外观 + 圆角间距）。
 pub fn apply(ctx: &egui::Context, dark: bool) {
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     let p = palette(dark);
     visuals.panel_fill = p.bg;
@@ -133,6 +134,18 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_theme_keeps_the_same_visuals_on_subsequent_frames() {
+        let ctx = egui::Context::default();
+        for dark in [false, true, false] {
+            apply(&ctx, dark);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                assert_eq!(ctx.style().visuals.dark_mode, dark);
+                assert_eq!(ctx.style().visuals.panel_fill, palette(dark).bg);
+            });
+        }
+    }
 
     #[test]
     fn explicit_modes_do_not_consult_the_system() {

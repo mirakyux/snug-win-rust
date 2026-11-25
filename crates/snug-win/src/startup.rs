@@ -18,7 +18,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use snug_core::update::{build_task_xml, TASK_NAME};
+use snug_core::update::{build_task_xml, STARTUP_DELAY, TASK_NAME};
 
 /// 计划任务命令。
 pub const SCHTASKS: &str = "schtasks.exe";
@@ -307,7 +307,7 @@ impl<R: CommandRunner> StartupService<R> {
         Ok(())
     }
 
-    /// 程序换位置了就把任务里的路径改过来（C# `RefreshPathIfEnabled`）。
+    /// 更新已启用任务的程序路径及登录触发设置。
     ///
     /// 返回 `true` 表示确实重新注册了。
     pub fn refresh_path_if_enabled(&self) -> bool {
@@ -322,12 +322,17 @@ impl<R: CommandRunner> StartupService<R> {
         };
         let exe = self.exe_path.to_string_lossy().to_string();
         let legacy_elevation = output.output.contains("<RunLevel>HighestAvailable</RunLevel>");
-        if exe.is_empty() || (!needs_refresh(&registered, &exe) && !legacy_elevation) {
+        let legacy_delay = output.output.contains("<LogonTrigger>")
+            && !output.output.contains(&format!("<Delay>{STARTUP_DELAY}</Delay>"));
+        if exe.is_empty() || (!needs_refresh(&registered, &exe) && !legacy_elevation && !legacy_delay) {
             return false;
         }
         match self.set_enabled(true) {
             Ok(()) => true,
-            Err(error) => { crate::warn(&format!("无法迁移开机任务到普通权限；若旧任务拒绝修改，请在设置中以管理员重启一次，迁移后退出并普通启动：{error}")); false }
+            Err(error) => {
+                crate::warn(&format!("无法更新已有的登录启动任务：{error}"));
+                false
+            }
         }
     }
 
@@ -605,6 +610,20 @@ mod tests {
         let exe = directory.join("snug.exe");
         std::fs::write(&exe, b"test").unwrap();
         let xml = format!("<Task><RunLevel>HighestAvailable</RunLevel><Command>{}</Command></Task>", exe.display());
+        let runner = std::sync::Arc::new(FakeRunner::with(vec![CommandOutput::new(0, &xml, "")]));
+        let service = StartupService::new(SharedRunner(runner.clone()), TASK_NAME, &exe, &directory);
+        assert!(service.refresh_path_if_enabled());
+        assert_eq!(runner.calls()[1].1[0], "/Create");
+        std::fs::remove_file(exe).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn refresh_adds_delay_to_an_existing_logon_task() {
+        let directory = temp_dir();
+        let exe = directory.join("snug.exe");
+        std::fs::write(&exe, b"test").unwrap();
+        let xml = build_task_xml(&exe.to_string_lossy(), None).replace("<Delay>PT20S</Delay>", "");
         let runner = std::sync::Arc::new(FakeRunner::with(vec![CommandOutput::new(0, &xml, "")]));
         let service = StartupService::new(SharedRunner(runner.clone()), TASK_NAME, &exe, &directory);
         assert!(service.refresh_path_if_enabled());

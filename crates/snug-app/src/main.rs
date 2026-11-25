@@ -3,14 +3,19 @@
 //! 阶段：核心逻辑层与虚拟屏管道已移植；显示配置、搬窗、钩子等平台层由 `snug-win` 逐步补齐。
 //! 屏幕按用户指定的分辨率工作；旧机型资料只用于读取和迁移历史配置。
 
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod bubble;
 mod controller;
+mod desktop_settings;
+mod display_layout;
 mod driver;
 mod embedded_fonts;
 mod library;
 mod logging;
 mod mobile_library;
 mod privileged;
+mod projection;
 mod settings;
 mod theme;
 mod shots;
@@ -37,6 +42,7 @@ fn main() -> eframe::Result<()> {
             })
     });
     let preview_all = arguments.iter().any(|argument| argument == "--preview-all");
+    let preview_desktop_settings = arguments.iter().any(|argument| argument == "--preview-desktop-settings");
     let preview_search = arguments
         .iter()
         .find_map(|argument| argument.strip_prefix("--preview-search="))
@@ -45,11 +51,12 @@ fn main() -> eframe::Result<()> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--preview-output="))
         .map(std::path::PathBuf::from);
-    let preview_requested = preview_settings.is_some()
+    let phone_preview_requested = preview_settings.is_some()
         || preview_all
         || preview_search.is_some()
         || preview_output.is_some()
         || arguments.iter().any(|argument| argument == "--preview");
+    let preview_requested = phone_preview_requested || preview_desktop_settings;
     match privileged::dispatch(&arguments) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
@@ -71,7 +78,10 @@ fn main() -> eframe::Result<()> {
     }
     let paths = Paths::default();
     if let Err(err) = paths.ensure_dirs() {
-        eprintln!("无法创建数据目录 {}：{err}", paths.data_dir().display());
+        snug_win::elevation::show_error_dialog(&format!(
+            "无法创建数据目录 {}：{err}",
+            paths.data_dir().display(),
+        ));
     }
     logging::init(paths.log_directory());
     // 崩溃要留痕：GUI 进程没有控制台，默认的 panic 输出会直接丢掉。
@@ -134,8 +144,8 @@ fn main() -> eframe::Result<()> {
     let fit = snug_core::ScreenPlan::fit_of(&screen);
     let (pixel_width, pixel_height) = fit.pixel_size(fit.base_width());
     crate::info!(
-        "配置：手机屏={} 手势={} 分辨率={}×{}",
-        config.phone_screen,
+        "配置：手机屏={:?} 手势={} 分辨率={}×{}",
+        config.phone_screen_mode(),
         config.gestures,
         pixel_width,
         pixel_height
@@ -165,6 +175,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // Decouple both windows from the display's next vblank, including an off-screen root.
+        vsync: false,
         ..Default::default()
     };
 
@@ -180,13 +192,14 @@ fn main() -> eframe::Result<()> {
             let controller = controller::Controller::start(
                 &config,
                 &paths,
+                !preview_requested,
                 move || repaint_ctx.request_repaint(),
                 |line: &str| crate::info!("desk: {line}"),
             )?;
             crate::info!("控制器已启动（手机屏 {}）", if pipe_ready { "可用" } else { "不可用" });
-            if !pipe_ready && !preview_requested && let Err(error) = driver::spawn_ensure_installed() {
-                crate::warn!("驱动安装后台任务无法启动：{error}");
-            }
+            let display_layout = display_layout::DisplayLayout::start(
+                controller.display_service(), cc.egui_ctx.clone(),
+            )?;
             let mut app = ui::PhoneHomeApp::new(
                 config,
                 paths.clone(),
@@ -194,14 +207,21 @@ fn main() -> eframe::Result<()> {
                 start_minimized,
                 controller,
                 ui_heartbeat,
+                display_layout,
             );
-            if preview_requested {
+            if !preview_requested {
+                app.prepare_driver_at_startup(&cc.egui_ctx, start_minimized);
+            }
+            if phone_preview_requested {
                 app.open_preview(&cc.egui_ctx);
                 app.set_preview_library(preview_all, preview_search);
             }
             if let Some(tab) = preview_settings {
                 app.settings.select_tab(tab);
                 app.settings.open();
+            }
+            if preview_desktop_settings {
+                app.open_desktop_settings(settings::SettingsTab::Home);
             }
             if let Some(path) = preview_output {
                 app.capture_preview_to(path);
