@@ -7,6 +7,7 @@
     这不是验收，是**发版门禁**。真机行为（建屏、撤屏、托盘、主题…）仍然要照
     docs/acceptance.md 手点一遍；这里只保证发出去的那个 exe 是发布形态：
 
+      0. PE 子系统为 Windows GUI，启动不分配控制台；
       1. 版本：exe 资源里的 FileVersion/ProductVersion 与根 Cargo.toml 的
          [workspace.package] version 一致，且是三段数字（更新器按它跟 tag 比）；
       2. 体积：应用 8 MiB + 内嵌驱动 4 MiB，总预算 12 MiB；
@@ -114,9 +115,24 @@ if (-not (Test-Path -LiteralPath $Exe)) {
 $exePath = (Resolve-Path -LiteralPath $Exe).Path
 $exeInfo = Get-Item -LiteralPath $exePath
 $exeHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
-$exeContent = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($exePath))
+$exeBytes = [System.IO.File]::ReadAllBytes($exePath)
+$exeContent = [System.Text.Encoding]::Latin1.GetString($exeBytes)
 Write-Host ("  exe   : {0}" -f $exePath)
 Write-Host ("  大小  : {0:N0} B（{1:N2} MiB）" -f $exeInfo.Length, ($exeInfo.Length / 1MB))
+
+# PE32 与 PE32+ 的 Subsystem 都在可选头偏移 68。
+$peOffset = if ($exeBytes.Length -ge 64) { [BitConverter]::ToInt32($exeBytes, 60) } else { -1 }
+if ($peOffset -lt 64 -or $peOffset -gt ($exeBytes.Length - 94) -or
+    [BitConverter]::ToUInt16($exeBytes, 0) -ne 0x5A4D -or
+    [BitConverter]::ToUInt32($exeBytes, $peOffset) -ne 0x4550 -or
+    [BitConverter]::ToUInt16($exeBytes, $peOffset + 20) -lt 70 -or
+    [BitConverter]::ToUInt16($exeBytes, $peOffset + 24) -notin @(0x10B, 0x20B)) {
+    Fail 'exe 的 PE 文件头无效，无法确认 Windows 子系统'
+} else {
+    $subsystem = [BitConverter]::ToUInt16($exeBytes, $peOffset + 24 + 68)
+    if ($subsystem -eq 2) { Pass 'PE 子系统为 Windows GUI' }
+    else { Fail "PE 子系统编号为 $subsystem，要求 Windows GUI（2）" }
+}
 
 # ---------------------------------------------------------------------------
 # 1. 版本
@@ -265,7 +281,7 @@ if (-not $vcvars) {
                 'crypt32.dll', 'd3d11.dll', 'dwmapi.dll', 'dwrite.dll', 'dxgi.dll',
                 'gdi32.dll', 'gdi32full.dll', 'imm32.dll', 'iphlpapi.dll', 'kernel32.dll',
                 'msimg32.dll', 'ntdll.dll', 'ole32.dll', 'oleaut32.dll', 'opengl32.dll',
-                'psapi.dll', 'rpcrt4.dll', 'secur32.dll', 'setupapi.dll', 'shcore.dll',
+                'pdh.dll', 'psapi.dll', 'rpcrt4.dll', 'secur32.dll', 'setupapi.dll', 'shcore.dll',
                 'shell32.dll', 'shlwapi.dll', 'user32.dll', 'userenv.dll', 'uxtheme.dll',
                 'version.dll', 'winmm.dll', 'winspool.drv', 'wintrust.dll', 'ws2_32.dll',
                 'wtsapi32.dll', 'dcomp.dll', 'dinput8.dll', 'hid.dll', 'propsys.dll',

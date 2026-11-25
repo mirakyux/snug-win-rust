@@ -12,11 +12,12 @@ use std::time::Duration;
 use snug_core::desk::{
     AppControl, DeskSet, DeskSetEvents, DeskSetOptions, DeskState, PhoneDisplays, PhoneScreenPhase,
 };
-use snug_core::session::{ControllerTable, UUSignals};
+use snug_core::session::{ControllerTable, EpisodeChange, SessionEpisode, UUSignals};
 use snug_core::touch::{TouchOptions, TouchRegion};
 use snug_core::windows::{AppInfo, WindowInfo};
-use snug_core::{AppConfig, Paths, Rect};
+use snug_core::{AppConfig, Paths, PhoneScreenMode, Rect};
 use snug_win::{WinPhoneDisplays, WinWindows};
+use snug_win::crossdesk::{CrossDeskActivity, CrossDeskSensor};
 
 /// `snug-win` 的 `WinApps` 已经实现了 core 的 [`AppControl`]
 /// （`apps.rs` 的 `impl<S: AppSystem> AppControl for Apps<S>`），控制器直接用真机实现。
@@ -87,6 +88,40 @@ type DeskAction = Box<dyn FnOnce(&mut DeskSet) + Send>;
 const UU_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const UU_SAMPLE_MAX_AGE: f64 = 5.0;
 
+#[derive(Default)]
+struct CrossDeskSession {
+    episode: SessionEpisode,
+    last_active_at: Option<f64>,
+}
+
+impl CrossDeskSession {
+    fn update(&mut self, enabled: bool, activity: CrossDeskActivity, now: f64) -> bool {
+        if !enabled {
+            let ended = self.episode.is_active();
+            *self = Self::default();
+            return ended;
+        }
+        let ended = self.episode.advance(now) == Some(EpisodeChange::Ended);
+        match activity {
+            CrossDeskActivity::Active => {
+                self.last_active_at = Some(now);
+                self.episode.connected(now);
+            }
+            CrossDeskActivity::Inactive => {
+                self.last_active_at = None;
+                self.episode.disconnected(now);
+            }
+            CrossDeskActivity::Unknown => {
+                if self.last_active_at.is_some_and(|at| now - at > UU_SAMPLE_MAX_AGE) {
+                    self.last_active_at = None;
+                    self.episode.disconnected(now);
+                }
+            }
+        }
+        ended
+    }
+}
+
 struct UuSample {
     sampled_at: f64,
     signals: snug_win::UuSignalSet,
@@ -107,8 +142,11 @@ fn read_uu_sample(
 ) -> UuReading {
     let sample = latest.lock().unwrap_or_else(|e| e.into_inner()).take();
     match sample {
-        Some(sample) if now - sample.sampled_at <= UU_SAMPLE_MAX_AGE => {
+        Some(mut sample) if now - sample.sampled_at <= UU_SAMPLE_MAX_AGE => {
             *last_sample_at = sample.sampled_at;
+            if now - sample.sampled_at > 1.5 {
+                sample.signals.capture_evidence = Default::default();
+            }
             UuReading::Fresh(sample.signals)
         }
         _ if now - *last_sample_at > UU_SAMPLE_MAX_AGE => UuReading::Stale,
@@ -136,6 +174,10 @@ pub struct Controller {
     pending: Arc<std::sync::Mutex<Vec<DeskAction>>>,
     /// 最近一次屏配置（wishes 由它算，写屏列表时更新）。
     config: Arc<std::sync::Mutex<AppConfig>>,
+    /// 屏配置或当前选择发生变化，唤醒下一次控制循环重新计算愿望。
+    screen_policy_changed: Arc<AtomicBool>,
+    /// 安装或授权任务结束后，控制线程才清理残留屏并应用配置。
+    driver_startup_pending: Arc<AtomicBool>,
     /// 界面当前显示哪块屏（`None` = 主触控屏）。
     ///
     /// 多屏时**只有这块屏会真的建出来**：我们只有一个窗口，建成 N 块虚拟屏的话
@@ -146,16 +188,9 @@ pub struct Controller {
     displays: Arc<WinPhoneDisplays>,
     /// 手势钩子（C# `TouchHookService`）。
     touch: Arc<snug_win::TouchHook>,
-    /// 用户明确要求保留手机屏，不依赖 UU 探测是否有结果。
-    manual_override: Arc<AtomicBool>,
-    /// 手机屏总开关（对应 C# `_config.PhoneScreen`）。
-    ///
-    /// 它只是"允许开屏"，真正开不开还要看会话：C# 每个 tick 都算
-    /// `_config.PhoneScreen && _session.InEpisode && WantsPhoneScreen(...)` 再 `SetWanted`。
-    /// 移植时漏了这一层（只在启动时设一次），真机表现就是"退出远控后虚拟屏还挂着"。
-    phone_enabled: Arc<AtomicBool>,
     /// UU 远程会话状态机（控制线程消费采样结果，界面读它判断"在不在会话里"）。
     session: Arc<std::sync::Mutex<snug_core::session::RemoteSession>>,
+    crossdesk_in_episode: Arc<AtomicBool>,
     /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
     touch_region: Arc<std::sync::Mutex<Option<TouchRegion>>>,
     /// 钩子抛出的事件队列（关闭窗口 / 选区结束 / 选区取消）。
@@ -175,6 +210,7 @@ impl Controller {
     pub fn start(
         config: &AppConfig,
         paths: &Paths,
+        driver_startup_pending: bool,
         on_change: impl Fn() + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
@@ -220,19 +256,12 @@ impl Controller {
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let pending: Arc<std::sync::Mutex<Vec<DeskAction>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        // 清理可能等待系统 UAC：放到控制线程，在第一条 wish 前完成，
-        // 不让它挡住主线程上的界面与托盘创建。
         let startup_displays = displays.clone();
-        // 注意：这里**不**按 `config.phone_screen` 直接开屏。C# 的 `SetWishes` 由
-        // `OnTick` 每秒按会话算一次（见下面 worker），启动时没有任何 wish、
-        // 屏幕要等第一段远程会话才建。移植时漏了这一层，真机表现是"退出远控后
-        // 虚拟屏还挂着，只有杀进程才消失"。
-
+        let driver_startup_pending = Arc::new(AtomicBool::new(driver_startup_pending));
+        let driver_startup_worker = driver_startup_pending.clone();
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
         let desks_worker = desks.clone();
-        let manual_override = Arc::new(AtomicBool::new(false));
-        let manual_worker = manual_override.clone();
         let latest_uu: LatestUuSample = Arc::new(std::sync::Mutex::new(None));
         {
             let latest = latest_uu.clone();
@@ -262,11 +291,33 @@ impl Controller {
                     std::io::Error::new(error.kind(), format!("无法启动 UU 探测线程：{error}"))
                 })?;
         }
-        let phone_enabled = Arc::new(AtomicBool::new(config.phone_screen));
-        let phone_enabled_worker = phone_enabled.clone();
         let session_worker = session.clone();
+        let initial_mode = config.phone_screen_mode();
         let config = Arc::new(std::sync::Mutex::new(config.clone()));
         let config_worker = config.clone();
+        let screen_policy_changed = Arc::new(AtomicBool::new(true));
+        let screen_policy_worker = screen_policy_changed.clone();
+        let crossdesk_in_episode = Arc::new(AtomicBool::new(false));
+        let crossdesk_episode_worker = crossdesk_in_episode.clone();
+        let latest_crossdesk = Arc::new(std::sync::Mutex::new(None));
+        {
+            let latest = latest_crossdesk.clone();
+            let config = config.clone();
+            let stop = running.clone();
+            let sampler = std::thread::Builder::new().name("snug-crossdesk-sampler".into()).spawn(move || {
+                let sensor = CrossDeskSensor::new();
+                while stop.load(Ordering::Relaxed) {
+                    let began = std::time::Instant::now();
+                    let enabled = config.lock().map(|cfg| cfg.crossdesk_enabled).unwrap_or(false);
+                    let value = enabled.then(|| (began.duration_since(clock).as_secs_f64(), sensor.sample()));
+                    *latest.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                    std::thread::sleep(UU_SAMPLE_INTERVAL.saturating_sub(began.elapsed()));
+                }
+            });
+            if let Err(error) = sampler {
+                crate::warn!("无法启动 CrossDesk 探测线程：{error}");
+            }
+        }
         let active_screen: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let active_screen_worker = active_screen.clone();
@@ -285,10 +336,6 @@ impl Controller {
         let worker = match std::thread::Builder::new()
             .name("snug-desk-idle".to_string())
             .spawn(move || {
-                startup_displays.cleanup_orphans();
-                if let Ok(desks) = desks_worker.lock() {
-                    desks.recover();
-                }
                 // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
                 // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
                 use snug_win::display::DisplayApi;
@@ -296,15 +343,21 @@ impl Controller {
                 let mut last_topology: Option<Vec<(u32, i32, i32, i32, i32)>> = None;
                 // 与 `topology_changing` 回调共用同一根时间轴（会话状态机内部按秒比较）。
                 let started = clock;
-                let mut last_policy_update = -1.0_f64;
+                let mut last_session_poll = -1.0_f64;
                 let mut last_uu_sample = 0.0_f64;
                 let mut uu_sample_stale = false;
-                let mut last_manual = false;
+                let mut crossdesk_session = CrossDeskSession::default();
+                let mut last_crossdesk_activity = CrossDeskActivity::Unknown;
+                let mut was_uu_in_episode = false;
+                let mut in_episode = false;
+                let mut was_in_episode = false;
+                let mut last_mode = initial_mode;
                 let mut last_topology_check = -1.0_f64;
                 let mut last_check_returns = -1.0_f64;
                 let mut last_connected = false;
                 let mut last_signals = None;
                 let mut panel_handle = None;
+                let mut startup_recovered = false;
                 while stop.load(Ordering::Relaxed) {
                     // 界面排过来的动作先做（只是入队，很快）：这样界面线程永远不用在
                     // `DeskSet` 的锁上等——那把锁在 `idle()` 里可能被建屏占住好几秒。
@@ -355,62 +408,60 @@ impl Controller {
                         }
                     }
                     let now = started.elapsed().as_secs_f64();
-                    let manual = manual_worker.load(Ordering::Relaxed);
-                    if now - last_policy_update >= 1.0 || manual != last_manual {
-                        last_policy_update = now;
-                        last_manual = manual;
-                        let signals = if manual {
-                            // 手动强制只影响 wish；不要把合成信号写进真实远程会话状态。
-                            None
-                        } else {
-                            match read_uu_sample(&latest_uu, now, &mut last_uu_sample) {
-                                UuReading::Fresh(sampled) => {
-                                    if uu_sample_stale {
-                                        crate::info!("UU：探测已恢复");
-                                        uu_sample_stale = false;
-                                    }
-                                    let summary = (
-                                        sampled.client_running,
-                                        sampled.client_visible,
-                                        sampled.capture_active,
-                                        sampled.peer_active,
-                                        sampled.controllers.names.len(),
-                                        sampled.controllers.readable,
+                    let poll_session = now - last_session_poll >= 1.0;
+                    let mut replaced_episode = false;
+                    if poll_session {
+                        last_session_poll = now;
+                        let signals = match read_uu_sample(&latest_uu, now, &mut last_uu_sample) {
+                            UuReading::Fresh(sampled) => {
+                                if uu_sample_stale {
+                                    crate::info!("UU：探测已恢复");
+                                    uu_sample_stale = false;
+                                }
+                                let summary = (
+                                    sampled.client_running,
+                                    sampled.client_visible,
+                                    sampled.capture_active,
+                                    sampled.peer_active,
+                                    sampled.controllers.names.len(),
+                                    sampled.controllers.readable,
+                                    matches!(sampled.capture_evidence, snug_core::session::UuCaptureEvidence::HardwareEncoding),
+                                );
+                                if last_signals != Some(summary) {
+                                    crate::info!(
+                                        "UU 探测：客户端={} 服务端可见窗候选={} 推流={:?} 对端={} 控制端={}（{}）视频编码={}",
+                                        summary.0,
+                                        summary.1,
+                                        summary.2,
+                                        summary.3,
+                                        summary.4,
+                                        if summary.5 { "可读" } else { "读不到" },
+                                        summary.6,
                                     );
-                                    if last_signals != Some(summary) {
-                                        crate::info!(
-                                            "UU 探测：客户端={} 服务端可见窗候选={} 推流={:?} 对端={} 控制端={}（{}）",
-                                            summary.0,
-                                            summary.1,
-                                            summary.2,
-                                            summary.3,
-                                            summary.4,
-                                            if summary.5 { "可读" } else { "读不到" }
-                                        );
-                                        last_signals = Some(summary);
-                                    }
-                                    Some(sampled.to_signals())
+                                    last_signals = Some(summary);
                                 }
-                                UuReading::Pending => None,
-                                UuReading::Stale => {
-                                    if !uu_sample_stale {
-                                        crate::warn!(
-                                            "UU：超过 {UU_SAMPLE_MAX_AGE} 秒没有新鲜探测结果，按无新证据推进会话"
-                                        );
-                                        uu_sample_stale = true;
-                                    }
-                                    Some(UUSignals {
-                                        overlay_visible: false,
-                                        controllers: ControllerTable::unreadable(),
-                                        capture_active: None,
-                                    })
+                                Some(sampled.to_signals())
+                            }
+                            UuReading::Pending => None,
+                            UuReading::Stale => {
+                                if !uu_sample_stale {
+                                    crate::warn!(
+                                        "UU：超过 {UU_SAMPLE_MAX_AGE} 秒没有新鲜探测结果，按无新证据推进会话"
+                                    );
+                                    uu_sample_stale = true;
                                 }
+                                Some(UUSignals {
+                                    overlay_visible: false,
+                                    controllers: ControllerTable::unreadable(),
+                                    capture_active: None,
+                                    capture_evidence: Default::default(),
+                                })
                             }
                         };
                         // 会话判定用 `RemoteSession`（不只是 ConnectionTracker）：C# 的
                         // `_session.InEpisode` 决定"该不该有屏"，中断后还有一段重连窗口，
                         // 单用 `ConnectionTracker` 会把这段丢掉。
-                        let (connected, in_episode, controllers_len, ended) = {
+                        let (connected, uu_in_episode, controllers_len, ended) = {
                             let mut session =
                                 session_worker.lock().unwrap_or_else(|e| e.into_inner());
                             let ended = signals.is_some_and(|signals| {
@@ -434,30 +485,79 @@ impl Controller {
                             );
                         }
                         if ended {
-                            crate::info!("远程会话：本次会话结束，撤掉手机屏");
+                            crate::info!("UU：本次远程会话结束");
                         }
-                        // C# `OnTick`：
-                        //   bool remote = _session.InEpisode || _sensor.ManualOverride;
-                        //   _desks.SetWishes(ScreenPlan.Wishes(_config, remote));
-                        //   _desks.SetRemote(_session.InEpisode);
-                        // 与 1.2 的区别：不再按控制端类型判断要不要开屏（多设备时代那套
-                        // 启发式已经不准了），只看"有没有会话/手动强制"，屏列表自己带 enabled。
-                        let remote = in_episode || manual;
-                        let enabled = phone_enabled_worker.load(Ordering::Relaxed);
+                        let crossdesk_enabled = config_worker.lock().map(|cfg| cfg.crossdesk_enabled).unwrap_or(false);
+                        let crossdesk_activity = if crossdesk_enabled {
+                            latest_crossdesk.lock().ok().and_then(|mut sample| sample.take())
+                                .filter(|(at, _)| now - *at <= UU_SAMPLE_MAX_AGE)
+                                .map(|(_, activity)| activity)
+                                .unwrap_or(CrossDeskActivity::Unknown)
+                        } else {
+                            CrossDeskActivity::Unknown
+                        };
+                        // Missing one sample is routine. Log only explicit results or a sustained loss
+                        // of the episode so the diagnostic log does not oscillate every poll.
+                        let crossdesk_ended = crossdesk_session.update(crossdesk_enabled, crossdesk_activity, now);
+                        let crossdesk_active = crossdesk_session.episode.is_active();
+                        crossdesk_episode_worker.store(crossdesk_active, Ordering::Relaxed);
+                        if (crossdesk_activity != CrossDeskActivity::Unknown || crossdesk_ended)
+                            && crossdesk_activity != last_crossdesk_activity
+                        {
+                            crate::info!("CrossDesk：会话观测={crossdesk_activity:?}");
+                            last_crossdesk_activity = crossdesk_activity;
+                        }
+                        touch_worker.set_crossdesk_enabled(crossdesk_active && !uu_in_episode);
+                        replaced_episode = ended && (uu_in_episode || was_uu_in_episode && crossdesk_active)
+                            || crossdesk_ended && crossdesk_active && !uu_in_episode;
+                        was_uu_in_episode = uu_in_episode;
+                        in_episode = uu_in_episode || crossdesk_active;
+                    }
+                    // 授权由独立任务处理。期间继续探测会话，等授权任务完成后先清残留屏，
+                    // 再按最新的会话和设置建立屏幕。
+                    let changed = screen_policy_worker.swap(false, Ordering::AcqRel);
+                    let authorization_pending = driver_startup_worker.load(Ordering::Acquire);
+                    if should_apply_screen_policy(
+                        authorization_pending,
+                        startup_recovered,
+                        poll_session || changed,
+                    ) {
+                        if !startup_recovered {
+                            startup_displays.cleanup_orphans();
+                            if let Ok(desks) = desks_worker.lock() {
+                                desks.recover();
+                            }
+                            startup_recovered = true;
+                            if !stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
                         let active = active_screen_worker
                             .lock()
                             .ok()
                             .and_then(|guard| guard.clone());
-                        let wishes = {
+                        let (mode, wishes) = {
                             let config =
                                 config_worker.lock().unwrap_or_else(|e| e.into_inner());
-                            active_wishes(&config, enabled, remote, active.as_deref())
+                            let mode = config.phone_screen_mode();
+                            (mode, active_wishes(&config, in_episode, active.as_deref()))
                         };
                         if let Ok(mut desks) = desks_worker.lock() {
-                            desks.set_wishes(wishes);
-                            // 手动强制影响屏愿望，但保留原语义：DeskSet 的"远控"标记只来自真实会话。
+                            if replaced_episode && mode != PhoneScreenMode::Always {
+                                desks.set_remote(false);
+                                desks.set_wishes(Vec::new());
+                            }
                             desks.set_remote(in_episode);
+                            desks.set_wishes(wishes);
+                            if mode == PhoneScreenMode::Always {
+                                let episode_ended = replaced_episode || was_in_episode && !in_episode;
+                                if episode_ended || was_in_episode != in_episode || last_mode != mode {
+                                    desks.reset_retained_screen_session(episode_ended);
+                                }
+                            }
                         }
+                        was_in_episode = in_episode;
+                        last_mode = mode;
                     }
                     if now - last_topology_check >= 2.0 {
                         last_topology_check = now;
@@ -547,12 +647,13 @@ impl Controller {
             snapshots,
             pending,
             config,
+            screen_policy_changed,
+            driver_startup_pending,
             active_screen,
             displays,
             touch,
-            manual_override,
-            phone_enabled,
             session,
+            crossdesk_in_episode,
             touch_region,
             touch_events,
             selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
@@ -565,18 +666,20 @@ impl Controller {
     /// 主触控屏的 id（单屏界面默认操作的那块）。
     fn primary_screen_id(&self) -> Option<String> {
         let config = self.config.lock().ok()?;
-        config.primary_touch_screen().map(|screen| screen.id)
+        config.primary_touch_screen().filter(|screen| screen.enabled)
+            .or_else(|| config.effective_screens().into_iter().find(|screen| screen.enabled))
+            .map(|screen| screen.id)
     }
 
-    /// 所有已启用触控屏的 `(id, 名字)`，按配置顺序（多屏切换用）。
-    pub fn touch_screens(&self) -> Vec<(String, String)> {
+    /// 所有已启用屏幕的 `(id, 名字)`，按配置顺序。
+    pub fn enabled_screens(&self) -> Vec<(String, String)> {
         let Ok(config) = self.config.lock() else {
             return Vec::new();
         };
         config
             .effective_screens()
             .into_iter()
-            .filter(|screen| screen.enabled && screen.device.kind.is_touch())
+            .filter(|screen| screen.enabled)
             .map(|screen| (screen.id, screen.name))
             .collect()
     }
@@ -602,24 +705,13 @@ impl Controller {
 
     /// 屏列表变了（设置里增删改屏，对应 C# `_desks.SetWishes(ScreenPlan.Wishes(...))`）。
     ///
-    /// 配置当场存下，`set_wishes` 交给后台线程执行（界面线程不在那把锁上等）。
+    /// 配置当场存下，后台线程结合当时的会话和屏幕选择执行 `set_wishes`。
     pub fn apply_screens(&self, config: &AppConfig) {
         if let Ok(mut stored) = self.config.lock() {
             *stored = config.clone();
+            self.screen_policy_changed.store(true, Ordering::Release);
         }
-        let enabled = self.phone_enabled.load(Ordering::Relaxed);
-        let remote = self.in_session() || self.manual_override();
-        let active = self.active_screen.lock().ok().and_then(|guard| guard.clone());
-        let wishes = active_wishes(config, enabled, remote, active.as_deref());
-        let zoom = config.zoom_steps;
-        crate::info!(
-            "屏配置变化：{} 块屏愿望（remote={remote} 总开关={enabled}）",
-            wishes.len()
-        );
-        self.enqueue(move |desks| {
-            desks.set_wishes(wishes);
-            desks.set_default_zoom(zoom);
-        });
+        self.set_default_zoom(config.zoom_steps);
     }
 
     /// 切换界面当前显示哪块屏（`None` = 主触控屏）。
@@ -634,20 +726,14 @@ impl Controller {
         }
         crate::info!(
             "切换屏幕：{}",
-            screen_id.clone().unwrap_or_else(|| "主触控屏".to_string())
+            screen_id.as_deref().unwrap_or("主触控屏")
         );
-        let enabled = self.phone_enabled.load(Ordering::Relaxed);
-        let remote = self.in_session() || self.manual_override();
-        if let Ok(config) = self.config.lock() {
-            let wishes = active_wishes(&config, enabled, remote, screen_id.as_deref());
-            self.enqueue(move |desks| desks.set_wishes(wishes));
-        }
+        self.screen_policy_changed.store(true, Ordering::Release);
     }
 
     /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
     pub fn reenter(&self) {
-        if !self.phone_enabled.load(Ordering::Relaxed) {
-            crate::warn!("重新进入手机屏：总开关是关的，忽略");
+        if !self.wants_phone_display() {
             return;
         }
         crate::info!("重新进入手机屏");
@@ -656,11 +742,11 @@ impl Controller {
 
     /// 当前这一段远程会话还在不在（对应 C# `_session.InEpisode`）。
     pub fn in_session(&self) -> bool {
-        self.session.lock().map(|session| session.in_episode()).unwrap_or(false)
+        self.crossdesk_in_episode.load(Ordering::Relaxed)
+            || self.session.lock().map(|session| session.in_episode()).unwrap_or(false)
     }
 
-    /// 能不能"重新进入手机屏"（C# `CanReenterPhoneScreen`）：
-    /// 会话中（或手动强制）**且**有触控屏被用户收起过。
+    /// 当前模式需要创建手机屏，且有触控屏被用户临时收起过。
     ///
     /// 读快照（`dismissed` 是屏状态的一部分），不碰 `DeskSet` 的锁。
     pub fn can_reenter(&self) -> bool {
@@ -669,18 +755,26 @@ impl Controller {
             .lock()
             .map(|snap| snap.values().any(|state| state.dismissed))
             .unwrap_or(false);
-        dismissed && (self.in_session() || self.manual_override())
+        dismissed && self.wants_phone_display()
     }
 
-    /// 设置里的手机屏开关。
-    ///
-    /// 只改"允许开屏"这个开关；真正开/关由采样线程每秒按会话算（和 C# 一样）。
-    /// 关掉时立刻把屏愿望清空，不等下一拍。
-    pub fn set_phone_screen(&self, on: bool) {
-        self.phone_enabled.store(on, Ordering::Relaxed);
-        if !on {
-            self.enqueue(|desks| desks.set_wishes(Vec::new()));
+    pub fn set_phone_screen_mode(&self, mode: PhoneScreenMode) {
+        if let Ok(mut config) = self.config.lock()
+            && config.phone_screen_mode() != mode
+        {
+            config.set_phone_screen_mode(mode);
+            self.screen_policy_changed.store(true, Ordering::Release);
+            crate::info!("手机屏显示模式 = {mode:?}");
         }
+    }
+
+    pub fn complete_driver_startup(&self) {
+        self.driver_startup_pending.store(false, Ordering::Release);
+    }
+
+    fn wants_phone_display(&self) -> bool {
+        let mode = self.config.lock().map(|config| config.phone_screen_mode());
+        mode.is_ok_and(|mode| wants_phone_display(mode, self.in_session()))
     }
 
     /// 默认字号档位（设置窗的 zoom 滑杆）。
@@ -742,21 +836,14 @@ impl Controller {
         }
     }
 
-    /// 手动强制保持手机屏；不把它写入真实远程会话的证据。
-    pub fn set_manual_override(&self, on: bool) {
-        crate::info!("手动强制手机屏 = {on}");
-        self.manual_override.store(on, Ordering::Relaxed);
-    }
-
-    /// 当前"手动强制"状态（设置窗回显用）。
-    pub fn manual_override(&self) -> bool {
-        self.manual_override.load(Ordering::Relaxed)
-    }
-
     /// 一次快照返回手机屏完整矩形与底栏矩形（物理像素），供一帧内复用。
     pub fn phone_layout_of(&self, screen_id: Option<&str>) -> Option<(Rect, Rect)> {
         let id = self.state_of(screen_id).display_id?;
         self.displays.phone_layout_of(id)
+    }
+
+    pub(crate) fn display_service(&self) -> Arc<WinPhoneDisplays> {
+        Arc::clone(&self.displays)
     }
 
     /// 主屏（非手机屏）的可用区域（物理像素），桌面预览要按它摆放。
@@ -819,6 +906,16 @@ impl Controller {
             return;
         };
         self.enqueue(move |desks| desks.pull(&id, window));
+    }
+
+    pub fn focus_window(&self, key: snug_core::windows::WindowKey, screen: Rect) {
+        use snug_core::desk::services::WindowControl;
+        self.enqueue(move |_| {
+            let windows = snug_win::WinWindows::new();
+            if windows.look(key).is_some_and(|window| !window.minimized && screen.contains(window.frame.center())) {
+                windows.focus(key);
+            }
+        });
     }
 
     /// 启动一个 App（资源库里点没在跑的 App）。
@@ -927,8 +1024,7 @@ impl Controller {
             allow_right_click: config.gestures && config.gesture_long_press_right_click,
             notify_selection_ended: config.copy_after_selection && !state.list_visible,
         });
-        self.touch
-            .set_require_injected_flag(config.gestures_injected_only && !self.manual_override());
+        self.touch.set_require_injected_flag(config.gestures_injected_only);
     }
 
     /// 撤屏并停掉后台线程；返回前会把状态机收干净。
@@ -951,6 +1047,14 @@ impl Drop for Controller {
 fn panel_recovery_bounds(state: &DeskState, frame: Rect, screen: Rect) -> Option<Rect> {
     (state.screen_phase == PhoneScreenPhase::Ready && !screen.contains(frame.center()))
         .then_some(screen)
+}
+
+fn should_apply_screen_policy(
+    authorization_pending: bool,
+    startup_recovered: bool,
+    policy_changed: bool,
+) -> bool {
+    !authorization_pending && (!startup_recovered || policy_changed)
 }
 
 /// 把当前所有屏的状态拷一份给界面线程。
@@ -1018,21 +1122,24 @@ fn clear_touch_region_if_offline(
 /// ```
 ///
 /// 与 1.2 的**关键区别**：不再按控制端类型（手机/平板/电脑）判断要不要开屏。
-/// 多设备时代那套启发性判断已经被上游去掉，屏开不开完全由配置里每块屏的
-/// `enabled` 决定；总开关（手机屏开关）关掉时一块屏都不要。
-///
-/// 抽成纯函数是为了能单测：漏掉 `remote` 那一段就是真机上那个
-/// "退出远控后虚拟屏还挂着"的 bug。
+fn wants_phone_display(mode: PhoneScreenMode, in_episode: bool) -> bool {
+    match mode {
+        PhoneScreenMode::Off => false,
+        PhoneScreenMode::WhileConnected => in_episode,
+        PhoneScreenMode::Always => true,
+    }
+}
+
+/// 把显示模式、真实远程会话和当前屏幕选择合成为一个建屏愿望。
 fn active_wishes(
     config: &AppConfig,
-    enabled: bool,
-    remote: bool,
+    in_episode: bool,
     active_screen: Option<&str>,
 ) -> Vec<snug_core::screen_plan::ScreenWish> {
-    if !enabled {
+    if !wants_phone_display(config.phone_screen_mode(), in_episode) {
         return Vec::new();
     }
-    let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, remote, false);
+    let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, true, false);
     // 只留当前显示的那块：我们只有一个窗口，多建几块只会得到几块黑屏。
     //
     // `None` 必须和 `Controller::state_of(None)` 选同一块——那边用的是
@@ -1040,7 +1147,7 @@ fn active_wishes(
     // 两张表不一致时会出现"建的是电脑副屏、界面却在找手机屏"。
     let wanted_id = match active_screen {
         Some(id) => Some(id.to_string()),
-        None => config.primary_touch_screen().map(|screen| screen.id),
+        None => config.primary_touch_screen().filter(|screen| screen.enabled).map(|screen| screen.id),
     };
     match wanted_id {
         Some(id) => wishes.retain(|wish| wish.id == id),
@@ -1052,7 +1159,53 @@ fn active_wishes(
 
 #[cfg(test)]
 mod tests {
-    use super::{UuReading, active_wishes, read_uu_sample, panel_recovery_bounds};
+    use super::{CrossDeskActivity, CrossDeskSession, UuReading, active_wishes, read_uu_sample, panel_recovery_bounds};
+
+    #[test]
+    fn screen_policy_waits_for_driver_startup_then_runs_without_a_new_session_sample() {
+        assert!(!super::should_apply_screen_policy(true, false, true));
+        assert!(super::should_apply_screen_policy(false, false, false));
+        assert!(!super::should_apply_screen_policy(false, true, false));
+        assert!(super::should_apply_screen_policy(false, true, true));
+    }
+
+    #[test]
+    fn confirmed_uu_encoding_requests_a_screen_without_a_readable_controller_list() {
+        use snug_core::config::{AppConfig, PhoneScreenMode};
+        use snug_core::session::{ControllerTable, RemoteSession, UUSignals, UuCaptureEvidence};
+
+        let mut config = AppConfig::default();
+        config.set_phone_screen_mode(PhoneScreenMode::WhileConnected);
+        let mut session = RemoteSession::new();
+        let mut sample = UUSignals {
+            overlay_visible: false,
+            controllers: ControllerTable::unreadable(),
+            capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
+        };
+        session.update(&sample, 0.0);
+        assert!(active_wishes(&config, session.in_episode(), None).is_empty());
+
+        sample.capture_evidence = UuCaptureEvidence::HardwareEncoding;
+        session.update(&sample, 1.0);
+        assert!(session.is_connected());
+        assert_eq!(active_wishes(&config, session.in_episode(), None).len(), 1);
+    }
+
+    #[test]
+    fn crossdesk_unknown_sample_keeps_the_reconnect_window() {
+        let mut session = CrossDeskSession::default();
+        assert!(!session.update(false, CrossDeskActivity::Active, 0.0));
+        assert!(!session.episode.is_active());
+        assert!(!session.update(true, CrossDeskActivity::Active, 1.0));
+        assert!(!session.update(true, CrossDeskActivity::Unknown, 7.0));
+        assert!(session.episode.is_active());
+        assert!(!session.update(true, CrossDeskActivity::Active, 8.0));
+        assert!(!session.update(true, CrossDeskActivity::Inactive, 9.0));
+        assert!(!session.update(true, CrossDeskActivity::Inactive, 24.0));
+        assert!(session.update(true, CrossDeskActivity::Inactive, 24.1));
+        assert!(!session.episode.is_active());
+    }
 
     #[test]
     fn snapshot_removal_notifies_after_offline_state_is_published() {
@@ -1238,19 +1391,34 @@ mod tests {
     #[test]
     fn no_screen_outside_a_session() {
         let config = config_with_one_screen();
-        assert!(active_wishes(&config, true, false, None).is_empty());
+        assert!(active_wishes(&config, false, None).is_empty());
     }
 
     #[test]
     fn one_screen_during_a_session() {
         let config = config_with_one_screen();
-        assert_eq!(active_wishes(&config, true, true, None).len(), 1);
+        assert_eq!(active_wishes(&config, true, None).len(), 1);
     }
 
     #[test]
     fn master_switch_off_wins() {
-        let config = config_with_one_screen();
-        assert!(active_wishes(&config, false, true, None).is_empty());
+        let mut config = config_with_one_screen();
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Off);
+        assert!(active_wishes(&config, true, None).is_empty());
+        assert!(active_wishes(&config, false, None).is_empty());
+    }
+
+    #[test]
+    fn always_mode_keeps_the_selected_screen_wish_across_a_session() {
+        let mut config = config_with_two_screens();
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Always);
+        let startup = active_wishes(&config, false, Some("tablet-1"));
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].id, "tablet-1");
+        assert_eq!(active_wishes(&config, true, Some("tablet-1")), startup);
+        assert_eq!(active_wishes(&config, false, Some("tablet-1")), startup);
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::WhileConnected);
+        assert!(active_wishes(&config, false, Some("tablet-1")).is_empty());
     }
 
     /// 关掉某块屏就不该再有这个愿望。
@@ -1260,7 +1428,8 @@ mod tests {
         let mut screens = config.effective_screens();
         screens[0].enabled = false;
         config.screens = Some(screens);
-        assert!(active_wishes(&config, true, true, None).is_empty());
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Always);
+        assert!(active_wishes(&config, true, None).is_empty());
     }
 
     /// 配了两块屏，但同一时刻只建一块（只画一块屏，多建就是黑屏）：
@@ -1270,7 +1439,7 @@ mod tests {
         use snug_core::ScreenConfig;
 
         let config = config_with_two_screens();
-        let wishes = active_wishes(&config, true, true, None);
+        let wishes = active_wishes(&config, true, None);
         assert_eq!(wishes.len(), 1, "同一时刻只该建一块屏");
         assert_eq!(wishes[0].id, ScreenConfig::LEGACY_PHONE_ID);
     }
@@ -1279,7 +1448,7 @@ mod tests {
     #[test]
     fn selecting_a_screen_drops_the_other() {
         let config = config_with_two_screens();
-        let wishes = active_wishes(&config, true, true, Some("tablet-1"));
+        let wishes = active_wishes(&config, true, Some("tablet-1"));
         assert_eq!(wishes.len(), 1);
         assert_eq!(wishes[0].id, "tablet-1");
         assert_eq!(wishes[0].fit.kind(), snug_core::DeviceKind::Tablet);
@@ -1306,7 +1475,7 @@ mod tests {
         config.screens = Some(vec![computer.sanitize(), base.sanitize()]);
         let primary = config.primary_touch_screen().expect("配置里有手机屏");
 
-        let wishes = active_wishes(&config, true, true, None);
+        let wishes = active_wishes(&config, true, None);
         assert_eq!(wishes.len(), 1);
         assert_eq!(wishes[0].id, primary.id, "默认建屏要和 primary_touch_screen 是同一块");
         assert_eq!(wishes[0].fit.kind(), DeviceKind::Phone);

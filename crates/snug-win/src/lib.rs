@@ -13,12 +13,14 @@
 //! | `screenshot` | `ScreenshotService` | `PrintWindow` / `BitBlt` |
 //! | `uu` | `UUSensor` | 覆盖窗口、UIA 控制端表、TCP peer、GameViewerServer 日志 |
 
+pub mod crossdesk;
 pub mod display;
 pub mod driver_health;
 pub mod touch;
 pub mod uia;
 pub mod vdd;
 pub mod vdd_broker;
+pub mod vdd_task;
 mod wide;
 pub mod window;
 pub mod apps;

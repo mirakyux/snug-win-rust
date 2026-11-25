@@ -32,17 +32,20 @@ use snug_core::touch::{
     TouchTranslator,
 };
 use snug_core::{Point, Rect};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_LBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN,
+    CallNextHookEx, DispatchMessageW, GetClipCursor, GetGUIThreadInfo, GetMessageW,
+    GetPhysicalCursorPos, GetSystemMetrics, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, GUITHREADINFO, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_MOUSE_LL, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, LLMHF_INJECTED,
 };
@@ -217,6 +220,8 @@ pub struct HookEngine {
     copy_bubble: Option<Rect>,
     require_injected_flag: bool,
     logged_first_flag: bool,
+    crossdesk_pressed: bool,
+    crossdesk_replay_point: Option<Point>,
 }
 
 impl Default for HookEngine {
@@ -233,6 +238,8 @@ impl Default for HookEngine {
             // C# 默认只接管注入事件（UU 远程模拟出来的鼠标）。
             require_injected_flag: true,
             logged_first_flag: false,
+            crossdesk_pressed: false,
+            crossdesk_replay_point: None,
         }
     }
 }
@@ -273,8 +280,7 @@ impl HookEngine {
     pub fn set_regions(&mut self, regions: Vec<TouchRegion>) {
         self.regions = regions;
         if self.regions.is_empty() {
-            self.active_region = None;
-            self.translator = TouchTranslator::default();
+            self.reset_gesture();
         } else if self.active_region.is_some() {
             let held = self.held_press_point.unwrap_or(Point::ZERO);
             self.active_region = self
@@ -284,6 +290,15 @@ impl HookEngine {
                 .copied()
                 .or_else(|| self.regions.first().copied());
         }
+    }
+
+    fn reset_gesture(&mut self) {
+        self.active_region = None;
+        self.translator = TouchTranslator::default();
+        self.held_press_point = None;
+        self.passthrough_browser_chrome = false;
+        self.crossdesk_pressed = false;
+        self.crossdesk_replay_point = None;
     }
 
     /// 单区域便捷入口（C# `SetRegion`）：`None` 等价于空列表。
@@ -414,6 +429,7 @@ impl HookEngine {
 pub enum Injection {
     MoveTo(Point),
     Button { at: Point, down: bool, right: bool },
+    ReleaseButton { right: bool },
     Wheel { steps: i32 },
     HScroll { steps: i32 },
     CursorTo(Point),
@@ -559,6 +575,92 @@ impl WinInput {
     }
 }
 
+fn projection_pixel(bounds: Rect, point: Point) -> Option<POINT> {
+    if !bounds.contains(point) || point.x >= bounds.max_x() || point.y >= bounds.max_y() {
+        return None;
+    }
+    let x = point.x.floor();
+    let y = point.y.floor();
+    let coordinates = f64::from(i32::MIN)..=f64::from(i32::MAX);
+    (coordinates.contains(&x) && coordinates.contains(&y)).then_some(POINT { x: x as i32, y: y as i32 })
+}
+
+fn projected_desktop_absolute(pixel: POINT, desktop: Rect) -> Option<(i32, i32)> {
+    fn axis(pixel: i32, start: f64, size: f64) -> Option<i32> {
+        let offset = f64::from(pixel) - start;
+        // Windows maps [0, 65536) to virtual desktop pixels. Aim at the center of the pixel interval.
+        if !(1.0..=65536.0).contains(&size) || !(0.0..size).contains(&offset) {
+            return None;
+        }
+        Some(((offset + 0.5) * 65536.0 / size).floor() as i32)
+    }
+
+    Some((axis(pixel.x, desktop.x, desktop.width)?, axis(pixel.y, desktop.y, desktop.height)?))
+}
+
+fn monitor_bounds_at(pixel: POINT) -> Option<Rect> {
+    let handle = unsafe { MonitorFromPoint(pixel, MONITOR_DEFAULTTONULL) };
+    if handle.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(handle, &mut info) }.as_bool() {
+        return None;
+    }
+    let rect = info.rcMonitor;
+    Some(Rect::new(
+        f64::from(rect.left),
+        f64::from(rect.top),
+        f64::from(rect.right - rect.left),
+        f64::from(rect.bottom - rect.top),
+    ))
+}
+
+/// Deliver one explicit projection click. The caller has already verified the display's identity.
+pub fn click_projected_display(bounds: Rect, point: Point) -> bool {
+    let Some(pixel) = projection_pixel(bounds, point) else { return false };
+    let desktop = WinInput::virtual_desktop();
+    let Some((x, y)) = projected_desktop_absolute(pixel, desktop) else { return false };
+    let mut clip = RECT::default();
+    let mut foreground = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    // A clipped cursor or a captured mouse could redirect the click away from the pixel we validated.
+    if unsafe { GetClipCursor(&mut clip) }.is_err()
+        || pixel.x < clip.left || pixel.x >= clip.right || pixel.y < clip.top || pixel.y >= clip.bottom
+        || unsafe { GetGUIThreadInfo(0, &mut foreground) }.is_err() || !foreground.hwndCapture.is_invalid()
+        || unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } < 0
+        || unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) } < 0
+    {
+        return false;
+    }
+
+    let move_flags = MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0
+        | MOUSEEVENTF_MOVE_NOCOALESCE.0;
+    let mut inputs = [
+        WinInput::mouse_input(x, y, 0, move_flags | MOUSEEVENTF_LEFTDOWN.0),
+        WinInput::mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP.0),
+        INPUT::default(),
+    ];
+    let mut cursor = POINT::default();
+    let mut count = 2;
+    if unsafe { GetPhysicalCursorPos(&mut cursor) }.is_ok()
+        && let Some((x, y)) = projected_desktop_absolute(cursor, desktop)
+    {
+        inputs[2] = WinInput::mouse_input(x, y, 0, move_flags);
+        count += 1;
+    }
+    // Read the point's live monitor again just before submitting the ordered batch.
+    if monitor_bounds_at(pixel) != Some(bounds) || WinInput::virtual_desktop() != desktop {
+        return false;
+    }
+    let input_size = std::mem::size_of::<INPUT>() as i32;
+    let sent = unsafe { SendInput(&inputs[..count], input_size) };
+    if sent == 1 {
+        // A short write inserted the press. Release it to avoid a stuck mouse button.
+        WinInput::send(inputs[1]);
+    }
+    sent >= 2
+}
+
 impl InputInjector for WinInput {
     fn apply(&self, injection: Injection) {
         let move_flags =
@@ -577,6 +679,10 @@ impl InputInjector for WinInput {
                 };
                 let (x, y) = Self::absolute(at);
                 Self::send(Self::mouse_input(x, y, 0, move_flags | button));
+            }
+            Injection::ReleaseButton { right } => {
+                let button = if right { MOUSEEVENTF_RIGHTUP.0 } else { MOUSEEVENTF_LEFTUP.0 };
+                Self::send(Self::mouse_input(0, 0, 0, button));
             }
             Injection::Wheel { steps } => {
                 Self::send(Self::mouse_input(0, 0, steps as u32, MOUSEEVENTF_WHEEL.0));
@@ -601,16 +707,61 @@ impl InputInjector for WinInput {
 /// 重放线程收到的一批动作。
 struct ReplayJob {
     actions: Vec<ReplayAction>,
+    route: u32,
+}
+
+struct ReplayButtons {
+    input_route: Arc<AtomicU32>,
+    route: u32,
+    held: [bool; 2],
+}
+
+impl ReplayButtons {
+    fn accept(&mut self, route: u32, injector: &dyn InputInjector) -> bool {
+        let current = self.input_route.load(Ordering::Acquire);
+        if self.route != current {
+            self.release(injector);
+            self.route = current;
+        }
+        current == route
+    }
+
+    fn inject(&mut self, input: Injection, injector: &dyn InputInjector) {
+        if self.route & CROSSDESK_ROUTE != 0
+            && let Injection::Button { down, right, .. } = input
+        {
+            self.held[usize::from(right)] = down;
+        }
+        injector.apply(input);
+    }
+
+    fn release(&mut self, injector: &dyn InputInjector) {
+        for (index, held) in self.held.iter_mut().enumerate() {
+            if std::mem::take(held) {
+                injector.apply(Injection::ReleaseButton { right: index == 1 });
+            }
+        }
+    }
 }
 
 /// 钩子线程与重放线程共享的东西。
 struct HookContext {
     engine: Arc<Mutex<HookEngine>>,
     require_injected_flag: Arc<AtomicBool>,
+    input_route: Arc<AtomicU32>,
     replay: SyncSender<ReplayJob>,
     events: Arc<dyn TouchEvents>,
     started: Instant,
 }
+
+// CrossDesk v1.7.7-20261124 windows_input_marker.h. The marker is an input-routing
+// hint and is only used while Snug has selected an experimental CrossDesk session.
+const CROSSDESK_MOUSE_MARKER: usize = 0x4353_444D;
+
+// The low bit selects CrossDesk. Changing the route or clearing regions also
+// invalidates jobs already queued by the previous gesture.
+const CROSSDESK_ROUTE: u32 = 1;
+const NEXT_GENERATION: u32 = 2;
 
 impl HookContext {
     /// C# `HookCallback` 的 Win32 壳子。
@@ -622,33 +773,79 @@ impl HookContext {
         let point = Point::new(info.pt.x as f64, info.pt.y as f64);
         let injected = info.flags & LLMHF_INJECTED != 0;
         let replay_marked = info.dwExtraInfo == REPLAY_MARKER;
+        let crossdesk = injected && info.dwExtraInfo == CROSSDESK_MOUSE_MARKER;
         // 真实鼠标与自己重放的事件不应等待手势状态锁，更不能被一次慢命中探测拖住。
         // 引擎内保留相同过滤，防止配置切换时仅靠此快照接管不该处理的输入。
-        if replay_marked || (self.require_injected_flag.load(Ordering::Acquire) && !injected) {
+        if replay_marked
+            || crossdesk != (self.input_route.load(Ordering::Acquire) & CROSSDESK_ROUTE != 0)
+            || (self.require_injected_flag.load(Ordering::Acquire) && !injected)
+        {
             return Some(false);
         }
         let now = self.started.elapsed().as_secs_f64();
 
-        let outcome = {
+        let (outcome, route, replay_button_event) = {
             let mut engine = match self.engine.lock() {
                 Ok(engine) => engine,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let route = self.input_route.load(Ordering::Acquire);
+            if crossdesk != (route & CROSSDESK_ROUTE != 0) {
+                return Some(false);
+            }
+            if crossdesk {
+                match kind {
+                    TouchInputKind::Press => engine.crossdesk_pressed = true,
+                    TouchInputKind::Release if engine.crossdesk_pressed => engine.crossdesk_pressed = false,
+                    _ if !engine.crossdesk_pressed => return Some(false),
+                    _ => {}
+                }
+            }
             let hit = if kind == TouchInputKind::Press {
                 engine.passthrough_hit(point)
             } else {
                 BubbleHit::default()
             };
-            engine.on_event(kind, point, now, injected, replay_marked, |_, _| hit)
+            let mut outcome = engine.on_event(kind, point, now, injected, replay_marked, |_, _| hit);
+            let mut replay_button_event = None;
+            if crossdesk && kind == TouchInputKind::Drag {
+                if let Some(previous) = engine.crossdesk_replay_point {
+                    // SendInput can emit a stationary WM_MOUSEMOVE immediately before button-up.
+                    // The replay already placed the pointer here, so only pass the later release.
+                    if point == previous {
+                        return Some(true);
+                    }
+                    engine.crossdesk_replay_point = Some(point);
+                    replay_button_event = Some(Injection::MoveTo(point));
+                    outcome.pass_original = false;
+                } else if outcome.commands.contains(&TouchCommand::ReplayPress) {
+                    engine.crossdesk_replay_point = Some(point);
+                }
+            }
+            if crossdesk
+                && kind == TouchInputKind::Release
+                && engine.crossdesk_replay_point.take().is_some()
+            {
+                replay_button_event = Some(Injection::Button { at: point, down: false, right: false });
+                outcome.pass_original = false;
+            }
+            (outcome, route, replay_button_event)
         };
 
         if outcome.dismiss_bubble {
             self.events.selection_dismissed();
         }
-        if !outcome.commands.is_empty() {
-            let actions = plan_replay(&outcome.commands, kind, outcome.press_origin, point);
+        if !outcome.commands.is_empty() || replay_button_event.is_some() {
+            let mut actions = plan_replay(&outcome.commands, kind, outcome.press_origin, point);
+            if let Some(injection) = replay_button_event {
+                actions.insert(0, ReplayAction::Injection(injection));
+            }
             // 队列满了就丢这一批，和 C# `TryAdd` 返回 false 一样，绝不阻塞钩子。
-            let _ = self.replay.try_send(ReplayJob { actions });
+            let queued = self.replay.try_send(ReplayJob { actions, route });
+            if queued.is_err() && matches!(replay_button_event, Some(Injection::Button { down: false, .. })) {
+                // The replay worker releases the button even if the queue cannot accept its up event.
+                let _ = self.input_route.compare_exchange(route, route.wrapping_add(NEXT_GENERATION), Ordering::AcqRel, Ordering::Acquire);
+            }
         }
 
         Some(!outcome.pass_original)
@@ -687,6 +884,7 @@ struct Worker {
 pub struct TouchHook {
     engine: Arc<Mutex<HookEngine>>,
     require_injected_flag: Arc<AtomicBool>,
+    input_route: Arc<AtomicU32>,
     injector: Arc<dyn InputInjector>,
     events: Arc<dyn TouchEvents>,
     desktop: WinDesktop,
@@ -710,6 +908,7 @@ impl TouchHook {
         Self {
             engine: Arc::new(Mutex::new(engine)),
             require_injected_flag,
+            input_route: Arc::new(AtomicU32::new(0)),
             injector,
             events,
             desktop: WinDesktop,
@@ -737,6 +936,9 @@ impl TouchHook {
                 Err(poisoned) => poisoned.into_inner(),
             };
             engine.set_regions(regions.clone());
+            if regions.is_empty() {
+                self.input_route.fetch_add(NEXT_GENERATION, Ordering::AcqRel);
+            }
         }
         if regions.is_empty() {
             self.stop();
@@ -768,6 +970,26 @@ impl TouchHook {
         self.lock_engine().set_require_injected_flag(require);
     }
 
+    /// Select the CrossDesk input route for an experimental CrossDesk session.
+    pub fn set_crossdesk_enabled(&self, enabled: bool) {
+        let selected = u32::from(enabled);
+        if self.input_route.load(Ordering::Acquire) & CROSSDESK_ROUTE == selected {
+            return;
+        }
+        let mut engine = self.lock_engine();
+        let mut route = self.input_route.load(Ordering::Acquire);
+        while route & CROSSDESK_ROUTE != selected {
+            let next = (route & !CROSSDESK_ROUTE).wrapping_add(NEXT_GENERATION) | selected;
+            match self.input_route.compare_exchange(route, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    engine.reset_gesture();
+                    break;
+                }
+                Err(actual) => route = actual,
+            }
+        }
+    }
+
     fn lock_engine(&self) -> std::sync::MutexGuard<'_, HookEngine> {
         match self.engine.lock() {
             Ok(engine) => engine,
@@ -794,6 +1016,7 @@ impl TouchHook {
         let context = Arc::new(HookContext {
             engine: self.engine.clone(),
             require_injected_flag: self.require_injected_flag.clone(),
+            input_route: self.input_route.clone(),
             replay: replay_tx,
             events: self.events.clone(),
             started: Instant::now(),
@@ -849,16 +1072,20 @@ impl TouchHook {
         let replay_injector = self.injector.clone();
         let replay_events = self.events.clone();
         let replay_desktop = self.desktop;
+        let input_route = self.input_route.clone();
         let replay_thread = std::thread::Builder::new()
             .name("SnugWin.TouchReplay".to_string())
             .spawn(move || {
                 let mut accumulator = ScrollAccumulator::default();
+                let route = input_route.load(Ordering::Acquire);
+                let mut buttons = ReplayButtons { input_route, route, held: [false; 2] };
                 loop {
+                    buttons.accept(buttons.route, replay_injector.as_ref());
                     let coasting = match replay_engine.lock() {
                         Ok(engine) => engine.is_coasting(),
                         Err(poisoned) => poisoned.into_inner().is_coasting(),
                     };
-                    let timeout = if coasting {
+                    let timeout = if coasting || buttons.held.iter().any(|held| *held) {
                         frame_interval()
                     } else {
                         Duration::from_secs(30)
@@ -870,7 +1097,8 @@ impl TouchHook {
                             &replay_desktop,
                             &replay_events,
                             &mut accumulator,
-                            &job.actions,
+                            &job,
+                            &mut buttons,
                         ),
                         Err(RecvTimeoutError::Timeout) => {
                             let step = {
@@ -887,6 +1115,7 @@ impl TouchHook {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                buttons.release(replay_injector.as_ref());
             });
 
         let Ok(replay_thread) = replay_thread else {
@@ -953,11 +1182,15 @@ fn run_actions(
     desktop: &WinDesktop,
     events: &Arc<dyn TouchEvents>,
     accumulator: &mut ScrollAccumulator,
-    actions: &[ReplayAction],
+    job: &ReplayJob,
+    buttons: &mut ReplayButtons,
 ) {
-    for action in actions {
+    for action in &job.actions {
+        if !buttons.accept(job.route, injector.as_ref()) {
+            return;
+        }
         match action {
-            ReplayAction::Injection(injection) => injector.apply(*injection),
+            ReplayAction::Injection(injection) => buttons.inject(*injection, injector.as_ref()),
             ReplayAction::Scroll(step) => apply_scroll(injector, accumulator, step),
             ReplayAction::CloseWindow { at } => {
                 // 关闭按钮的位置由界面那边塞进 region（C# 从 `region?.CloseButton` 取）。
@@ -1021,6 +1254,34 @@ mod tests {
     }
 
     #[test]
+    fn projected_pixels_stay_inside_the_virtual_monitor() {
+        let bounds = Rect::new(-1080.0, -200.0, 1080.0, 1920.0);
+        assert_eq!(projection_pixel(bounds, Point::new(-1080.0, -200.0)), Some(POINT { x: -1080, y: -200 }));
+        assert_eq!(projection_pixel(bounds, Point::new(-0.01, 1719.99)), Some(POINT { x: -1, y: 1719 }));
+        for point in [Point::new(0.0, 700.0), Point::new(-500.0, 1720.0), Point::new(-1080.01, 700.0), Point::new(f64::NAN, 700.0)] {
+            assert!(projection_pixel(bounds, point).is_none());
+        }
+    }
+
+    #[test]
+    fn projected_absolute_positions_round_trip_virtual_desktop_pixels() {
+        for (width, height) in [(1, 1), (3000, 2170), (65536, 1080)] {
+            let desktop = Rect::new(-1080.0, -250.0, f64::from(width), f64::from(height));
+            for dx in 0..width {
+                let dy = dx % height;
+                let pixel = POINT { x: dx - 1080, y: dy - 250 };
+                let (x, y) = projected_desktop_absolute(pixel, desktop).unwrap();
+                assert!((0..=65535).contains(&x));
+                assert!((0..=65535).contains(&y));
+                assert_eq!((i64::from(x) * i64::from(width)) >> 16, i64::from(dx));
+                assert_eq!((i64::from(y) * i64::from(height)) >> 16, i64::from(dy));
+            }
+        }
+        let too_wide = Rect::new(0.0, 0.0, 65537.0, 100.0);
+        assert!(projected_desktop_absolute(POINT { x: 0, y: 0 }, too_wide).is_none());
+    }
+
+    #[test]
     fn hook_kind_maps_mouse_messages() {
         assert_eq!(hook_input_kind(WM_LBUTTONDOWN), Some(TouchInputKind::Press));
         assert_eq!(hook_input_kind(WM_MOUSEMOVE), Some(TouchInputKind::Drag));
@@ -1042,6 +1303,7 @@ mod tests {
             let context = HookContext {
                 engine: engine.clone(),
                 require_injected_flag: Arc::new(AtomicBool::new(require_injected)),
+                input_route: Arc::new(AtomicU32::new(0)),
                 replay,
                 events: Arc::new(NoopEvents),
                 started: Instant::now(),
@@ -1086,6 +1348,110 @@ mod tests {
     }
 
     #[test]
+    fn crossdesk_intercepts_only_its_own_button_gestures_when_selected() {
+        let hook = TouchHook::with_parts(Arc::new(WinInput), Arc::new(NoopEvents));
+        hook.engine.lock().unwrap().set_region(Some(region()));
+        let (replay, receiver) = mpsc::sync_channel(REPLAY_QUEUE);
+        let context = HookContext {
+            engine: hook.engine.clone(),
+            require_injected_flag: hook.require_injected_flag.clone(),
+            input_route: hook.input_route.clone(),
+            replay,
+            events: Arc::new(NoopEvents),
+            started: Instant::now(),
+        };
+        let mut info = MSLLHOOKSTRUCT::default();
+        info.pt.x = 300;
+        info.pt.y = 350;
+        info.flags = LLMHF_INJECTED;
+        info.dwExtraInfo = CROSSDESK_MOUSE_MARKER;
+        assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(false));
+
+        hook.set_crossdesk_enabled(true);
+        assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(false));
+        assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(false));
+        assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(true));
+        assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
+        assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(true));
+        assert!(receiver.try_recv().is_ok(), "one translated tap");
+        assert!(receiver.try_recv().is_err(), "no duplicate tap from the preceding cursor move");
+
+        info.dwExtraInfo = 0;
+        assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(false));
+        hook.set_crossdesk_enabled(false);
+        assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(true));
+    }
+
+    #[test]
+    fn crossdesk_replays_drag_release_in_order_and_releases_on_provider_switch() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Injection>>);
+        impl InputInjector for Recorder {
+            fn apply(&self, injection: Injection) {
+                self.0.lock().unwrap().push(injection);
+            }
+        }
+        let record = Arc::new(Recorder::default());
+        let injector: Arc<dyn InputInjector> = record.clone();
+        let hook = TouchHook::with_parts(injector.clone(), Arc::new(NoopEvents));
+        hook.engine.lock().unwrap().set_region(Some(region()));
+        hook.set_crossdesk_enabled(true);
+        hook.set_options(TouchOptions { allow_scroll: false, ..Default::default() });
+        let (replay, receiver) = mpsc::sync_channel(REPLAY_QUEUE);
+        let context = HookContext {
+            engine: hook.engine.clone(),
+            require_injected_flag: hook.require_injected_flag.clone(),
+            input_route: hook.input_route.clone(),
+            replay,
+            events: Arc::new(NoopEvents),
+            started: Instant::now(),
+        };
+        let mut info = MSLLHOOKSTRUCT { flags: LLMHF_INJECTED, dwExtraInfo: CROSSDESK_MOUSE_MARKER, ..Default::default() };
+        let mut start_drag = || {
+            info.pt.x = 300;
+            info.pt.y = 350;
+            assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(true));
+            info.pt.y = 410;
+            assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
+            assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
+            assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(true));
+            let drag = receiver.try_recv().unwrap();
+            let release = receiver.try_recv().unwrap();
+            assert!(receiver.try_recv().is_err(), "stationary input must not enqueue a replay");
+            (drag, release)
+        };
+        let mut buttons = ReplayButtons {
+            input_route: hook.input_route.clone(),
+            route: hook.input_route.load(Ordering::Acquire),
+            held: [false; 2],
+        };
+        let mut accumulator = ScrollAccumulator::default();
+        let mut replay = |job: &ReplayJob| {
+            run_actions(&injector, &hook.engine, &hook.desktop, &hook.events, &mut accumulator, job, &mut buttons);
+        };
+
+        let (down, up) = start_drag();
+        replay(&down);
+        replay(&up);
+        let mut output = record.0.lock().unwrap();
+        assert_eq!(std::mem::take(&mut *output), vec![
+            Injection::Button { at: Point::new(300.0, 350.0), down: true, right: false },
+            Injection::MoveTo(Point::new(300.0, 410.0)),
+            Injection::Button { at: Point::new(300.0, 410.0), down: false, right: false },
+        ]);
+        drop(output);
+
+        let (down, up) = start_drag();
+        replay(&down);
+        hook.set_crossdesk_enabled(false);
+        replay(&up);
+        replay(&down);
+        let output = record.0.lock().unwrap();
+        assert_eq!(output.len(), 3, "stale jobs must not move or press again");
+        assert_eq!(output.last(), Some(&Injection::ReleaseButton { right: false }));
+    }
+
+    #[test]
     fn dispatch_uses_known_passthrough_rectangles_without_a_desktop_probe() {
         let hook = TouchHook::with_parts(Arc::new(WinInput), Arc::new(NoopEvents));
         hook.engine.lock().unwrap().set_region(Some(region()));
@@ -1104,6 +1470,7 @@ mod tests {
         let context = HookContext {
             engine: hook.engine.clone(),
             require_injected_flag: hook.require_injected_flag.clone(),
+            input_route: hook.input_route.clone(),
             replay,
             events: Arc::new(NoopEvents),
             started: Instant::now(),

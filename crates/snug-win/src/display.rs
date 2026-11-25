@@ -19,9 +19,20 @@ use snug_core::desk::{PhoneDisplays, PhoneScreenErrorKind, PhoneScreenException}
 use snug_core::store::OwnedDisplayStore;
 use snug_core::{DisplayModeInfo, OtherDisplay, Paths, Point, Rect, ScreenFit};
 use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_D_JPN, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_BASE_TYPE, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, QDC_ONLY_ACTIVE_PATHS, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
 };
@@ -128,6 +139,47 @@ fn is_virtual_monitor(monitor: &MonitorSnapshot) -> bool {
     device.contains("virtual")
         || friendly.contains("virtudisplay")
         || friendly.contains("virtual")
+}
+
+fn monitor_at_point(monitors: &[MonitorSnapshot], point: Point) -> Option<&MonitorSnapshot> {
+    let mut matching = monitors.iter().filter(|monitor| {
+        // Windows coordinates put the shared edge on the display to its right or below.
+        point.x >= monitor.bounds.min_x()
+            && point.x < monitor.bounds.max_x()
+            && point.y >= monitor.bounds.min_y()
+            && point.y < monitor.bounds.max_y()
+    });
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn preferred_monitor(
+    monitors: &[MonitorSnapshot],
+    preferred: Option<Point>,
+) -> Option<&MonitorSnapshot> {
+    preferred
+        .and_then(|point| monitor_at_point(monitors, point))
+        .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
+        .or_else(|| monitors.first())
+}
+
+fn lost_physical_display<'a>(
+    before: &'a [MonitorSnapshot],
+    current: &[MonitorSnapshot],
+) -> Option<&'a MonitorSnapshot> {
+    let is_physical = |monitor: &MonitorSnapshot| {
+        monitor.virtual_display_id.is_none() && !is_virtual_monitor(monitor)
+    };
+    before.iter().filter(|monitor| is_physical(monitor)).find(|previous| {
+        !current.iter().filter(|monitor| is_physical(monitor)).any(|monitor| {
+            let same_output = if !previous.adapter_id.is_zero() && !monitor.adapter_id.is_zero() {
+                previous.adapter_id == monitor.adapter_id && previous.source_id == monitor.source_id
+            } else {
+                previous.device_name.eq_ignore_ascii_case(&monitor.device_name)
+            };
+            same_output && (!previous.is_primary || monitor.is_primary)
+        })
+    })
 }
 
 /// C# `GetDpiScalePercent` 的反算：把 CCD 报回的相对档位换成百分比。
@@ -333,6 +385,16 @@ pub trait DisplayApi: Send {
     fn has_display_mode(&self, device_name: &str, width: i32, height: i32) -> bool;
     /// 改分辨率（C# `SetResolution`）。
     fn set_resolution(&self, device_name: &str, width: i32, height: i32, refresh_rate: f64) -> bool;
+    /// 临时应用模式。平台不支持时由调用方重新核对归属，再走常规模式写入。
+    fn set_temporary_resolution(
+        &self,
+        _device_name: &str,
+        _width: i32,
+        _height: i32,
+        _refresh_rate: f64,
+    ) -> bool {
+        false
+    }
     /// 改 DPI 缩放（C# `SetDpiScalePercent`）。
     fn set_dpi_scale(&self, adapter_id: AdapterLuid, source_id: u32, percent: i32) -> bool;
     /// 把"已经到了但没启用"的虚拟屏扩展成桌面的一块（C# `TryAttachVirtualDisplay`）。
@@ -397,6 +459,8 @@ pub struct Timings {
     pub resolution_settle: Duration,
     /// 启动清理之后等驱动反映（C# 300ms）。
     pub cleanup_settle: Duration,
+    /// 连续向驱动提交建屏或换比例请求时的最短间隔。
+    pub modeset_interval: Duration,
 }
 
 impl Default for Timings {
@@ -411,6 +475,7 @@ impl Default for Timings {
             reshape_poll: Duration::from_millis(100),
             resolution_settle: Duration::from_millis(150),
             cleanup_settle: Duration::from_millis(300),
+            modeset_interval: Duration::from_secs(2),
         }
     }
 }
@@ -466,6 +531,7 @@ struct PhoneScreen<A: DisplayApi, V: VirtualDisplays> {
     api: A,
     ipc: V,
     timings: Timings,
+    last_modeset: Option<Instant>,
     maps: Arc<Mutex<ScreenMaps>>,
     /// 归属记录（C# v1.3.0 `_ownedStore`）：只记本程序建的屏，启动清理只拆这些。
     /// `None` = 不记账（内存版构造函数、单测用）。
@@ -486,7 +552,21 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         maps: Arc<Mutex<ScreenMaps>>,
         owned: Option<OwnedDisplayStore>,
     ) -> Self {
-        Self { api, ipc, timings, maps, owned }
+        Self { api, ipc, timings, last_modeset: None, maps, owned }
+    }
+
+    fn wait_for_modeset_cooldown(&self) {
+        if let Some(previous) = self.last_modeset {
+            sleep_for(self.timings.modeset_interval.saturating_sub(previous.elapsed()));
+        }
+    }
+
+    fn check_physical_displays(&self, before: &[MonitorSnapshot]) -> Result<(), String> {
+        let current = self.api.active_monitors();
+        if let Some(display) = lost_physical_display(before, &current) {
+            return Err(format!("实体屏 {} 已离线或原主屏身份发生变化", display.friendly_name));
+        }
+        Ok(())
     }
 
     /// 启动时清掉上次崩溃留下的虚拟屏（C# v1.3.0 `CleanupOrphansAsync`）。
@@ -546,6 +626,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         fit: ScreenFit,
         name: Option<&str>,
     ) -> Result<u32, PhoneScreenException> {
+        self.wait_for_modeset_cooldown();
+        let before_monitors = self.api.active_monitors();
         if !self.api.driver_pipe_available() && !self.api.restart_virtual_display_device() {
             return Err(PhoneScreenException::with_detail(
                 PhoneScreenErrorKind::CreateFailed,
@@ -561,7 +643,6 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(MONITOR_NAME);
 
-        let before_monitors = self.api.active_monitors();
         let existing: HashSet<String> = before_monitors
             .iter()
             .map(|m| normalized(&m.device_name))
@@ -583,21 +664,32 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             {
                 continue;
             }
+            self.wait_for_modeset_cooldown();
+            self.check_physical_displays(&before_monitors).map_err(|detail| {
+                PhoneScreenException::with_detail(PhoneScreenErrorKind::CreateFailed, detail)
+            })?;
             let monitor = VddMonitor {
                 id: candidate,
                 name: Some(vdd_name.to_string()),
                 enabled: true,
                 modes: modes.clone(),
             };
-            if let Err(error) = self.ipc.notify(&[monitor]) {
+            let submitted = self.ipc.notify(&[monitor]);
+            self.last_modeset = Some(Instant::now());
+            if let Err(error) = submitted {
                 // C# `PhoneDisplayService.cs:73`：`Log.Warn($"手机屏（id={candidateId}）IPC Notify 失败：{ex.Message}")`
                 // 这一行是排障关键：没有它，「Notify 全被驱动拒了」和「Notify 成功但驱动
                 // 没把屏挂上来」在日志里长得一模一样。
                 crate::warn(&format!("手机屏（id={candidate}）IPC Notify 失败：{error}"));
                 continue;
             }
-            let Some(snapshot) =
-                self.wait_for_online(&existing, candidate, base_width, base_height)
+            let Some(snapshot) = self.wait_for_online(
+                &before_monitors,
+                &existing,
+                candidate,
+                base_width,
+                base_height,
+            )
             else {
                 // C# `6f548dd`：超时后**不要** Remove 这个 id。那个 id 可能对应 C# 版
                 // 或别的程序建的屏（同机跑两版时很常见），误删会把别人的手机屏拆掉。
@@ -606,6 +698,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                     "手机屏（id={candidate}）创建后 {}s 内未在 Windows 上线，跳过该候选 ID（不移除未知设备）",
                     self.timings.online.as_secs()
                 ));
+                self.check_physical_displays(&before_monitors).map_err(|detail| {
+                    PhoneScreenException::with_detail(PhoneScreenErrorKind::CreateFailed, detail)
+                })?;
                 continue;
             };
             {
@@ -618,19 +713,23 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             if let Some(store) = &self.owned {
                 store.record_owned(candidate);
             }
-            if !self.set_width(candidate, fit.base_width()) {
+            let mode = self.check_physical_displays(&before_monitors).and_then(|()| {
+                if !self.set_width(candidate, fit.base_width()) {
+                    return Err(format!(
+                        "手机屏 #{candidate} 未能应用并确认目标分辨率 {base_width}×{base_height} @ 60 Hz"
+                    ));
+                }
+                self.check_physical_displays(&before_monitors)
+            });
+            if let Err(detail) = mode {
                 let retired = self.retire(candidate);
                 if !retired {
                     crate::warn(&format!(
-                        "手机屏 #{candidate} 模式应用失败后尚未下线，保留归属以便重试"
+                        "手机屏 #{candidate} 建屏失败后尚未下线，保留归属以便重试"
                     ));
                 }
-                let error = PhoneScreenException::with_detail(
-                    PhoneScreenErrorKind::CreateFailed,
-                    format!(
-                        "手机屏 #{candidate} 未能应用并确认目标分辨率 {base_width}×{base_height} @ 60 Hz"
-                    ),
-                );
+                let error =
+                    PhoneScreenException::with_detail(PhoneScreenErrorKind::CreateFailed, detail);
                 return Err(error.with_pending_display(candidate));
             }
             return Ok(candidate);
@@ -641,7 +740,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 等新屏上线，必要时主动把它扩展成桌面（C# `WaitForOnlineAsync`）。
     fn wait_for_online(
-        &self,
+        &mut self,
+        before_monitors: &[MonitorSnapshot],
         existing: &HashSet<String>,
         driver_id: u32,
         base_width: i32,
@@ -652,6 +752,10 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             let all = self.api.active_monitors();
             if let Some(found) = pick_new_monitor(existing, &all, driver_id) {
                 return Some(found);
+            }
+            if lost_physical_display(before_monitors, &all).is_some() {
+                sleep_for(self.timings.online_poll);
+                continue;
             }
 
             let right_edge = all
@@ -664,6 +768,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 .try_attach_virtual_display(driver_id, base_width, base_height, right_edge, 0)
                 .is_some()
             {
+                self.last_modeset = Some(Instant::now());
                 sleep_for(self.timings.attach_settle);
                 let attached_monitors = self.api.active_monitors();
                 if let Some(attached) = pick_new_monitor(existing, &attached_monitors, driver_id) {
@@ -681,6 +786,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         let Some(old_fit) = lock_maps(&self.maps).fits.get(&display_id).cloned() else {
             return false;
         };
+        self.wait_for_modeset_cooldown();
+        let before_monitors = self.api.active_monitors();
         let Some(before) = bound_monitor_of(&self.api, &self.maps, display_id) else {
             crate::warn(&format!("手机屏 #{display_id} 身份无法确认，未改变分辨率"));
             return false;
@@ -694,12 +801,19 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         };
 
         let (width, height) = fit.pixel_size(fit.base_width());
-        if modes_sent
-            && self.wait_for_mode(display_id, width, height)
-            && self.apply_fit(display_id, &fit, fit.base_width())
-        {
-            lock_maps(&self.maps).fits.insert(display_id, fit);
-            return true;
+        if modes_sent && self.wait_for_mode(display_id, width, height) {
+            let applied = self.check_physical_displays(&before_monitors).and_then(|()| {
+                let applied = self.apply_fit(display_id, &fit, fit.base_width());
+                self.check_physical_displays(&before_monitors).map(|()| applied)
+            });
+            match applied {
+                Ok(true) => {
+                    lock_maps(&self.maps).fits.insert(display_id, fit);
+                    return true;
+                }
+                Ok(false) => {}
+                Err(detail) => crate::warn(&detail),
+            }
         }
 
         crate::warn(&format!(
@@ -729,7 +843,9 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             modes: build_modes(fit),
         };
         // Let the connected client choose the protocol. It may have changed since the last call.
-        self.ipc.replace_legacy(&[display_id], &[monitor])
+        let submitted = self.ipc.replace_legacy(&[display_id], &[monitor]);
+        self.last_modeset = Some(Instant::now());
+        submitted
     }
 
     fn refresh_binding(&self, display_id: u32) -> Option<MonitorSnapshot> {
@@ -902,7 +1018,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         self.apply_fit(display_id, &fit, width)
     }
 
-    fn apply_fit(&self, display_id: u32, fit: &ScreenFit, width: i32) -> bool {
+    fn apply_fit(&mut self, display_id: u32, fit: &ScreenFit, width: i32) -> bool {
         let (pixel_width, pixel_height) = fit.pixel_size(width);
         self.apply_mode(
             display_id,
@@ -915,7 +1031,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         )
     }
 
-    fn apply_mode(&self, display_id: u32, mode: DisplayModeInfo) -> bool {
+    fn apply_mode(&mut self, display_id: u32, mode: DisplayModeInfo) -> bool {
         let Some(current) = bound_monitor_of(&self.api, &self.maps, display_id) else {
             crate::warn(&format!(
                 "手机屏 #{display_id} 的显示器身份已失效，未修改模式"
@@ -926,13 +1042,27 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         let mut after = current;
         if needs_resolution {
             let started = std::time::Instant::now();
-            if !self.api.set_resolution(
+            let applied = self.api.set_temporary_resolution(
                 &after.device_name,
                 mode.width,
                 mode.height,
                 mode.refresh_rate,
-            ) {
-                return false;
+            );
+            self.last_modeset = Some(Instant::now());
+            if !applied {
+                let Some(current) = bound_monitor_of(&self.api, &self.maps, display_id) else {
+                    return false;
+                };
+                let applied = self.api.set_resolution(
+                    &current.device_name,
+                    mode.width,
+                    mode.height,
+                    mode.refresh_rate,
+                );
+                self.last_modeset = Some(Instant::now());
+                if !applied {
+                    return false;
+                }
             }
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if ms >= 200.0 {
@@ -1286,12 +1416,103 @@ fn virtual_display_id_from_instance_id(instance: &str) -> Option<u32> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WinDisplay;
 
+#[derive(PartialEq)]
+struct MonitorGeometry {
+    handle: usize,
+    device_name: String,
+    bounds: Rect,
+    work_area: Rect,
+    is_primary: bool,
+}
+
+/// The outputs verified by CCD, tied to the GDI geometry active during that check.
+pub struct PhysicalMonitors {
+    monitors: Vec<MonitorSnapshot>,
+    geometry: Vec<MonitorGeometry>,
+}
+
+impl PhysicalMonitors {
+    pub fn contains_physical_point(&self, point: Point) -> bool {
+        monitor_at_point(&self.monitors, point).is_some()
+    }
+
+    pub fn preferred_work_area(&self, point: Point) -> Option<Rect> {
+        preferred_monitor(&self.monitors, Some(point)).map(|monitor| monitor.work_area)
+    }
+
+    /// Fast check for monitor movement, removal, or taskbar changes before placing a window.
+    pub fn geometry_is_current(&self) -> bool {
+        self.geometry == monitor_geometry()
+    }
+}
+
+fn is_direct_physical_output(technology: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> bool {
+    matches!(
+        technology,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_D_JPN
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL
+            | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+    )
+}
+
+fn physical_target(path: &DISPLAYCONFIG_PATH_INFO, monitor_path: &str) -> bool {
+    if !path.targetInfo.targetAvailable.as_bool()
+        || monitor_path.is_empty()
+        || cherry_monitor_registry_instance(monitor_path).is_some()
+        || !is_direct_physical_output(path.targetInfo.outputTechnology)
+    {
+        return false;
+    }
+    // The path can report a wireless sink's own connector instead of Miracast.
+    let mut base = DISPLAYCONFIG_TARGET_BASE_TYPE {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE,
+            size: std::mem::size_of::<DISPLAYCONFIG_TARGET_BASE_TYPE>() as u32,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    (unsafe { DisplayConfigGetDeviceInfo(&mut base.header) } == 0)
+        && is_direct_physical_output(base.baseOutputTechnology)
+}
+
 impl WinDisplay {
     pub const fn new() -> Self {
         Self
     }
 
-    fn ccd_sources(&self) -> HashMap<String, CcdSource> {
+    /// 优先使用指定位置所在的实体屏，其次是实体主屏或第一块已确认的实体屏。
+    pub fn preferred_physical_monitor(&self, preferred: Option<Point>) -> Option<MonitorSnapshot> {
+        preferred_monitor(&self.desktop_monitors(true), preferred).cloned()
+    }
+
+    pub fn verified_physical_monitors(&self) -> Option<PhysicalMonitors> {
+        let geometry = monitor_geometry();
+        let monitors = self.desktop_monitors(true);
+        (!monitors.is_empty() && geometry == monitor_geometry())
+            .then_some(PhysicalMonitors { monitors, geometry })
+    }
+
+    /// 返回物理像素位置所在的、已确认属于实体输出的工作区。
+    pub fn physical_monitor_at(&self, point: Point) -> Option<MonitorSnapshot> {
+        monitor_at_point(&self.desktop_monitors(true), point).cloned()
+    }
+
+    fn ccd_sources(&self, physical_only: bool) -> HashMap<String, CcdSource> {
         let mut map = HashMap::new();
         // 对 C# 的有意偏离：C# 只查一次；如果 GetDisplayConfigBufferSizes 与
         // QueryDisplayConfig 之间正好热插拔，整次采样会失败——所有屏的
@@ -1330,14 +1551,6 @@ impl WinDisplay {
             target.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
             target.header.adapterId = path.targetInfo.adapterId;
             target.header.id = path.targetInfo.id;
-            let (friendly, virtual_display_id) = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0 {
-                (
-                    from_wide(&target.monitorFriendlyDeviceName),
-                    virtual_display_id_from_device_path(&from_wide(&target.monitorDevicePath)),
-                )
-            } else {
-                (gdi_name.clone(), None)
-            };
             let source_is_unique = source_path_counts
                 .get(&(
                     path.sourceInfo.adapterId.LowPart,
@@ -1346,6 +1559,22 @@ impl WinDisplay {
                 ))
                 .copied()
                 == Some(1);
+            let (friendly, virtual_display_id) =
+                if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0 {
+                    let monitor_path = from_wide(&target.monitorDevicePath);
+                    // A mirrored source could send the same pixels to a virtual target.
+                    if physical_only && (!source_is_unique || !physical_target(&path, &monitor_path)) {
+                        continue;
+                    }
+                    (
+                        from_wide(&target.monitorFriendlyDeviceName),
+                        virtual_display_id_from_device_path(&monitor_path),
+                    )
+                } else if physical_only {
+                    continue;
+                } else {
+                    (gdi_name.clone(), None)
+                };
             let virtual_display_id = if source_is_unique { virtual_display_id } else { None };
 
             let adapter_id =
@@ -1397,35 +1626,73 @@ impl WinDisplay {
     }
 }
 
-impl DisplayApi for WinDisplay {
-    fn active_monitors(&self) -> Vec<MonitorSnapshot> {
-        let mut handles: Vec<HMONITOR> = Vec::new();
-        unsafe {
-            let _ = EnumDisplayMonitors(
-                None,
-                None,
-                Some(collect_monitor),
-                LPARAM(&mut handles as *mut Vec<HMONITOR> as isize),
-            );
+fn change_gdi_resolution(
+    device_name: &str,
+    width: i32,
+    height: i32,
+    refresh_rate: f64,
+    flags: CDS_TYPE,
+) -> bool {
+    let wide_name = to_wide(device_name);
+    let name = PCWSTR(wide_name.as_ptr());
+    let mut dev_mode = DEVMODEW::default();
+    dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    if !unsafe {
+        EnumDisplaySettingsExW(
+            name,
+            ENUM_CURRENT_SETTINGS,
+            &mut dev_mode,
+            ENUM_DISPLAY_SETTINGS_FLAGS(0),
+        )
+    }
+    .as_bool()
+    {
+        return false;
+    }
+
+    dev_mode.dmPelsWidth = width.max(0) as u32;
+    dev_mode.dmPelsHeight = height.max(0) as u32;
+    let mut fields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    if refresh_rate > 0.0 {
+        // C# `(uint)Math.Round(refreshRate)`：银行家舍入。
+        dev_mode.dmDisplayFrequency = round_ties_even(refresh_rate) as u32;
+        fields = fields | DM_DISPLAYFREQUENCY;
+    }
+    dev_mode.dmFields = fields;
+
+    unsafe {
+        let result = ChangeDisplaySettingsExW(
+            name,
+            Some(&dev_mode as *const DEVMODEW),
+            None,
+            flags,
+            None,
+        );
+        if result == DISP_CHANGE_SUCCESSFUL {
+            true
+        } else {
+            // C# `Log.Warn($"ChangeDisplaySettingsEx({deviceName}, {w}x{h}) 返回 {res}")`
+            crate::warn(&format!(
+                "ChangeDisplaySettingsEx({device_name}, {width}x{height}) 返回 {}",
+                result.0
+            ));
+            false
         }
+    }
+}
 
-        let ccd = self.ccd_sources();
+impl WinDisplay {
+    fn desktop_monitors(&self, physical_only: bool) -> Vec<MonitorSnapshot> {
+        let geometry = monitor_geometry();
+        let ccd = self.ccd_sources(physical_only);
         let device_strings = self.device_strings();
-        let mut monitors = Vec::with_capacity(handles.len());
+        let mut monitors = Vec::with_capacity(geometry.len());
 
-        for handle in handles {
-            let mut info = MONITORINFOEXW::default();
-            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-            if !unsafe { GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) }
-                .as_bool()
-            {
+        for MonitorGeometry { device_name, bounds, work_area, is_primary, .. } in geometry {
+            let source = ccd.get(&normalized(&device_name));
+            if physical_only && (source.is_none() || work_area.width <= 0.0 || work_area.height <= 0.0) {
                 continue;
             }
-
-            let device_name = from_wide(&info.szDevice);
-            let bounds = rect_of(info.monitorInfo.rcMonitor);
-            let work_area = rect_of(info.monitorInfo.rcWork);
-            let is_primary = info.monitorInfo.dwFlags & 1 != 0;
 
             let mut width = bounds.width as i32;
             let mut height = bounds.height as i32;
@@ -1450,7 +1717,6 @@ impl DisplayApi for WinDisplay {
                 }
             }
 
-            let source = ccd.get(&normalized(&device_name));
             let (adapter_id, source_id, friendly_name) = match source {
                 Some(source) => (source.adapter_id, source.source_id, {
                     if source.friendly_name.trim().is_empty() {
@@ -1474,7 +1740,7 @@ impl DisplayApi for WinDisplay {
                 .unwrap_or_default();
             let virtual_display_id = source.and_then(|source| source.virtual_display_id);
 
-            monitors.push(MonitorSnapshot {
+            let monitor = MonitorSnapshot {
                 stable_id: stable_id(&device_name, adapter_id, source_id),
                 device_name,
                 friendly_name,
@@ -1486,9 +1752,25 @@ impl DisplayApi for WinDisplay {
                 mode: DisplayModeInfo { width, height, refresh_rate, dpi_scale_percent },
                 adapter_id,
                 source_id,
-            });
+            };
+            if physical_only
+                && (monitor.virtual_display_id.is_some()
+                    || monitor.device_string.is_empty()
+                    || contains_ignore_case(&monitor.device_string, "GameViewer")
+                    || contains_ignore_case(&monitor.friendly_name, "GameViewer")
+                    || is_virtual_monitor(&monitor))
+            {
+                continue;
+            }
+            monitors.push(monitor);
         }
         monitors
+    }
+}
+
+impl DisplayApi for WinDisplay {
+    fn active_monitors(&self) -> Vec<MonitorSnapshot> {
+        self.desktop_monitors(false)
     }
 
     fn has_display_mode(&self, device_name: &str, width: i32, height: i32) -> bool {
@@ -1518,52 +1800,17 @@ impl DisplayApi for WinDisplay {
     }
 
     fn set_resolution(&self, device_name: &str, width: i32, height: i32, refresh_rate: f64) -> bool {
-        let wide_name = to_wide(device_name);
-        let name = PCWSTR(wide_name.as_ptr());
-        let mut dev_mode = DEVMODEW::default();
-        dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        if !unsafe {
-            EnumDisplaySettingsExW(
-                name,
-                ENUM_CURRENT_SETTINGS,
-                &mut dev_mode,
-                ENUM_DISPLAY_SETTINGS_FLAGS(0),
-            )
-        }
-        .as_bool()
-        {
-            return false;
-        }
+        change_gdi_resolution(device_name, width, height, refresh_rate, CDS_UPDATEREGISTRY)
+    }
 
-        dev_mode.dmPelsWidth = width.max(0) as u32;
-        dev_mode.dmPelsHeight = height.max(0) as u32;
-        let mut fields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        if refresh_rate > 0.0 {
-            // C# `(uint)Math.Round(refreshRate)`：银行家舍入。
-            dev_mode.dmDisplayFrequency = round_ties_even(refresh_rate) as u32;
-            fields = fields | DM_DISPLAYFREQUENCY;
-        }
-        dev_mode.dmFields = fields;
-
-        unsafe {
-            let result = ChangeDisplaySettingsExW(
-                name,
-                Some(&dev_mode as *const DEVMODEW),
-                None,
-                CDS_UPDATEREGISTRY,
-                None,
-            );
-            if result == DISP_CHANGE_SUCCESSFUL {
-                true
-            } else {
-                // C# `Log.Warn($"ChangeDisplaySettingsEx({deviceName}, {w}x{h}) 返回 {res}")`
-                crate::warn(&format!(
-                    "ChangeDisplaySettingsEx({device_name}, {width}x{height}) 返回 {}",
-                    result.0
-                ));
-                false
-            }
-        }
+    fn set_temporary_resolution(
+        &self,
+        device_name: &str,
+        width: i32,
+        height: i32,
+        refresh_rate: f64,
+    ) -> bool {
+        change_gdi_resolution(device_name, width, height, refresh_rate, CDS_TYPE(0))
     }
 
     fn set_dpi_scale(&self, adapter_id: AdapterLuid, source_id: u32, percent: i32) -> bool {
@@ -1772,6 +2019,30 @@ use std::os::windows::process::CommandExt;
 
 /// `CREATE_NO_WINDOW`：跑 `pnputil` 时不闪黑框。
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn monitor_geometry() -> Vec<MonitorGeometry> {
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut handles as *mut Vec<HMONITOR> as isize),
+        );
+    }
+    handles.into_iter().filter_map(|handle| {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        unsafe { GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) }
+            .as_bool().then(|| MonitorGeometry {
+                handle: handle.0 as usize,
+                device_name: from_wide(&info.szDevice),
+                bounds: rect_of(info.monitorInfo.rcMonitor),
+                work_area: rect_of(info.monitorInfo.rcWork),
+                is_primary: info.monitorInfo.dwFlags & 1 != 0,
+            })
+    }).collect()
+}
 
 unsafe extern "system" fn collect_monitor(
     monitor: HMONITOR,
@@ -1988,6 +2259,10 @@ impl WinPhoneDisplays {
     /// 用同一次显示器快照返回整屏和底栏，供界面布局与触控区域共用。
     pub fn phone_layout_of(&self, display_id: u32) -> Option<(Rect, Rect)> {
         phone_layout_of_display(&self.api, &self.maps, display_id)
+    }
+
+    pub fn projection_monitor(&self, display_id: u32) -> Option<MonitorSnapshot> {
+        bound_monitor_of(&self.api, &self.maps, display_id)
     }
 
     /// 慢操作串行入口；锁中毒（上一次调用 panic）也照常继续。
@@ -2251,6 +2526,54 @@ mod tests {
     }
 
     #[test]
+    fn physical_outputs_require_a_known_direct_connector() {
+        use windows::Win32::Devices::Display::{
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER,
+        };
+        assert!(is_direct_physical_output(DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL));
+        assert!(is_direct_physical_output(DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI));
+        assert!(is_direct_physical_output(DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL));
+        for technology in [
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER,
+            DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY(99),
+        ] {
+            assert!(!is_direct_physical_output(technology));
+        }
+    }
+
+    #[test]
+    fn a_physical_monitor_at_the_preferred_point_takes_precedence() {
+        let main = snapshot(
+            r"\\.\DISPLAY1",
+            "Main",
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            Rect::new(0.0, 0.0, 1920.0, 1040.0),
+            true,
+            mode(1920, 1080),
+        );
+        let secondary = snapshot(
+            r"\\.\DISPLAY2",
+            "Secondary",
+            Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
+            Rect::new(-1920.0, 0.0, 1920.0, 1040.0),
+            false,
+            mode(1920, 1080),
+        );
+        let monitors = [secondary, main];
+        assert_eq!(preferred_monitor(&monitors, Some(Point::new(-100.0, 10.0))), monitors.first());
+        assert_eq!(monitor_at_point(&monitors, Point::new(0.0, 10.0)), monitors.get(1));
+        // A position on an excluded display deliberately falls back to the physical primary.
+        assert!(monitor_at_point(&monitors, Point::new(2000.0, 10.0)).is_none());
+        assert_eq!(preferred_monitor(&monitors, Some(Point::new(2000.0, 10.0))), monitors.get(1));
+        assert!(preferred_monitor(&[], None).is_none());
+    }
+
+    #[test]
     fn other_displays_hides_phone_and_virtual_screens() {
         let phone = snapshot(r"\\.\DISPLAY2", "Virtual Display", Rect::ZERO, Rect::ZERO, false, mode(1080, 1900));
         let virtual_ = snapshot(r"\\.\DISPLAY3", "VirtuDisplay", Rect::ZERO, Rect::ZERO, false, mode(1080, 1900));
@@ -2400,6 +2723,11 @@ mod tests {
 
     // ----- 假实现的整条流程 -----
 
+    enum PrimaryChange {
+        Remove,
+        SwitchToVirtual,
+    }
+
     /// 一个假的世界：显示器列表、驱动侧"哪些候选编号在线"、调用记录。
     #[derive(Default)]
     struct World {
@@ -2410,6 +2738,8 @@ mod tests {
         cursor: Option<Point>,
         moves: Vec<Point>,
         resolutions: Vec<(String, i32, i32, f64)>,
+        temporary_attempts: usize,
+        temporary_resolution_error: bool,
         dpi_calls: Vec<(u32, u32, i32)>,
         attaches: Vec<(i32, i32, i32, i32)>,
         pending_attach: Option<String>,
@@ -2434,6 +2764,7 @@ mod tests {
         fail_next_legacy_add: bool,
         /// 非 `None` 时所有 `notify` 都失败（模拟驱动拒收/管道已断）。
         notify_error: Option<String>,
+        primary_change_on_arrival: Option<PrimaryChange>,
     }
 
     impl World {
@@ -2461,6 +2792,16 @@ mod tests {
             monitor.virtual_display_id = Some(id);
             self.monitors
                 .retain(|m| m.device_name != device && m.virtual_display_id != Some(id));
+            match self.primary_change_on_arrival.take() {
+                Some(PrimaryChange::Remove) => self.monitors.retain(|m| !m.is_primary),
+                Some(PrimaryChange::SwitchToVirtual) => {
+                    for display in &mut self.monitors {
+                        display.is_primary = false;
+                    }
+                    monitor.is_primary = true;
+                }
+                None => {}
+            }
             self.monitors.push(monitor);
         }
 
@@ -2513,6 +2854,21 @@ mod tests {
                 }
             }
             true
+        }
+
+        fn set_temporary_resolution(
+            &self,
+            device_name: &str,
+            width: i32,
+            height: i32,
+            refresh_rate: f64,
+        ) -> bool {
+            let fallback = {
+                let mut world = self.0.lock().unwrap();
+                world.temporary_attempts += 1;
+                world.temporary_resolution_error
+            };
+            !fallback && self.set_resolution(device_name, width, height, refresh_rate)
         }
 
         fn set_dpi_scale(&self, adapter_id: AdapterLuid, source_id: u32, percent: i32) -> bool {
@@ -2684,6 +3040,7 @@ mod tests {
             reshape_poll: Duration::ZERO,
             resolution_settle: Duration::ZERO,
             cleanup_settle: Duration::ZERO,
+            modeset_interval: Duration::ZERO,
         }
     }
 
@@ -2962,6 +3319,63 @@ mod tests {
             vec![(r"\\.\DISPLAY2".to_string(), 1080, 1900, 60.0)]
         );
         assert_eq!(world.dpi_calls.len(), 1);
+        assert_eq!(world.temporary_attempts, 1);
+    }
+
+    #[test]
+    fn virtual_mode_falls_back_to_persistent_gdi_mode_when_temporary_mode_fails() {
+        let mut world = world_with_phone(&[0]);
+        world.online_mode = Some((1920, 1080));
+        world.temporary_resolution_error = true;
+        let (mut screen, shared) = screen(world);
+        screen.create(ScreenFit::standard()).unwrap();
+
+        let world = shared.lock().unwrap();
+        assert_eq!(world.temporary_attempts, 1);
+        assert_eq!(world.resolutions, vec![(r"\\.\DISPLAY2".into(), 1080, 1900, 60.0)]);
+    }
+
+    #[test]
+    fn a_late_virtual_mode_write_refreshes_the_cooldown() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        screen.last_modeset = None;
+
+        assert!(screen.set_width(id, 600));
+        assert_eq!(shared.lock().unwrap().temporary_attempts, 1);
+        assert!(screen.last_modeset.is_some());
+    }
+
+    #[test]
+    fn create_retires_the_verified_virtual_display_when_the_physical_primary_disappears() {
+        let mut world = world_with_phone(&[0, 1]);
+        world.primary_change_on_arrival = Some(PrimaryChange::Remove);
+        let (mut screen, shared) = screen(world);
+        let error = screen.create(ScreenFit::standard()).unwrap_err();
+
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.pending_display_id, Some(0));
+        assert!(error.detail.contains("DELL U2720Q"));
+        let world = shared.lock().unwrap();
+        assert_eq!(world.notified, vec![vec![0]]);
+        assert_eq!(world.removed, vec![0]);
+        assert!(world.resolutions.is_empty());
+    }
+
+    #[test]
+    fn reshape_keeps_the_previous_fit_when_the_physical_primary_is_reassigned() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let old_fit = ScreenFit::standard();
+        let id = screen.create(old_fit.clone()).unwrap();
+        shared.lock().unwrap().primary_change_on_arrival = Some(PrimaryChange::SwitchToVirtual);
+        let new_fit =
+            ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+
+        assert!(!screen.reshape(id, new_fit));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+        let world = shared.lock().unwrap();
+        assert_eq!(world.notified, vec![vec![id], vec![id], vec![id]]);
+        assert!(world.resolutions.is_empty());
     }
 
     #[test]

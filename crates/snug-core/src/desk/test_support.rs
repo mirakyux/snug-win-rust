@@ -595,8 +595,8 @@ impl FakeApps {
 }
 
 impl AppControl for FakeApps {
-    fn pid_of(&self, _app: &AppInfo) -> Option<i32> {
-        None
+    fn pid_of(&self, app: &AppInfo) -> Option<i32> {
+        self.pids(&app.app_id).first().copied()
     }
 
     fn pids(&self, app_id: &str) -> Vec<i32> {

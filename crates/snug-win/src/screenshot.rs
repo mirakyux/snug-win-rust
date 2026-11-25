@@ -26,8 +26,9 @@ use snug_core::WindowKey;
 use windows::core::w;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC, HGDIOBJ, SRCCOPY,
+    BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HALFTONE, HDC, HGDIOBJ,
+    ReleaseDC, SRCCOPY, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -600,12 +601,64 @@ impl ScreenshotControl for WinScreenshot {
 // 真机实现
 // ---------------------------------------------------------------------------
 
+/// 抓取虚拟桌面坐标内的一帧画面。GDI 先缩放，再读出不透明 RGBA 像素。
+pub fn capture_projection(rect: Rect) -> Option<PixelImage> {
+    let [left, top, source_width, source_height] = [rect.x, rect.y, rect.width, rect.height]
+        .map(f64::round);
+    let coord_range = f64::from(i32::MIN)..=f64::from(i32::MAX);
+    if ![left, top, source_width, source_height].iter().all(|v| coord_range.contains(v))
+        || source_width < 1.0 || source_height < 1.0
+    {
+        return None;
+    }
+    let left = left as i32;
+    let top = top as i32;
+    let source_width = source_width as i32;
+    let source_height = source_height as i32;
+    left.checked_add(source_width)?;
+    top.checked_add(source_height)?;
+    let (width, height) = projection_size(source_width, source_height);
+    let rgba = WinScreens::capture_bitmap(
+        width,
+        height,
+        |memory, screen| unsafe {
+            let layered = SRCCOPY | CAPTUREBLT;
+            if width == source_width && height == source_height {
+                return BitBlt(memory, 0, 0, width, height, Some(screen), left, top, layered).is_ok();
+            }
+            if SetStretchBltMode(memory, HALFTONE) == 0
+                || !SetBrushOrgEx(memory, 0, 0, None).as_bool()
+            {
+                return false;
+            }
+            StretchBlt(
+                memory, 0, 0, width, height, Some(screen), left, top, source_width, source_height,
+                layered,
+            ).as_bool()
+        },
+        bgra_to_opaque_rgba,
+    )?;
+    PixelImage::new(width, height, rgba)
+}
+
+fn projection_size(width: i32, height: i32) -> (i32, i32) {
+    const MAX_EDGE: f64 = 1280.0;
+    let scale = (MAX_EDGE / f64::from(width.max(height))).min(1.0);
+    let scaled = |edge: i32| (f64::from(edge) * scale).round().max(1.0) as i32;
+    (scaled(width), scaled(height))
+}
+
 /// 真机截图后端。
 pub struct WinScreens;
 
 impl WinScreens {
-    /// 建一块 32 位自上而下的 DIB，交给 `draw` 画，成功后取回 BGRA。
-    fn capture_bitmap(width: i32, height: i32, draw: impl FnOnce(HDC) -> bool) -> Option<Vec<u8>> {
+    /// 创建自上而下的 32 位 DIB，将设备上下文交给 `draw`，再读取同步后的 BGRA。
+    fn capture_bitmap<T>(
+        width: i32,
+        height: i32,
+        draw: impl FnOnce(HDC, HDC) -> bool,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
         if width <= 0 || height <= 0 {
             return None;
         }
@@ -632,11 +685,13 @@ impl WinScreens {
                     CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0)
                 {
                     let old = SelectObject(memory, HGDIOBJ(bitmap.0));
-                    if draw(memory) && !bits.is_null() {
+                    if !old.is_invalid() && draw(memory, screen) && GdiFlush().as_bool() && !bits.is_null() {
                         let length = width as usize * height as usize * 4;
-                        result = Some(std::slice::from_raw_parts(bits as *const u8, length).to_vec());
+                        result = Some(read(std::slice::from_raw_parts(bits as *const u8, length)));
                     }
-                    SelectObject(memory, old);
+                    if !old.is_invalid() {
+                        SelectObject(memory, old);
+                    }
                     let _ = DeleteObject(HGDIOBJ(bitmap.0));
                 }
                 let _ = DeleteDC(memory);
@@ -687,20 +742,26 @@ impl ScreenshotSystem for WinScreens {
 
     fn print_window(&self, handle: u64, width: i32, height: i32) -> Option<Vec<u8>> {
         let hwnd = HWND(handle as usize as *mut c_void);
-        Self::capture_bitmap(width, height, |dc| unsafe {
-            PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT).as_bool()
-                || PrintWindow(hwnd, dc, 0).as_bool()
-        })
+        Self::capture_bitmap(
+            width,
+            height,
+            |memory, _| unsafe {
+                PrintWindow(hwnd, memory, PW_RENDERFULLCONTENT).as_bool()
+                    || PrintWindow(hwnd, memory, 0).as_bool()
+            },
+            <[u8]>::to_vec,
+        )
     }
 
     fn copy_from_screen(&self, left: i32, top: i32, width: i32, height: i32) -> Option<Vec<u8>> {
-        Self::capture_bitmap(width, height, |dc| unsafe {
-            let screen = GetDC(None);
-            let ok = !screen.is_invalid()
-                && BitBlt(dc, 0, 0, width, height, Some(screen), left, top, SRCCOPY).is_ok();
-            ReleaseDC(None, screen);
-            ok
-        })
+        Self::capture_bitmap(
+            width,
+            height,
+            |memory, screen| unsafe {
+                BitBlt(memory, 0, 0, width, height, Some(screen), left, top, SRCCOPY).is_ok()
+            },
+            <[u8]>::to_vec,
+        )
     }
 
     fn write_clipboard(&self, dib: &[u8], png: &[u8]) -> bool {
@@ -728,6 +789,16 @@ impl ScreenshotSystem for WinScreens {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn projection_caps_either_orientation_without_upscaling() {
+        assert_eq!(projection_size(1080, 1920), (720, 1280));
+        assert_eq!(projection_size(3840, 2160), (1280, 720));
+        assert_eq!(projection_size(360, 640), (360, 640));
+        assert_eq!(projection_size(1, 4096), (1, 1280));
+        assert!(capture_projection(Rect::new(0.0, 0.0, 12.0, f64::NAN)).is_none());
+        assert!(capture_projection(Rect::new(f64::from(i32::MAX), 0.0, 12.0, 12.0)).is_none());
+    }
 
     fn window(pid: i32, handle: u64) -> WindowKey {
         WindowKey::new(pid, handle)

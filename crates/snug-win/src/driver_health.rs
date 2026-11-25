@@ -7,7 +7,7 @@ use windows::Win32::Devices::Properties::{
 };
 use windows::core::PCWSTR;
 
-use crate::vdd::{self, VddProtocol};
+use crate::vdd::{self, VddError, VddProtocol};
 use crate::vdd_broker::{self, BrokerStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,8 +15,19 @@ pub enum PipeAccess {
     Missing,
     Direct(VddProtocol),
     RequiresElevation,
+    ElevatedAccessDenied,
     Busy,
     Unavailable,
+}
+
+impl PipeAccess {
+    fn for_process(self, elevated: Option<bool>) -> Self {
+        match (self, elevated) {
+            (Self::RequiresElevation, Some(true)) => Self::ElevatedAccessDenied,
+            (Self::RequiresElevation, None) => Self::Unavailable,
+            (access, _) => access,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +48,8 @@ impl DriverHealth {
             version: None,
             started: None,
             problem_code: None,
-            access: vdd::probe_access(vdd::DEFAULT_PIPE_NAME),
+            access: vdd::probe_access(vdd::DEFAULT_PIPE_NAME)
+                .for_process(crate::elevation::try_is_elevated().ok()),
         };
         let Some(instance_id) = instance_id else {
             return health;
@@ -78,21 +90,91 @@ impl DriverHealth {
     }
 }
 
-/// GUI calls this on a background thread after an explicit click.
+/// Connect directly or request driver authorization during interactive use.
 pub fn retry_connection() -> Result<VddProtocol, String> {
-    match vdd::probe_access(vdd::DEFAULT_PIPE_NAME) {
+    retry_connection_with_broker(vdd_broker::retry_connection)
+}
+
+/// Connect from login startup using direct access or the account's previously authorized broker.
+pub fn retry_connection_without_prompt() -> Result<VddProtocol, String> {
+    retry_connection_with_broker(vdd_broker::retry_connection_without_prompt)
+}
+
+fn retry_connection_with_broker(
+    connect_broker: impl FnOnce() -> std::io::Result<Option<VddProtocol>>,
+) -> Result<VddProtocol, String> {
+    let elevated = crate::elevation::try_is_elevated()
+        .map_err(|error| format!("无法确认当前进程权限：{error}"))?;
+    match vdd::probe_access(vdd::DEFAULT_PIPE_NAME).for_process(Some(elevated)) {
         PipeAccess::Direct(_) => vdd::VddClient::direct(vdd::DEFAULT_PIPE_NAME)
             .probe_connection()
-            .map_err(|error| error.to_string()),
-        PipeAccess::RequiresElevation if !crate::is_elevated() => vdd_broker::retry_connection()
+            .map_err(|error| describe_direct_error(elevated, error)),
+        PipeAccess::ElevatedAccessDenied => Err(ELEVATED_ACCESS_DENIED.into()),
+        PipeAccess::RequiresElevation => connect_broker()
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "驱动未返回协议类型".into()),
         PipeAccess::Missing => Err("驱动控制管道尚未出现".into()),
         PipeAccess::Busy => Err("驱动控制管道忙，请稍后再试".into()),
-        _ => Err("当前账户无法打开驱动控制管道".into()),
+        PipeAccess::Unavailable => Err("当前账户无法打开驱动控制管道".into()),
+    }
+}
+
+const ELEVATED_ACCESS_DENIED: &str =
+    "当前进程已是管理员，驱动控制管道仍拒绝访问。请检查驱动权限或尝试修复驱动。";
+
+fn describe_direct_error(elevated: bool, error: VddError) -> String {
+    let permission_denied = match &error {
+        VddError::Connect { source, .. } | VddError::Io(source) => {
+            source.kind() == std::io::ErrorKind::PermissionDenied
+        }
+        VddError::NotConnected => false,
+    };
+    if elevated && permission_denied {
+        ELEVATED_ACCESS_DENIED.into()
+    } else {
+        error.to_string()
     }
 }
 
 pub fn broker_status() -> BrokerStatus {
     vdd_broker::status()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denial_only_requests_authorization_for_a_standard_process() {
+        assert_eq!(
+            PipeAccess::RequiresElevation.for_process(Some(true)),
+            PipeAccess::ElevatedAccessDenied
+        );
+        assert_eq!(
+            PipeAccess::RequiresElevation.for_process(Some(false)),
+            PipeAccess::RequiresElevation
+        );
+        assert_eq!(
+            PipeAccess::RequiresElevation.for_process(None),
+            PipeAccess::Unavailable
+        );
+        let direct = PipeAccess::Direct(VddProtocol::Legacy);
+        assert_eq!(direct.clone().for_process(Some(true)), direct);
+    }
+
+    #[test]
+    fn elevated_failures_between_probe_and_connection_explain_the_pipe_denial() {
+        let denied = || VddError::Connect {
+            name: vdd::DEFAULT_PIPE_NAME.into(),
+            source: std::io::Error::from_raw_os_error(5),
+        };
+        assert_eq!(
+            describe_direct_error(true, denied()),
+            ELEVATED_ACCESS_DENIED
+        );
+        assert_ne!(
+            describe_direct_error(false, denied()),
+            ELEVATED_ACCESS_DENIED
+        );
+    }
 }

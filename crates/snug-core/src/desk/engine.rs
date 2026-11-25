@@ -15,7 +15,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
@@ -66,6 +66,8 @@ const WINDOW_POLL: f64 = 0.1;
 const LAUNCH_WAIT: f64 = 30.0;
 /// C# `WindowWait`：已有进程里新建窗口的等待上限。
 const WINDOW_WAIT: f64 = 10.0;
+/// 单实例 App 回到已有窗口前，先给真正的新窗口留出时间。
+const EXISTING_WINDOW_GRACE: f64 = 2.0;
 /// C# `WatchPoll`：watch 轮询间隔。
 const WATCH_POLL: f64 = 0.25;
 /// C# `QuitWait`：等 App 退出的上限。
@@ -237,6 +239,7 @@ struct DeskShared {
     /// C# 字段 `_wanted` / `_remote` 由界面线程直接读写，这里用原子量保持同样语义。
     wanted: AtomicBool,
     remote: AtomicBool,
+    session_generation: AtomicU64,
     default_zoom: AtomicI32,
     fit: Mutex<ScreenFit>,
     displays: Arc<dyn PhoneDisplays>,
@@ -513,6 +516,7 @@ impl Desk {
             close_button_busy: AtomicBool::new(false),
             wanted: AtomicBool::new(false),
             remote: AtomicBool::new(false),
+            session_generation: AtomicU64::new(0),
             default_zoom: AtomicI32::new(default_zoom),
             fit: Mutex::new(fit),
             displays,
@@ -670,21 +674,25 @@ impl Desk {
 
     /// 对应 C# `PutBack`：把手机屏上的窗口放回原位。
     pub fn put_back(&self) {
-        self.inner.slot.run(|core: &mut DeskCore| {
-            if core.placement.is_none() {
-                return;
-            }
-            core.begin(DeskWork::new(DeskWorkKind::PuttingBack));
-            if let Some(placement) = core.placement.clone()
-                && !core.return_to_original(&placement, true)
-            {
-                let app = placement.window.app_name.clone();
+        self.inner.slot.run(DeskCore::put_back_placement);
+    }
+
+    pub(crate) fn reset_retained_screen_session(&self, restore_windows: bool) {
+        if restore_windows {
+            // 正在等待 App 窗口的操作也在串行队列中，先通知它结束等待。
+            self.inner.shared.session_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.slot.run(move |core| {
+            if restore_windows {
+                core.cancel_watches();
+                core.replaced = None;
                 core.set_state(
-                    core.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })),
+                    core.state().with_notice(None).with_quitting_cleared().with_closing_cleared(),
                 );
+                core.put_back_placement();
             }
-            core.match_width();
-            core.set_state(core.state().with_work(None));
+            // 收起动作可能仍在队列里，在这里读取它提交后的状态。
+            core.reenter_dismissed_screen();
         });
     }
 
@@ -782,11 +790,7 @@ impl Desk {
         if !self.inner.shared.wanted.load(Ordering::SeqCst) || !self.state().dismissed {
             return;
         }
-        self.inner.slot.run(|core: &mut DeskCore| {
-            core.set_state(core.state().with_dismissed(false).with_notice(None));
-            core.log("同会话重新进入手机屏：恢复建屏");
-            core.reconcile();
-        });
+        self.inner.slot.run(DeskCore::reenter_dismissed_screen);
     }
 
     /// `reenter_screen` 的旧名字，保留给已经接好的调用方。
@@ -855,9 +859,13 @@ impl Desk {
     /// 对应 C# `Open`：打开 App 并把出现的窗口放上手机屏。
     pub fn open(&self, app: AppInfo) {
         let label = app.name.clone();
+        let generation = self.inner.shared.session_generation.load(Ordering::SeqCst);
         self.inner.slot.run(move |core: &mut DeskCore| {
+            if core.shared.session_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
             core.begin(DeskWork::with_label(DeskWorkKind::Opening, label));
-            core.open_window(app, None);
+            core.open_window(app, None, generation);
             core.set_state(core.state().with_work(None));
         });
     }
@@ -870,9 +878,13 @@ impl Desk {
         }
         let label = app.app.name.clone();
         let pid = app.pid;
+        let generation = self.inner.shared.session_generation.load(Ordering::SeqCst);
         self.inner.slot.run(move |core: &mut DeskCore| {
+            if core.shared.session_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
             core.begin(DeskWork::with_label(DeskWorkKind::Opening, label));
-            core.open_window(app.app, Some(pid));
+            core.open_window(app.app, Some(pid), generation);
             core.set_state(core.state().with_work(None));
         });
     }
@@ -890,7 +902,7 @@ impl Desk {
         let app_name = app_name.into();
         self.inner.slot.run(move |core: &mut DeskCore| {
             core.unwatch(WatchedKey::for_quit(pid));
-            core.set_state(core.state().with_notice(None));
+            core.set_state(core.state().with_notice(None).with_quitting_removed(pid));
             core.warn(format!("强制退出 {app_name}（pid {pid}）"));
             if !core.shared.apps.force_quit(pid) {
                 let notice = DeskNotice::WindowUnresponsive { app: app_name.clone() };
@@ -1190,6 +1202,14 @@ impl DeskCore {
         }
     }
 
+    fn reenter_dismissed_screen(&mut self) {
+        if self.wanted() && self.state().dismissed {
+            self.set_state(self.state().with_dismissed(false).with_notice(None));
+            self.log("重新进入手机屏：恢复建屏");
+            self.reconcile();
+        }
+    }
+
     /// 对应 C# `AddScreenAsync`。
     fn add_screen(&mut self) {
         self.settle_displays();
@@ -1254,15 +1274,7 @@ impl DeskCore {
         self.evacuate_computer_screen_windows();
         self.retire_display();
 
-        let tokens = {
-            let mut watches = self.shared.watches.lock().expect("watches");
-            let tokens: Vec<CancelToken> = watches.values().cloned().collect();
-            watches.clear();
-            tokens
-        };
-        for token in tokens {
-            token.cancel();
-        }
+        self.cancel_watches();
 
         let state = self
             .state()
@@ -2112,6 +2124,19 @@ impl DeskCore {
         self.change_zoom(steps);
     }
 
+    fn put_back_placement(&mut self) {
+        let Some(placement) = self.placement.clone() else {
+            return;
+        };
+        self.begin(DeskWork::new(DeskWorkKind::PuttingBack));
+        if !self.return_to_original(&placement, true) {
+            let app = placement.window.app_name;
+            self.set_state(self.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })));
+        }
+        self.match_width();
+        self.set_state(self.state().with_work(None));
+    }
+
     /// 对应 C# `ReturnToOriginalAsync`：把窗口放回原位并清掉摆放状态。
     fn return_to_original(&mut self, placement: &Placement, restoring_state: bool) -> bool {
         let mut placement = placement.clone();
@@ -2383,8 +2408,8 @@ impl DeskCore {
 
     // ---- 以下对应 C# 的打开 / 退出 / 关闭与 watch ----
 
-    /// 对应 C# `OpenWindowAsync`：打开 App 并把它的新窗口放上手机屏。
-    fn open_window(&mut self, app: AppInfo, new_window_in: Option<i32>) {
+    /// 对应 C# `OpenWindowAsync`：打开 App 并把新窗口或唤醒的已有窗口放上手机屏。
+    fn open_window(&mut self, app: AppInfo, new_window_in: Option<i32>, session_generation: u64) {
         let started = self.now();
         if self.ready_display(&format!("打开 {}", app.name)).is_none() {
             self.set_state(self.state().with_notice(Some(DeskNotice::ScreenNotReady)));
@@ -2405,8 +2430,12 @@ impl DeskCore {
                 before.insert(window.key);
             }
         }
+        let mut existing_app_windows = HashSet::new();
         if new_window_in.is_none() {
-            for window in self.shared.apps.app_windows(&app, known_pid) {
+            for window in self.shared.apps.app_windows(&app, None) {
+                if self.shared.apps.can_reuse_window(&app, &window) {
+                    existing_app_windows.insert(window.key);
+                }
                 before.insert(window.key);
             }
         }
@@ -2435,42 +2464,56 @@ impl DeskCore {
         let wait = if known_pid.is_none() { LAUNCH_WAIT } else { WINDOW_WAIT };
         let deadline = self.now() + wait;
         let exit_grace_deadline = self.now() + 3.0;
-        while self.wanted() {
-            let pid_windows = self.shared.windows.shown_windows(pid);
+        // 在已有同一应用的窗口时，ShellExecute 返回的进程可能只是负责唤醒它。
+        let launch_pid = existing_app_windows.is_empty().then_some(pid);
+        while self.wanted()
+            && self.shared.session_generation.load(Ordering::SeqCst) == session_generation
+        {
+            let pid_windows = launch_pid.map_or_else(Vec::new, |pid| self.shared.windows.shown_windows(pid));
             let app_windows = if new_window_in.is_none() {
-                self.shared.apps.app_windows(&app, Some(pid))
+                self.shared.apps.app_windows(&app, launch_pid)
             } else {
                 Vec::new()
             };
-            let app_windows_empty = app_windows.is_empty();
             let appeared = pid_windows
-                .into_iter()
-                .chain(app_windows)
+                .iter()
+                .chain(&app_windows)
                 .find(|window| !before.contains(&window.key));
-            if let Some(appeared) = appeared {
+            let now = self.now();
+            let launcher_exited = now >= exit_grace_deadline && !self.shared.apps.is_running(pid);
+            let reuse_existing = appeared.is_none()
+                && !existing_app_windows.is_empty()
+                && (launcher_exited || known_pid.is_some() && now >= started + EXISTING_WINDOW_GRACE);
+            let target = if reuse_existing {
+                app_windows.iter().find(|window| existing_app_windows.contains(&window.key))
+            } else {
+                appeared
+            };
+            if let Some(target) = target {
+                if self.shared.session_generation.load(Ordering::SeqCst) != session_generation {
+                    return;
+                }
+                let action = if reuse_existing { "沿用已有窗口" } else { "出现" };
                 self.log(format!(
-                    "{}（{:.1}s）出现 {}，放上手机屏",
+                    "{}（{:.1}s）{action} {}，放上手机屏",
                     app.name,
-                    self.now() - started,
-                    appeared.label()
+                    now - started,
+                    target.label()
                 ));
                 self.set_state(
                     self.state()
-                        .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, appeared.label()))),
+                        .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, target.label()))),
                 );
-                self.place(appeared, true, None);
+                self.place(target.clone(), true, None);
                 return;
             }
-            if !self.shared.apps.is_running(pid)
-                && self.now() >= exit_grace_deadline
-                && app_windows_empty
-            {
+            if launcher_exited && app_windows.is_empty() {
                 self.warn(format!("{} 打开后已退出", app.name));
                 let name = app.name.clone();
                 self.set_state(self.state().with_notice(Some(DeskNotice::OpenFailed { app: name })));
                 return;
             }
-            if self.now() >= deadline {
+            if now >= deadline {
                 self.warn(format!("{} 打开超时无窗口", app.name));
                 let name = app.name.clone();
                 self.set_state(self.state().with_notice(Some(DeskNotice::NoWindow { app: name })));
@@ -2571,11 +2614,19 @@ impl DeskCore {
             .name("snug-desk-watch".to_string())
             .spawn(move || {
                 body(context);
+                let mut watches = shared.watches.lock().expect("watches");
                 if !token.is_cancelled() {
-                    shared.watches.lock().expect("watches").remove(&key);
+                    watches.remove(&key);
                 }
             })
             .expect("创建 PhoneDesk 监视线程失败");
+    }
+
+    fn cancel_watches(&self) {
+        let mut watches = self.shared.watches.lock().expect("watches");
+        for (_, token) in watches.drain() {
+            token.cancel();
+        }
     }
 
     /// 对应 C# `Unwatch`。
@@ -2891,7 +2942,7 @@ impl WatchContext {
 
     /// 把一次状态改动排回桌面队列（C# watch 线程直接改 State，这里串行化）。
     fn set_state(&self, change: impl FnOnce(DeskState) -> DeskState + Send + 'static) {
-        self.lane.call(move |core: &mut DeskCore| {
+        self.apply_if_active(move |core| {
             let next = change(core.state());
             core.set_state(next);
         });
@@ -2906,7 +2957,7 @@ impl WatchContext {
     /// 对应 C# `PlaceAskingAsync`：把正在询问的窗口放上手机屏（不调字号）。
     fn place_asking(&self, window: WindowInfo) {
         let label = window.label();
-        self.lane.call(move |core: &mut DeskCore| {
+        self.apply_if_active(move |core| {
             let state = core
                 .state()
                 .with_notice(None)
@@ -2918,11 +2969,20 @@ impl WatchContext {
     }
 
     fn remove_quitting(&self, pid: i32) {
-        self.lane.call(move |core: &mut DeskCore| core.remove_quitting(pid));
+        self.apply_if_active(move |core| core.remove_quitting(pid));
     }
 
     fn remove_closing(&self, key: WindowKey) {
-        self.lane.call(move |core: &mut DeskCore| core.remove_closing(key));
+        self.apply_if_active(move |core| core.remove_closing(key));
+    }
+
+    fn apply_if_active(&self, operation: impl FnOnce(&mut DeskCore) + Send + 'static) {
+        let token = self.token.clone();
+        self.lane.call(move |core| {
+            if !token.is_cancelled() {
+                operation(core);
+            }
+        });
     }
 }
 
@@ -3004,7 +3064,7 @@ fn watch_quit_body(context: WatchContext, app: RunningApp) {
                     context.log(format!("{} 后来自己退出了", app.app.name));
                     context.emit_gone(DeskGone::App { pid });
                     let stalled = stalled.clone();
-                    context.lane.call(move |core: &mut DeskCore| {
+                    context.apply_if_active(move |core| {
                         if core.state().notice.as_ref() == Some(&stalled) {
                             core.set_state(core.state().with_notice(None));
                         }
@@ -3847,6 +3907,83 @@ mod tests {
     }
 
     #[test]
+    fn retained_screen_session_reset_observes_a_pending_dismiss() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let (release, wait) = std::sync::mpsc::channel();
+        harness.desk.inner.slot.run(move |_| {
+            wait.recv_timeout(Duration::from_secs(3)).expect("release the desk lane");
+        });
+
+        harness.desk.dismiss_screen();
+        harness.desk.reset_retained_screen_session(true);
+        assert!(!harness.desk.state().dismissed, "dismiss is still queued");
+        release.send(()).unwrap();
+        harness.desk.idle();
+
+        assert!(!harness.desk.state().dismissed);
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
+        assert_eq!(harness.displays.create_calls(), 2);
+    }
+
+    #[test]
+    fn retained_screen_session_reset_ignores_a_stale_watch_placement() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let display = harness.desk.state().display_id;
+        let key = WindowKey::new(45, 0x103);
+        let original = Rect::new(10.0, 20.0, 900.0, 600.0);
+        harness.windows.insert(key, original);
+
+        let shared = Arc::clone(&harness.desk.inner.shared);
+        let token = CancelToken::new();
+        let watch = WatchContext {
+            shared: Arc::clone(&shared),
+            lane: harness.desk.inner.slot.clone(),
+            token: token.clone(),
+        };
+        shared.watches.lock().unwrap().insert(WatchedKey::for_close(key), token.clone());
+        harness.desk.reset_retained_screen_session(true);
+        watch.place_asking(window(key, Some("Code.exe"), "Save changes?"));
+        harness.desk.idle();
+
+        assert!(token.is_cancelled());
+        assert_eq!(harness.desk.state().display_id, display);
+        assert!(harness.desk.state().placed.is_none());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+    }
+
+    #[test]
+    fn retained_screen_session_reset_cancels_waiting_for_an_open_window() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let display = harness.desk.state().display_id;
+        let key = WindowKey::new(44, 0x104);
+        let original = Rect::new(10.0, 20.0, 900.0, 600.0);
+        let (entered, began) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        let windows = Arc::clone(&harness.windows);
+        harness.apps.set_new_window_result(true);
+        harness.apps.set_on_new_window(move || {
+            entered.send(()).unwrap();
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
+            windows.insert(key, original);
+        });
+
+        harness.desk.new_window(running(key.pid, "VS Code", "Code.exe", Vec::new()));
+        began.recv_timeout(Duration::from_secs(3)).unwrap();
+        harness.desk.reset_retained_screen_session(true);
+        release.send(()).unwrap();
+        harness.desk.idle();
+
+        assert_eq!(harness.desk.state().display_id, display);
+        assert!(harness.desk.state().placed.is_none());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[test]
     fn reenter_without_a_dismissed_screen_is_a_no_op() {
         let harness = Harness::new();
         ready_screen(&harness);
@@ -3993,6 +4130,45 @@ mod tests {
         assert_eq!(state.placed.as_ref().map(|placed| placed.window.key), Some(key));
         assert!(!state.list_visible);
         assert!(state.work.is_none());
+    }
+
+    #[test]
+    fn open_reuses_an_app_window_after_single_instance_handoff() {
+        for launcher_alive in [false, true] {
+            let harness = Harness::new();
+            let existing = WindowKey::new(66, 0x510);
+            let unrelated = WindowKey::new(75, 0x511);
+            let frame = Rect::new(50.0, 50.0, 1200.0, 800.0);
+            let existing_window = window(existing, Some("Code.exe"), "Workspace");
+            harness.windows.insert_window(existing_window.clone(), frame);
+            harness.windows.insert_window(
+                window(unrelated, Some("notepad.exe"), "Notes"),
+                frame,
+            );
+            harness.apps.set_app_windows("Code.exe", vec![existing_window]);
+            harness.apps.set_open_result(Some(unrelated.pid));
+            harness.apps.set_running(unrelated.pid, launcher_alive);
+            // A known app reaches the fallback after two seconds. With only a
+            // matching window, wait for the launcher to exit and settle first.
+            let elapsed_before_fallback = if launcher_alive {
+                harness.apps.set_pids("Code.exe", vec![existing.pid]);
+                super::EXISTING_WINDOW_GRACE
+            } else {
+                3.0
+            };
+            ready_screen(&harness);
+            let started = harness.timeline.now();
+
+            harness.desk.open(app("VS Code", "Code.exe"));
+            harness.desk.idle();
+
+            let state = harness.desk.state();
+            assert_eq!(state.placed.as_ref().map(|placed| placed.window.key), Some(existing));
+            assert!(state.notice.is_none());
+            assert_eq!(harness.windows.frame_of(unrelated), Some(frame));
+            let elapsed = harness.timeline.now() - started;
+            assert!(elapsed >= elapsed_before_fallback && elapsed < super::WINDOW_WAIT);
+        }
     }
 
     #[test]
