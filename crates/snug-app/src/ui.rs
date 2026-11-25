@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use snug_core::desk::PhoneScreenPhase;
 use snug_core::{AppConfig, Paths, PhoneScreenMode};
 
+use crate::computer_library::{ComputerAction, ComputerLibrary};
 use crate::controller::{Controller, TouchEvent};
 use crate::desktop_settings::DesktopSettings;
 use crate::library::Library;
@@ -195,6 +196,7 @@ pub struct PhoneHomeApp {
     /// Hidden-window repaint worker; joined during app shutdown.
     ui_heartbeat: UiHeartbeat,
     library_ui: MobileLibraryUi,
+    computer_library: ComputerLibrary,
     /// 手机屏的逻辑宽度（点），用于把界面元素按屏宽等比放大。
     /// 设置窗（无人操作时它自己返回 `Idle`，不画任何东西）。
     pub settings: SettingsWindow,
@@ -354,6 +356,7 @@ impl PhoneHomeApp {
             controller,
             ui_heartbeat,
             library_ui: MobileLibraryUi::default(),
+            computer_library: ComputerLibrary::default(),
             settings,
             desktop_settings,
             display_layout,
@@ -751,6 +754,7 @@ impl PhoneHomeApp {
         &mut self,
         ctx: &egui::Context,
         phone_layout: Option<(snug_core::Rect, snug_core::Rect)>,
+        computer_screen: bool,
     ) {
         let state = self.state();
         let ready = state.screen_phase == PhoneScreenPhase::Ready;
@@ -776,10 +780,15 @@ impl PhoneHomeApp {
         if ready && let Some((full_screen, _)) = phone_layout {
             let native = (ctx.pixels_per_point() / ctx.zoom_factor()).max(0.5);
             let zoom = touch_zoom(full_screen.width as f32, full_screen.height as f32, native);
-            self.apply_ui_scale(ctx, zoom, "手机触控");
+            self.apply_ui_scale(ctx, if computer_screen { 1.0 } else { zoom }, "屏幕界面");
         }
+        let computer_dock = computer_screen && !self.settings.is_open() && self.mobile_sheet.is_none();
         let bounds = if ready {
-            if showing_bar {
+            if computer_dock {
+                phone_layout.map(|(screen, _)| {
+                    self.computer_library.bounds(screen, ctx.pixels_per_point() as f64)
+                })
+            } else if showing_bar && !computer_screen {
                 phone_layout.map(|(_, bar)| bar)
             } else {
                 phone_layout.map(|(full, _)| full)
@@ -839,7 +848,12 @@ impl PhoneHomeApp {
         // （虚拟屏是 116.7%）时 winit 会按新比例自己改窗口尺寸，绕开 `SetWindowPos`，
         // 结果界面比屏小一圈、右边和底部留黑边。每帧比一次，不一致就重新摆。
         let mut request = snug_win::PlacementRequest::new(bounds);
-        request.no_activate = showing_bar || self.pill_mode();
+        request.no_activate = (if computer_screen {
+            computer_dock && !self.computer_library.expanded
+        } else { showing_bar }) || self.pill_mode();
+        request.focus_if_activated = computer_dock
+            && self.computer_library.expanded
+            && self.computer_library.request_focus();
         let placed_ok = self.last_phone_rect == Some(bounds)
             && snug_win::placement_matches(hwnd, &request, 2.0);
         if !placed_ok {
@@ -867,7 +881,9 @@ impl PhoneHomeApp {
                     } else {
                         "手机屏界面"
                     },
-                    if showing_bar {
+                    if computer_dock {
+                        "电脑屏左缘资源库"
+                    } else if showing_bar {
                         "收成底部指示条"
                     } else if self.preview.is_some() {
                         "预览（只读）"
@@ -947,6 +963,9 @@ impl PhoneHomeApp {
         let state = self.state();
         if state.screen_phase == PhoneScreenPhase::Ready {
             crate::info!("预览：手机屏已就绪，改为回到资源库列表");
+            if self.selected_computer_screen() {
+                self.computer_library.expanded = true;
+            }
             self.controller.show_list_of(self.active_screen.as_deref());
             return;
         }
@@ -961,6 +980,7 @@ impl PhoneHomeApp {
             active_screen: self.active_screen.clone(),
             capture: None,
         });
+        self.computer_library.expanded = self.selected_computer_screen();
         if self.preview_rect(ctx).is_none() {
             crate::warn!("预览：拿不到主屏工作区，无法摆放预览窗");
             self.preview = None;
@@ -1440,6 +1460,10 @@ impl eframe::App for PhoneHomeApp {
         let state = self.state();
         let phone_id = if state.screen_phase == PhoneScreenPhase::Ready { state.display_id } else { None };
         let phone_layout = self.display_layout.refresh(self.desktop_settings.is_open(), phone_id);
+        let computer_screen = (phone_id.is_some() || self.preview.is_some()) && self.selected_computer_screen();
+        if !computer_screen {
+            self.computer_library.expanded = false;
+        }
 
         // 选区结束 → 在选区上方弹"复制"气泡（C# `ShowCopySelectionBubble`）。
         for event in self.controller.take_selection_events() {
@@ -1478,6 +1502,11 @@ impl eframe::App for PhoneHomeApp {
                     crate::debug!("托盘：预览手机界面");
                     self.open_preview(ctx);
                 }
+                TrayCommand::OpenProjection => {
+                    self.desktop_settings.sync_config(&self.config);
+                    self.desktop_settings.open_projection();
+                    ctx.request_repaint();
+                }
                 TrayCommand::Reenter => {
                     crate::info!("托盘：重新进入手机屏");
                     self.controller.reenter();
@@ -1512,11 +1541,11 @@ impl eframe::App for PhoneHomeApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
         // 界面窗口跟着手机屏走（对应 C# 里 PhoneHomeWindow 一直待在虚拟屏上）。
-        self.sync_window(ctx, phone_layout);
+        self.sync_window(ctx, phone_layout, computer_screen);
         self.controller.sync_touch(
             &self.config,
             self.active_screen.as_deref(),
-            phone_layout.map(|(full, _)| full),
+            phone_layout.filter(|_| !computer_screen).map(|(full, _)| full),
             self.last_phone_rect,
             self.bubble.screen_bounds(ctx.pixels_per_point() as f64),
         );
@@ -1572,6 +1601,24 @@ impl eframe::App for PhoneHomeApp {
             self.draw_pill(ctx);
             return;
         }
+        let computer_bounds = phone_layout.map(|(full, _)| full)
+            .or_else(|| self.preview.as_ref().and(self.last_phone_rect));
+        if computer_screen && let Some(screen) = computer_bounds {
+            if self.mobile_sheet.is_some() {
+                self.draw_screen_picker(ctx);
+            } else {
+                let state = self.state();
+                match self.computer_library.show(ctx, &mut self.library, screen, state.work.is_some(), state.placed.is_some(), self.preview.is_some()) {
+                    Some(ComputerAction::Focus(window)) if self.preview.is_none() => {
+                        self.controller.focus_window(window.key, screen);
+                    }
+                    Some(ComputerAction::Focus(_)) => {}
+                    Some(ComputerAction::Library(action)) => self.apply_library_action(action, ctx),
+                    None => {}
+                }
+            }
+            return;
+        }
 
         // 有窗口铺在手机屏上时，界面只剩底部指示条（C#：PhoneHomeWindow 隐、HomeBarWindow 显）。
         // 和 `sync_window` 同一个条件：点了「‹ 资源库」之后 `list_visible=true`，即使窗口
@@ -1590,6 +1637,17 @@ impl eframe::App for PhoneHomeApp {
 }
 
 impl PhoneHomeApp {
+    fn selected_computer_screen(&self) -> bool {
+        let screens = self.config.effective_screens();
+        let selected = if let Some(id) = displayed_screen(&self.active_screen, &self.preview) {
+            screens.into_iter().find(|screen| screen.id == id && screen.enabled)
+        } else {
+            self.config.primary_touch_screen().filter(|screen| screen.enabled)
+                .or_else(|| screens.into_iter().find(|screen| screen.enabled))
+        };
+        selected.is_some_and(|screen| screen.device.kind == snug_core::DeviceKind::Computer)
+    }
+
     fn dismiss_active_screen(&mut self, ctx: &egui::Context) {
         self.mobile_sheet = None;
         self.reentry_pill_hidden = false;
@@ -1636,7 +1694,7 @@ impl PhoneHomeApp {
 
     fn draw_mobile_home(&mut self, ctx: &egui::Context) {
         let state = self.state();
-        let screens = self.controller.touch_screens();
+        let screens = self.controller.enabled_screens();
         let selected_screen = displayed_screen(&self.active_screen, &self.preview)
             .map(str::to_owned)
             .or_else(|| self.config.primary_touch_screen().map(|screen| screen.id));
@@ -1672,7 +1730,7 @@ impl PhoneHomeApp {
             ui.set_width((ctx.screen_rect().width() - 56.0).clamp(180.0, 440.0));
             ui.heading("切换屏幕");
             ui.add_space(12.0);
-            for (id, name) in self.controller.touch_screens() {
+            for (id, name) in self.controller.enabled_screens() {
                 let selected = displayed_screen(&self.active_screen, &self.preview)
                     .map(|active| active == id)
                     .unwrap_or_else(|| {
@@ -1710,6 +1768,9 @@ impl PhoneHomeApp {
                 select_displayed_screen(&mut self.active_screen, &mut self.preview, id)
             {
                 self.controller.set_active_screen(Some(id));
+            }
+            if self.preview.is_some() {
+                self.computer_library.expanded = self.selected_computer_screen();
             }
             self.last_phone_rect = None;
             self.last_offscreen = None;

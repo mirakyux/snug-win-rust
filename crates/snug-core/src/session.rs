@@ -186,6 +186,7 @@ pub const QUIET_WINDOW: f64 = 5.0;
 /// 推流日志可能包含本地 GameViewer 活动，不能独自无限延长远程会话。
 /// 它只在最近一次控制端证据后短暂维持未知状态；已确认的空控制表不接受日志续期。
 const CAPTURE_CONTINUITY_WINDOW: f64 = 15.0;
+const CAPTURE_REBUILD_GRACE: f64 = 3.0;
 
 /// 连接跟踪（对应 C# `ConnectionTracker`）。
 #[derive(Debug, Clone)]
@@ -194,6 +195,7 @@ pub struct ConnectionTracker {
     controllers: Vec<String>,
     last_present_at: Option<f64>,
     last_remote_evidence_at: Option<f64>,
+    last_verified_capture: Option<(u64, f64)>,
     quiet_until: Option<f64>,
 }
 
@@ -210,6 +212,7 @@ impl ConnectionTracker {
             controllers: Vec::new(),
             last_present_at: None,
             last_remote_evidence_at: None,
+            last_verified_capture: None,
             quiet_until: None,
         }
     }
@@ -233,6 +236,22 @@ impl ConnectionTracker {
 
     /// 喂一次采样。已确认的控制端或捕获可开启会话，日志心跳只用于短暂续期。
     pub fn update(&mut self, signals: &UUSignals, now: f64) -> Option<ConnectionEvent> {
+        let verified_rebuild = match signals.capture_evidence {
+            UuCaptureEvidence::Active { generation } => {
+                self.last_verified_capture = Some((generation, now));
+                false
+            }
+            UuCaptureEvidence::Rebuilding { generation } => self
+                .last_verified_capture
+                .is_some_and(|(previous, last_seen)| {
+                    previous == generation && now >= last_seen && now - last_seen <= CAPTURE_REBUILD_GRACE
+                }),
+            UuCaptureEvidence::Stopped { .. } => {
+                self.last_verified_capture = None;
+                false
+            }
+            UuCaptureEvidence::Unknown | UuCaptureEvidence::HardwareEncoding => false,
+        };
         let remote_evidence = signals.has_remote_evidence();
         if remote_evidence
             && (signals.controllers.readable || signals.capture_evidence != UuCaptureEvidence::HardwareEncoding)
@@ -249,7 +268,7 @@ impl ConnectionTracker {
         let capture_is_recent = self
             .last_remote_evidence_at
             .is_some_and(|last| now - last <= CAPTURE_CONTINUITY_WINDOW);
-        let present = remote_evidence
+        let present = remote_evidence || verified_rebuild
             || (!signals.controllers.readable
                 && signals.is_capturing()
                 && capture_is_recent);
@@ -290,6 +309,29 @@ impl ConnectionTracker {
             Some(quiet) => now > quiet,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn verified_capture_rebuild_keeps_an_existing_connection_for_three_seconds() {
+    let mut tracker = ConnectionTracker::new();
+    let mut sample = UUSignals {
+        overlay_visible: false,
+        controllers: ControllerTable::unreadable(),
+        capture_active: None,
+        capture_evidence: UuCaptureEvidence::Rebuilding { generation: 5 },
+    };
+    assert_eq!(tracker.update(&sample, 0.0), None);
+    assert!(!tracker.is_connected());
+    sample.capture_evidence = UuCaptureEvidence::Active { generation: 5 };
+    assert_eq!(tracker.update(&sample, 1.0), Some(ConnectionEvent::Connected(Vec::new())));
+
+    sample.controllers = ControllerTable::from_names(Vec::<String>::new());
+    sample.capture_evidence = UuCaptureEvidence::Rebuilding { generation: 5 };
+    assert_eq!(tracker.update(&sample, 3.0), None);
+    assert!(tracker.is_connected());
+    assert_eq!(tracker.update(&sample, 5.0), Some(ConnectionEvent::Disconnected));
+    assert_eq!(tracker.update(&sample, 6.0), None);
 }
 
 fn same_set(left: &[String], right: &[String]) -> bool {

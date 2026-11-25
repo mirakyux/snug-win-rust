@@ -66,6 +66,8 @@ const WINDOW_POLL: f64 = 0.1;
 const LAUNCH_WAIT: f64 = 30.0;
 /// C# `WindowWait`：已有进程里新建窗口的等待上限。
 const WINDOW_WAIT: f64 = 10.0;
+/// 单实例 App 回到已有窗口前，先给真正的新窗口留出时间。
+const EXISTING_WINDOW_GRACE: f64 = 2.0;
 /// C# `WatchPoll`：watch 轮询间隔。
 const WATCH_POLL: f64 = 0.25;
 /// C# `QuitWait`：等 App 退出的上限。
@@ -2406,7 +2408,7 @@ impl DeskCore {
 
     // ---- 以下对应 C# 的打开 / 退出 / 关闭与 watch ----
 
-    /// 对应 C# `OpenWindowAsync`：打开 App 并把它的新窗口放上手机屏。
+    /// 对应 C# `OpenWindowAsync`：打开 App 并把新窗口或唤醒的已有窗口放上手机屏。
     fn open_window(&mut self, app: AppInfo, new_window_in: Option<i32>, session_generation: u64) {
         let started = self.now();
         if self.ready_display(&format!("打开 {}", app.name)).is_none() {
@@ -2428,8 +2430,12 @@ impl DeskCore {
                 before.insert(window.key);
             }
         }
+        let mut existing_app_windows = HashSet::new();
         if new_window_in.is_none() {
-            for window in self.shared.apps.app_windows(&app, known_pid) {
+            for window in self.shared.apps.app_windows(&app, None) {
+                if self.shared.apps.can_reuse_window(&app, &window) {
+                    existing_app_windows.insert(window.key);
+                }
                 before.insert(window.key);
             }
         }
@@ -2458,47 +2464,56 @@ impl DeskCore {
         let wait = if known_pid.is_none() { LAUNCH_WAIT } else { WINDOW_WAIT };
         let deadline = self.now() + wait;
         let exit_grace_deadline = self.now() + 3.0;
+        // 在已有同一应用的窗口时，ShellExecute 返回的进程可能只是负责唤醒它。
+        let launch_pid = existing_app_windows.is_empty().then_some(pid);
         while self.wanted()
             && self.shared.session_generation.load(Ordering::SeqCst) == session_generation
         {
-            let pid_windows = self.shared.windows.shown_windows(pid);
+            let pid_windows = launch_pid.map_or_else(Vec::new, |pid| self.shared.windows.shown_windows(pid));
             let app_windows = if new_window_in.is_none() {
-                self.shared.apps.app_windows(&app, Some(pid))
+                self.shared.apps.app_windows(&app, launch_pid)
             } else {
                 Vec::new()
             };
-            let app_windows_empty = app_windows.is_empty();
             let appeared = pid_windows
-                .into_iter()
-                .chain(app_windows)
+                .iter()
+                .chain(&app_windows)
                 .find(|window| !before.contains(&window.key));
-            if let Some(appeared) = appeared {
+            let now = self.now();
+            let launcher_exited = now >= exit_grace_deadline && !self.shared.apps.is_running(pid);
+            let reuse_existing = appeared.is_none()
+                && !existing_app_windows.is_empty()
+                && (launcher_exited || known_pid.is_some() && now >= started + EXISTING_WINDOW_GRACE);
+            let target = if reuse_existing {
+                app_windows.iter().find(|window| existing_app_windows.contains(&window.key))
+            } else {
+                appeared
+            };
+            if let Some(target) = target {
                 if self.shared.session_generation.load(Ordering::SeqCst) != session_generation {
                     return;
                 }
+                let action = if reuse_existing { "沿用已有窗口" } else { "出现" };
                 self.log(format!(
-                    "{}（{:.1}s）出现 {}，放上手机屏",
+                    "{}（{:.1}s）{action} {}，放上手机屏",
                     app.name,
-                    self.now() - started,
-                    appeared.label()
+                    now - started,
+                    target.label()
                 ));
                 self.set_state(
                     self.state()
-                        .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, appeared.label()))),
+                        .with_work(Some(DeskWork::with_label(DeskWorkKind::Placing, target.label()))),
                 );
-                self.place(appeared, true, None);
+                self.place(target.clone(), true, None);
                 return;
             }
-            if !self.shared.apps.is_running(pid)
-                && self.now() >= exit_grace_deadline
-                && app_windows_empty
-            {
+            if launcher_exited && app_windows.is_empty() {
                 self.warn(format!("{} 打开后已退出", app.name));
                 let name = app.name.clone();
                 self.set_state(self.state().with_notice(Some(DeskNotice::OpenFailed { app: name })));
                 return;
             }
-            if self.now() >= deadline {
+            if now >= deadline {
                 self.warn(format!("{} 打开超时无窗口", app.name));
                 let name = app.name.clone();
                 self.set_state(self.state().with_notice(Some(DeskNotice::NoWindow { app: name })));
@@ -4115,6 +4130,45 @@ mod tests {
         assert_eq!(state.placed.as_ref().map(|placed| placed.window.key), Some(key));
         assert!(!state.list_visible);
         assert!(state.work.is_none());
+    }
+
+    #[test]
+    fn open_reuses_an_app_window_after_single_instance_handoff() {
+        for launcher_alive in [false, true] {
+            let harness = Harness::new();
+            let existing = WindowKey::new(66, 0x510);
+            let unrelated = WindowKey::new(75, 0x511);
+            let frame = Rect::new(50.0, 50.0, 1200.0, 800.0);
+            let existing_window = window(existing, Some("Code.exe"), "Workspace");
+            harness.windows.insert_window(existing_window.clone(), frame);
+            harness.windows.insert_window(
+                window(unrelated, Some("notepad.exe"), "Notes"),
+                frame,
+            );
+            harness.apps.set_app_windows("Code.exe", vec![existing_window]);
+            harness.apps.set_open_result(Some(unrelated.pid));
+            harness.apps.set_running(unrelated.pid, launcher_alive);
+            // A known app reaches the fallback after two seconds. With only a
+            // matching window, wait for the launcher to exit and settle first.
+            let elapsed_before_fallback = if launcher_alive {
+                harness.apps.set_pids("Code.exe", vec![existing.pid]);
+                super::EXISTING_WINDOW_GRACE
+            } else {
+                3.0
+            };
+            ready_screen(&harness);
+            let started = harness.timeline.now();
+
+            harness.desk.open(app("VS Code", "Code.exe"));
+            harness.desk.idle();
+
+            let state = harness.desk.state();
+            assert_eq!(state.placed.as_ref().map(|placed| placed.window.key), Some(existing));
+            assert!(state.notice.is_none());
+            assert_eq!(harness.windows.frame_of(unrelated), Some(frame));
+            let elapsed = harness.timeline.now() - started;
+            assert!(elapsed >= elapsed_before_fallback && elapsed < super::WINDOW_WAIT);
+        }
     }
 
     #[test]

@@ -59,6 +59,12 @@ impl DesktopSettings {
         state.repaint = true;
     }
 
+    pub(crate) fn open_projection(&self) {
+        self.open(SettingsTab::Screens);
+        let mut state = self.state.lock().expect("desktop settings");
+        state.projection = Some(Projection::new(Arc::clone(&self.displays)));
+    }
+
     pub(crate) fn close(&self) {
         self.state.lock().expect("desktop settings").close();
     }

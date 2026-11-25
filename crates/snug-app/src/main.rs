@@ -12,6 +12,7 @@ mod display_layout;
 mod driver;
 mod embedded_fonts;
 mod library;
+mod computer_library;
 mod logging;
 mod mobile_library;
 mod privileged;

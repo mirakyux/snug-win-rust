@@ -538,6 +538,9 @@ impl<A: WindowApi> WindowControl for Windows<A> {
         let Some(probe) = self.api.probe(window.handle) else {
             return;
         };
+        if probe.pid != window.pid {
+            return;
+        }
         if probe.minimized {
             self.api.show(window.handle, ShowCommand::Restore);
         }

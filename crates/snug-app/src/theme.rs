@@ -61,6 +61,22 @@ impl Palette {
     };
 }
 
+pub(crate) fn compact_controls(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.interact_size = egui::vec2(32.0, 24.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 12.0;
+    for (kind, size) in [
+        (egui::TextStyle::Body, 14.0),
+        (egui::TextStyle::Button, 14.0),
+        (egui::TextStyle::Small, 12.0),
+    ] {
+        style.text_styles.insert(kind, egui::FontId::proportional(size));
+    }
+}
+
 /// 这一档主题最终是不是深色。`Auto` 去问系统。
 pub fn resolve_dark(mode: AppThemeMode) -> bool {
     match mode {

@@ -176,6 +176,11 @@ pub trait AppControl: Send + Sync {
     fn app_windows(&self, _app: &AppInfo, _launched_pid: Option<i32>) -> Vec<WindowInfo> {
         Vec::new()
     }
+
+    /// Confirms a candidate from `app_windows` may be reused after an app launch.
+    fn can_reuse_window(&self, _app: &AppInfo, _window: &WindowInfo) -> bool {
+        true
+    }
 }
 
 /// 时间线与等待（对应 C# `ITimeline`）。

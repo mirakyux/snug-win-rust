@@ -221,7 +221,7 @@ pub struct HookEngine {
     require_injected_flag: bool,
     logged_first_flag: bool,
     crossdesk_pressed: bool,
-    crossdesk_replaying_drag: bool,
+    crossdesk_replay_point: Option<Point>,
 }
 
 impl Default for HookEngine {
@@ -239,7 +239,7 @@ impl Default for HookEngine {
             require_injected_flag: true,
             logged_first_flag: false,
             crossdesk_pressed: false,
-            crossdesk_replaying_drag: false,
+            crossdesk_replay_point: None,
         }
     }
 }
@@ -298,7 +298,7 @@ impl HookEngine {
         self.held_press_point = None;
         self.passthrough_browser_chrome = false;
         self.crossdesk_pressed = false;
-        self.crossdesk_replaying_drag = false;
+        self.crossdesk_replay_point = None;
     }
 
     /// 单区域便捷入口（C# `SetRegion`）：`None` 等价于空列表。
@@ -809,14 +809,23 @@ impl HookContext {
             let mut outcome = engine.on_event(kind, point, now, injected, replay_marked, |_, _| hit);
             let mut replay_button_event = None;
             if crossdesk && kind == TouchInputKind::Drag {
-                if engine.crossdesk_replaying_drag {
+                if let Some(previous) = engine.crossdesk_replay_point {
+                    // SendInput can emit a stationary WM_MOUSEMOVE immediately before button-up.
+                    // The replay already placed the pointer here, so only pass the later release.
+                    if point == previous {
+                        return Some(true);
+                    }
+                    engine.crossdesk_replay_point = Some(point);
                     replay_button_event = Some(Injection::MoveTo(point));
                     outcome.pass_original = false;
                 } else if outcome.commands.contains(&TouchCommand::ReplayPress) {
-                    engine.crossdesk_replaying_drag = true;
+                    engine.crossdesk_replay_point = Some(point);
                 }
             }
-            if crossdesk && kind == TouchInputKind::Release && std::mem::take(&mut engine.crossdesk_replaying_drag) {
+            if crossdesk
+                && kind == TouchInputKind::Release
+                && engine.crossdesk_replay_point.take().is_some()
+            {
                 replay_button_event = Some(Injection::Button { at: point, down: false, right: false });
                 outcome.pass_original = false;
             }
@@ -1362,6 +1371,7 @@ mod tests {
         assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(false));
         assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(false));
         assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(true));
+        assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
         assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(true));
         assert!(receiver.try_recv().is_ok(), "one translated tap");
         assert!(receiver.try_recv().is_err(), "no duplicate tap from the preceding cursor move");
@@ -1403,8 +1413,12 @@ mod tests {
             assert_eq!(context.dispatch(WM_LBUTTONDOWN, &info), Some(true));
             info.pt.y = 410;
             assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
+            assert_eq!(context.dispatch(WM_MOUSEMOVE, &info), Some(true));
             assert_eq!(context.dispatch(WM_LBUTTONUP, &info), Some(true));
-            (receiver.try_recv().unwrap(), receiver.try_recv().unwrap())
+            let drag = receiver.try_recv().unwrap();
+            let release = receiver.try_recv().unwrap();
+            assert!(receiver.try_recv().is_err(), "stationary input must not enqueue a replay");
+            (drag, release)
         };
         let mut buttons = ReplayButtons {
             input_route: hook.input_route.clone(),

@@ -666,18 +666,20 @@ impl Controller {
     /// 主触控屏的 id（单屏界面默认操作的那块）。
     fn primary_screen_id(&self) -> Option<String> {
         let config = self.config.lock().ok()?;
-        config.primary_touch_screen().map(|screen| screen.id)
+        config.primary_touch_screen().filter(|screen| screen.enabled)
+            .or_else(|| config.effective_screens().into_iter().find(|screen| screen.enabled))
+            .map(|screen| screen.id)
     }
 
-    /// 所有已启用触控屏的 `(id, 名字)`，按配置顺序（多屏切换用）。
-    pub fn touch_screens(&self) -> Vec<(String, String)> {
+    /// 所有已启用屏幕的 `(id, 名字)`，按配置顺序。
+    pub fn enabled_screens(&self) -> Vec<(String, String)> {
         let Ok(config) = self.config.lock() else {
             return Vec::new();
         };
         config
             .effective_screens()
             .into_iter()
-            .filter(|screen| screen.enabled && screen.device.kind.is_touch())
+            .filter(|screen| screen.enabled)
             .map(|screen| (screen.id, screen.name))
             .collect()
     }
@@ -904,6 +906,16 @@ impl Controller {
             return;
         };
         self.enqueue(move |desks| desks.pull(&id, window));
+    }
+
+    pub fn focus_window(&self, key: snug_core::windows::WindowKey, screen: Rect) {
+        use snug_core::desk::services::WindowControl;
+        self.enqueue(move |_| {
+            let windows = snug_win::WinWindows::new();
+            if windows.look(key).is_some_and(|window| !window.minimized && screen.contains(window.frame.center())) {
+                windows.focus(key);
+            }
+        });
     }
 
     /// 启动一个 App（资源库里点没在跑的 App）。
@@ -1135,7 +1147,7 @@ fn active_wishes(
     // 两张表不一致时会出现"建的是电脑副屏、界面却在找手机屏"。
     let wanted_id = match active_screen {
         Some(id) => Some(id.to_string()),
-        None => config.primary_touch_screen().map(|screen| screen.id),
+        None => config.primary_touch_screen().filter(|screen| screen.enabled).map(|screen| screen.id),
     };
     match wanted_id {
         Some(id) => wishes.retain(|wish| wish.id == id),

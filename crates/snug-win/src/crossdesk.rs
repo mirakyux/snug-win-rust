@@ -29,6 +29,8 @@ const LOG_TAIL_BYTES: u64 = 128 * 1024;
 const SHARING_STARTED: &str =
     "Requested display and system idle-sleep inhibition for screen sharing";
 const SHARING_STOPPED: &str = "Released screen sharing power inhibitors";
+const LAST_CONTROLLER_LEFT: &str = "Last remote controller disconnected;";
+const HOST_ATTACHED: &str = "GUI attached to persistent host; no second signaling login";
 
 /// Experimental observation of the desktop host in Snug's Windows session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,9 +370,37 @@ fn report_line<'a>(line: &'a [u8], started_at: &str) -> Option<(&'a str, CrossDe
     if stamp.len() != 23 || stamp < started_at {
         return None;
     }
+    let message = if let Some(source) = message.strip_prefix('[') {
+        let (location, message) = source.split_once("] ")?;
+        let (file, line) = location.rsplit_once(':')?;
+        if file.is_empty() || line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        message
+    } else {
+        message
+    };
     let activity = match message {
         SHARING_STARTED => CrossDeskActivity::Active,
         SHARING_STOPPED | "Logger initialized" => CrossDeskActivity::Inactive,
+        HOST_ATTACHED => CrossDeskActivity::Unknown,
+        _ if message.starts_with(LAST_CONTROLLER_LEFT) => CrossDeskActivity::Inactive,
+        _ if message.starts_with("Privacy: ")
+            && message.ends_with(", reason=Enabling privacy on connection") =>
+        {
+            CrossDeskActivity::Active
+        }
+        "System audio capture started" => CrossDeskActivity::Active,
+        _ if message
+            .strip_prefix("System audio capture started (attempt ")
+            .and_then(|attempt| attempt.strip_suffix(')'))
+            .is_some_and(|attempt| {
+                !attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            CrossDeskActivity::Active
+        }
+        // Both the viewer and host advertise their local displays.
         _ => return None,
     };
     Some((stamp, activity))
@@ -448,5 +478,58 @@ mod tests {
         assert_eq!(report(start, "Start screen capturer"), None);
         let partial = format!("[{start}] [crossdesk] [info] {SHARING_STARTED}");
         assert_eq!(report_line(partial.as_bytes(), start), None);
+    }
+
+    #[test]
+    fn recognizes_windows_177_host_logs_with_a_source_location() {
+        let start = "2026-11-24 13:00:02.033";
+        let report = |location: &str, message: &str| {
+            let line = format!("[{start}] [crossdesk] [info] [{location}] {message}\r\n");
+            report_line(line.as_bytes(), start).map(|(_, activity)| activity)
+        };
+        assert_eq!(
+            report(
+                "privacy_controller.cpp:64",
+                "Privacy: state=2, overlay=false, input_blocked=false, reason=Enabling privacy on connection"
+            ),
+            Some(CrossDeskActivity::Active)
+        );
+        assert_eq!(
+            report(
+                "speaker_capture_controller.cpp:122",
+                "System audio capture started (attempt 1)"
+            ),
+            Some(CrossDeskActivity::Active)
+        );
+        assert_eq!(
+            report(
+                "connection_runtime.cpp:246",
+                "Last remote controller disconnected; recovering privacy, reason=connection_closed"
+            ),
+            Some(CrossDeskActivity::Inactive)
+        );
+        assert_eq!(
+            report("gui_runtime.cpp:388", HOST_ATTACHED),
+            Some(CrossDeskActivity::Unknown)
+        );
+        assert_eq!(
+            report("peer_event_handler.cpp:665", "Local display [1:DISPLAY1]"),
+            None
+        );
+        assert_eq!(
+            report(
+                "privacy_controller.cpp:64",
+                "Privacy: state=5, overlay=false, input_blocked=false, reason=A visible window may overlap privacy coverage"
+            ),
+            None
+        );
+        assert_eq!(
+            report(
+                "speaker_capture_controller.cpp:122",
+                "System audio capture started (attempt failed)"
+            ),
+            None
+        );
+        assert_eq!(report("screen_sharing_power.cpp:no-line", SHARING_STARTED), None);
     }
 }

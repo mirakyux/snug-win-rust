@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use snug_core::apps::AppAction;
-use snug_core::windows::{AppInfo, RunningApp};
+use snug_core::windows::{AppInfo, RunningApp, WindowKey};
+use snug_core::Rect;
 use snug_win::WinApps;
 
 /// 多久重新扫一次（新装的 App 最多半分钟后出现）。
@@ -22,7 +23,13 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 后台扫描的线程句柄与结果通道。
 struct Scan {
-    rx: std::sync::mpsc::Receiver<(Vec<AppInfo>, Vec<RunningApp>)>,
+    rx: std::sync::mpsc::Receiver<ScanResult>,
+}
+
+struct ScanResult {
+    installed: Vec<AppInfo>,
+    running: Vec<RunningApp>,
+    frames: HashMap<WindowKey, Rect>,
 }
 
 pub struct Library {
@@ -30,6 +37,7 @@ pub struct Library {
     icons_service: WinApps,
     installed: Vec<AppInfo>,
     running: Vec<RunningApp>,
+    frames: HashMap<WindowKey, Rect>,
     /// AppId → 图标；`None` 表示取过但拿不到（例如未运行的 UWP），别反复重试。
     icons: HashMap<String, Option<egui::TextureHandle>>,
     scan: Option<Scan>,
@@ -50,6 +58,7 @@ impl Library {
             icons_service: WinApps::new(),
             installed: Vec::new(),
             running: Vec::new(),
+            frames: HashMap::new(),
             icons: HashMap::new(),
             scan: None,
             last_scan: None,
@@ -59,6 +68,10 @@ impl Library {
 
     pub fn running(&self) -> &[RunningApp] {
         &self.running
+    }
+
+    pub(crate) fn frame(&self, window: WindowKey) -> Option<Rect> {
+        self.frames.get(&window).copied()
     }
 
     /// 只给测试：塞一份现成的 App 列表进去（真机构造要走 COM，测试里不要碰）。
@@ -97,7 +110,14 @@ impl Library {
                 let service = WinApps::new();
                 let installed = service.scan_installed_apps();
                 let running = service.running_apps();
-                let _ = tx.send((installed, running));
+                let frames = running
+                    .iter()
+                    .flat_map(|app| &app.windows)
+                    .filter_map(|window| {
+                        snug_win::window::frame_of(window.key.handle).map(|frame| (window.key, frame))
+                    })
+                    .collect();
+                let _ = tx.send(ScanResult { installed, running, frames });
             })
             .ok();
     }
@@ -108,7 +128,7 @@ impl Library {
 
         let Some(scan) = &self.scan else { return };
         match scan.rx.try_recv() {
-            Ok((installed, running)) => {
+            Ok(ScanResult { installed, running, frames }) => {
                 crate::info!(
                     "资源库：{} 个已安装 App、{} 个运行中",
                     installed.len(),
@@ -116,6 +136,7 @@ impl Library {
                 );
                 self.installed = installed;
                 self.running = running;
+                self.frames = frames;
                 self.last_scan = Some(Instant::now());
                 self.scanned_once = true;
                 self.scan = None;

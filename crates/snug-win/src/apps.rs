@@ -179,10 +179,10 @@ pub fn is_installer_or_helper(exe: &str, name: &str) -> bool {
 
 /// 判定一个窗口是不是 `app` 的窗口。
 ///
-/// 规则与 C# 一致，按顺序：
+/// 按以下顺序判定：
 /// 1. 调用方指定的 `launched_pid` 命中窗口进程；
-/// 2. 窗口的 `AppId` 等于目标 exe 名；
-/// 3. 窗口所属进程的可执行文件在 App 的安装目录下（`image_path_of` 提供）；
+/// 2. 已知双方路径时，窗口所属进程的可执行文件位于 App 的安装目录下；
+/// 3. 路径无法核对时，窗口的 `AppId` 等于目标 exe 名；
 /// 4. UWP App：窗口标题或 App 名与 App 显示名匹配。
 ///
 /// 判定窗口匹配时**不**调用任何系统 API：进程镜像路径由调用方注入（便于测试）。
@@ -211,19 +211,19 @@ pub fn window_belongs_to(
         .filter(|path| !path.is_empty())
         .and_then(parent_dir);
 
+    if !uwp
+        && let Some(target_dir) = target_dir.as_deref()
+        && let Some(image) = image_path_of(window.key.pid)
+        && let Some(image) = image.to_str()
+    {
+        return image_is_in_directory(image, target_dir);
+    }
+
     if !target_exe.is_empty()
         && window
             .app_id
             .as_deref()
             .is_some_and(|app_id| app_id.eq_ignore_ascii_case(&target_exe))
-    {
-        return true;
-    }
-
-    if let Some(target_dir) = target_dir.as_deref()
-        && let Some(image) = image_path_of(window.key.pid)
-        && let Some(image) = image.to_str()
-        && starts_with_ignore_case(image, target_dir)
     {
         return true;
     }
@@ -236,8 +236,10 @@ pub fn window_belongs_to(
     false
 }
 
-fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
-    text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+fn image_is_in_directory(image: &str, directory: &str) -> bool {
+    let directory = directory.trim_end_matches(['\\', '/']);
+    image.get(..directory.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(directory))
+        && matches!(image.as_bytes().get(directory.len()), Some(b'\\' | b'/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -837,16 +839,7 @@ impl<S: AppSystem> AppControl for Apps<S> {
             // UWP 是交给 explorer 打开的，C# 直接返回 0。
             Some(_) if is_uwp(&app.app_id) => Some(0),
             // 普通 App 被既有实例接管时，按 exe 名找回进程；找不到也给 0。
-            Some(_) => {
-                let exe = app.executable_path.as_deref().unwrap_or(&app.app_id);
-                Some(
-                    self.system
-                        .processes_named(exe_stem(exe))
-                        .first()
-                        .map(|entry| entry.pid)
-                        .unwrap_or(0),
-                )
-            }
+            Some(_) => Some(self.pid_of(app).unwrap_or(0)),
         }
     }
 
@@ -902,6 +895,22 @@ impl<S: AppSystem> AppControl for Apps<S> {
                 })
             })
             .collect()
+    }
+
+    fn can_reuse_window(&self, app: &AppInfo, window: &WindowInfo) -> bool {
+        let matches_app_id = |id: &str| {
+            window.app_id.as_deref().is_some_and(|window_id| window_id.eq_ignore_ascii_case(id))
+        };
+        if is_uwp(&app.app_id) {
+            return matches_app_id(&app.app_id);
+        }
+        let target = app.executable_path.as_deref().unwrap_or(&app.app_id);
+        let executable = file_name(target);
+        if let Some(image) = self.system.image_path(window.key.pid) {
+            return file_name(&image).eq_ignore_ascii_case(executable)
+                && parent_dir(target).is_none_or(|directory| image_is_in_directory(&image, &directory));
+        }
+        matches_app_id(executable)
     }
 }
 
@@ -2340,6 +2349,30 @@ mod tests {
         };
         let matched = apps.app_windows(&uwp, None);
         assert!(matched.iter().any(|window| window.key.pid == 12));
+    }
+
+    #[test]
+    fn existing_window_reuse_requires_app_identity_even_in_a_shared_directory() {
+        let mut system = FakeSystem::default();
+        system.window(10, 1, "Terminal", Some("Term.exe"), "existing");
+        system.window(11, 2, "Editor", Some("Editor.exe"), "unrelated");
+        system.window(12, 3, "Terminal", Some("Term.exe"), "other install");
+        system.window(13, 4, "Terminal", Some("Term.exe"), "image path unavailable");
+        system.images.insert(10, r"C:\Portable\Term.exe".into());
+        system.images.insert(11, r"C:\Portable\Editor.exe".into());
+        system.images.insert(12, r"C:\Other\Term.exe".into());
+        let apps = Apps::with_system(system);
+        let terminal = AppInfo {
+            executable_path: Some(r"C:\Portable\Term.exe".into()),
+            ..app("Term.exe", "Terminal")
+        };
+        let candidates = apps.app_windows(&terminal, None);
+        assert!(candidates.iter().any(|window| window.key.pid == 11));
+        let reusable: Vec<_> = candidates.iter()
+            .filter(|window| apps.can_reuse_window(&terminal, window))
+            .map(|window| window.key.pid)
+            .collect();
+        assert_eq!(reusable, vec![10, 13]);
     }
 
     #[test]

@@ -1,18 +1,7 @@
 //! 托盘图标，移植自 C# 版 `App.xaml.cs` 的 `NotifyIcon` 部分。
 //!
-//! 托盘菜单：
-//! 1. `状态：…`（禁用，随状态刷新）
-//! 2. 分隔线
-//! 3. `打开桌面设置...` → 实体屏上的设置窗
-//! 4. `预览手机界面...` → 桌面预览窗（对应 C# `OpenPhonePreview`）
-//! 5. `检查更新...` → 设置窗第 3 页（关于与更新）
-//! 6. `重新进入手机屏` → 撤销"收起手机屏"（C# `_reentryMenuItem`）
-//! 7. `手机屏显示` → 当前配置的三种显示模式
-//! 8. 分隔线
-//! 9. `退出 SnugWin（先还原窗口）`
-//!
-//! 一处**有意偏离**：C# 用 `Visible = false` 藏起第 6 项，`muda 0.19` 的
-//! `MenuItem` 没有 `set_visible`，这里改成"不可用时禁用"（`set_enabled`）。
+//! 菜单提供桌面设置、虚拟屏投影、预览、驱动与日志和检查更新。重新进入手机屏只在
+//! 会话允许恢复时启用。显示模式和退出也从这里操作。
 //!
 //! 双击托盘 = 打开设置（C# `_trayIcon.DoubleClick`）。
 //! 图标随连接状态切换（沿用 C# 的两张 ICO，预先转成 32×32 RGBA）。
@@ -24,7 +13,7 @@ use snug_core::PhoneScreenMode;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::settings::{PHONE_SCREEN_MODES, phone_screen_mode_label};
+use crate::settings::{PHONE_SCREEN_MODES, SettingsTab, phone_screen_mode_label};
 
 const ICON_SIZE: u32 = 32;
 const ICON_BYTES: usize = (ICON_SIZE * ICON_SIZE * 4) as usize;
@@ -38,6 +27,7 @@ const CONNECTED_ICON: &[u8; ICON_BYTES] = include_bytes!("../assets/snugwin-conn
 pub enum TrayCommand {
     /// 打开设置窗并切到指定页（C# 的 `ShowSettings(index)`）。
     OpenSettings(usize),
+    OpenProjection,
     /// 桌面预览手机界面（C# `OpenPhonePreview`）。
     OpenPreview,
     /// 重新进入手机屏：撤销"收起"（C# `ReenterScreen`）。
@@ -56,6 +46,8 @@ pub struct Tray {
     reentry_item: MenuItem,
     settings_id: MenuId,
     update_id: MenuId,
+    diagnostics_id: MenuId,
+    projection_id: MenuId,
     preview_id: MenuId,
     reentry_id: MenuId,
     quit_id: MenuId,
@@ -70,6 +62,8 @@ impl Tray {
         let settings = MenuItem::new("打开桌面设置...", true, None);
         let preview = MenuItem::new("预览手机界面...", true, None);
         let update = MenuItem::new("检查更新...", true, None);
+        let diagnostics = MenuItem::new("驱动与日志...", true, None);
+        let projection = MenuItem::new("虚拟屏投影...", true, None);
         // C# 里这一项默认 `Visible = false`，只在"手机屏被收起且还在会话里"时出现。
         let reentry = MenuItem::new("重新进入手机屏", false, None);
         let mode_items = PHONE_SCREEN_MODES.map(|option| {
@@ -92,7 +86,9 @@ impl Tray {
             &status_item,
             &PredefinedMenuItem::separator(),
             &settings,
+            &projection,
             &preview,
+            &diagnostics,
             &update,
             &reentry,
             &modes,
@@ -125,6 +121,8 @@ impl Tray {
             settings_id: settings.id().clone(),
             preview_id: preview.id().clone(),
             update_id: update.id().clone(),
+            diagnostics_id: diagnostics.id().clone(),
+            projection_id: projection.id().clone(),
             quit_id: quit.id().clone(),
             connected,
             last_summary: String::new(),
@@ -141,6 +139,10 @@ impl Tray {
                 out.push(TrayCommand::OpenPreview);
             } else if event.id == self.update_id {
                 out.push(TrayCommand::OpenSettings(3));
+            } else if event.id == self.diagnostics_id {
+                out.push(TrayCommand::OpenSettings(SettingsTab::Diagnostics.index()));
+            } else if event.id == self.projection_id {
+                out.push(TrayCommand::OpenProjection);
             } else if event.id == self.reentry_id {
                 if self.reentry_item.is_enabled() {
                     out.push(TrayCommand::Reenter);
