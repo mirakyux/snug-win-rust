@@ -20,3 +20,6 @@ tools/refdump/geometry/obj/
 # 驱动安装包（3 MB，打包时由 scripts/fetch-driver.ps1 下载并核对 SHA-256）
 driver/virtual-desktop-driver-installer-x64.zip
 driver/installer/
+
+# 驱动使用独立的固定 nightly 工作区；生成文件不进入源码。
+/vendor/virtual-display-rs/target/

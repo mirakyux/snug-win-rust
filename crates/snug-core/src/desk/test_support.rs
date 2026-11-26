@@ -305,6 +305,8 @@ impl PhoneDisplays for FakeDisplays {
 }
 
 type CloseButtonHook = Arc<dyn Fn(WindowKey) -> Option<Rect> + Send + Sync>;
+type ZoomHook = Arc<dyn Fn(WindowKey, i32) + Send + Sync>;
+type LookHook = Arc<dyn Fn(WindowKey) + Send + Sync>;
 
 /// 假窗口服务，对应 C# `FakeWindows`（并补上 C# 测试里没用到的"列出窗口"能力）。
 pub struct FakeWindows {
@@ -316,12 +318,15 @@ pub struct FakeWindows {
     misplaced_moves_remaining: Mutex<usize>,
     move_calls: Mutex<Vec<(WindowKey, Rect)>>,
     zoom_ok: AtomicBool,
+    zoom_uncertain: AtomicBool,
+    zoom_hook: Mutex<Option<ZoomHook>>,
     restore_calls: Mutex<Vec<(HashMap<WindowKey, Rect>, Option<WindowKey>)>>,
     full_screen_calls: Mutex<Vec<(WindowKey, bool)>>,
     minimized_calls: Mutex<Vec<(WindowKey, bool)>>,
     full_screen_state: Mutex<HashMap<WindowKey, bool>>,
     minimized_state: Mutex<HashMap<WindowKey, bool>>,
     close_button_hook: Mutex<Option<CloseButtonHook>>,
+    look_hook: Mutex<Option<LookHook>>,
 }
 
 impl Default for FakeWindows {
@@ -335,17 +340,24 @@ impl Default for FakeWindows {
             misplaced_moves_remaining: Mutex::new(0),
             move_calls: Mutex::new(Vec::new()),
             zoom_ok: AtomicBool::new(true),
+            zoom_uncertain: AtomicBool::new(false),
+            zoom_hook: Mutex::new(None),
             restore_calls: Mutex::new(Vec::new()),
             full_screen_calls: Mutex::new(Vec::new()),
             minimized_calls: Mutex::new(Vec::new()),
             full_screen_state: Mutex::new(HashMap::new()),
             minimized_state: Mutex::new(HashMap::new()),
             close_button_hook: Mutex::new(None),
+            look_hook: Mutex::new(None),
         }
     }
 }
 
 impl FakeWindows {
+    pub fn on_look(&self, hook: impl Fn(WindowKey) + Send + Sync + 'static) {
+        *self.look_hook.lock().expect("look hook") = Some(Arc::new(hook));
+    }
+
     pub fn on_close_button(&self, hook: impl Fn(WindowKey) -> Option<Rect> + Send + Sync + 'static) {
         *self.close_button_hook.lock().expect("close button hook") = Some(Arc::new(hook));
     }
@@ -381,8 +393,16 @@ impl FakeWindows {
         self.zoom_delta_total.load(Ordering::SeqCst)
     }
 
+    pub fn set_zoom_uncertain(&self, uncertain: bool) {
+        self.zoom_uncertain.store(uncertain, Ordering::SeqCst);
+    }
+
     pub fn set_zoom_ok(&self, ok: bool) {
         self.zoom_ok.store(ok, Ordering::SeqCst);
+    }
+
+    pub fn on_zoom(&self, hook: impl Fn(WindowKey, i32) + Send + Sync + 'static) {
+        *self.zoom_hook.lock().expect("zoom hook") = Some(Arc::new(hook));
     }
 
     /// C# 测试里 `FakeWindows.MinLogicalWidth` 用来模拟"窗口最小宽度把 540 撑到 700"。
@@ -431,6 +451,10 @@ impl WindowControl for FakeWindows {
     }
 
     fn look(&self, window: WindowKey) -> Option<WindowLook> {
+        let hook = self.look_hook.lock().expect("look hook").clone();
+        if let Some(hook) = hook {
+            hook(window);
+        }
         let frame = self.frame_of(window)?;
         Some(WindowLook {
             frame,
@@ -469,12 +493,22 @@ impl WindowControl for FakeWindows {
 
     fn focus(&self, _window: WindowKey) {}
 
-    fn zoom(&self, _window: WindowKey, steps: i32) -> bool {
+    fn zoom(&self, window: WindowKey, steps: i32) -> bool {
+        if let Some(hook) = self.zoom_hook.lock().expect("zoom hook").clone() {
+            hook(window, steps);
+        }
         if !self.zoom_ok.load(Ordering::SeqCst) {
             return false;
         }
         self.zoom_delta_total.fetch_add(steps, Ordering::SeqCst);
         true
+    }
+
+    fn zoom_outcome(&self, window: WindowKey, steps: i32) -> crate::desk::services::ZoomOutcome {
+        use crate::desk::services::ZoomOutcome;
+        let uncertain = self.zoom_uncertain.load(Ordering::SeqCst);
+        if !self.zoom(window, if uncertain { steps.signum() } else { steps }) { ZoomOutcome::NotApplied }
+        else if uncertain { ZoomOutcome::Uncertain } else { ZoomOutcome::Applied }
     }
 
     fn shown_windows(&self, pid: i32) -> Vec<WindowInfo> {

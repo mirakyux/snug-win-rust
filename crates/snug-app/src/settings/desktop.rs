@@ -36,6 +36,7 @@ impl SettingsWindow {
             .show(ctx, |ui| {
                 compact_controls(ui);
                 ui.heading(self.tab.page_title());
+                self.show_config_save_error(ui);
                 ui.add_space(6.0);
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt(("desktop-settings-page", self.tab.index()))

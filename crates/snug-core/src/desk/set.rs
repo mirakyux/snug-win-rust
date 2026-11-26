@@ -12,7 +12,7 @@
 //! 状态变化只在真的变化时向上转发一次（`Desk::set_state` 自己会去重）。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::paths::Paths;
 use crate::screen_plan::{ScreenBehavior, ScreenWish};
@@ -66,6 +66,7 @@ pub struct DeskSet {
     wishes: Vec<ScreenWish>,
     remote: bool,
     events: DeskSetEvents,
+    restore_files_discovered: Mutex<bool>,
 }
 
 impl DeskSet {
@@ -96,6 +97,7 @@ impl DeskSet {
             wishes: Vec::new(),
             remote: false,
             events: options.events,
+            restore_files_discovered: Mutex::new(false),
         }
     }
 
@@ -120,6 +122,7 @@ impl DeskSet {
     pub fn set_wishes(&mut self, wishes: Vec<ScreenWish>) {
         self.wishes = wishes.clone();
         let next_keys: Vec<String> = wishes.iter().map(|wish| DeskHub::key(&wish.id)).collect();
+        self.discover_restore_files();
 
         // 1) 消失的屏：先入队撤屏，再从活跃集合摘掉；未下线的 core 留给定时善后。
         let stale: Vec<String> = self
@@ -169,6 +172,65 @@ impl DeskSet {
         }
 
         self.notify_state_changed();
+    }
+
+    /// Recover records left by screens removed from the saved configuration.
+    /// These cores keep wanted=false, so recovery never creates their displays.
+    fn discover_restore_files(&self) {
+        let mut discovered = self.restore_files_discovered.lock().expect("restore discovery");
+        if *discovered {
+            return;
+        }
+        let ids = (|| -> std::io::Result<Vec<String>> {
+            let entries = match std::fs::read_dir(self.paths.data_dir()) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let mut ids = Vec::new();
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue; };
+                let lower = name.to_ascii_lowercase();
+                let id = if lower == "phone-screen.json" {
+                    crate::config::ScreenConfig::LEGACY_PHONE_ID.to_string()
+                } else if let Some(id) = lower.strip_prefix("screen-").and_then(|name| name.strip_suffix(".json")) {
+                    if id.is_empty() || id.eq_ignore_ascii_case(crate::config::ScreenConfig::LEGACY_PHONE_ID) {
+                        continue;
+                    }
+                    name["screen-".len()..name.len() - ".json".len()].to_string()
+                } else {
+                    continue;
+                };
+                // Matching paths must also guard unreadable directories or links.
+                // The existing ledger reader decides whether recovery is possible.
+                ids.push(id);
+            }
+            Ok(ids)
+        })();
+        let ids = match ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.log(format!("还原记录目录读取失败，暂不处理共享归还，稍后重试：{error}"));
+                self.lane.run(|hub: &mut DeskHub| hub.set_restore_scan_failed(true));
+                return;
+            }
+        };
+        for id in ids {
+            let key = DeskHub::key(&id);
+            if self.desks.contains_key(&key) || self.wishes.iter().any(|wish| DeskHub::key(&wish.id) == key) {
+                continue;
+            }
+            let _desk = Desk::spawn(
+                &self.lane, self.books.clone(), self.displays.clone(), self.windows.clone(), self.apps.clone(),
+                &self.paths, self.timeline.clone(), self.default_zoom, crate::screen_fit::ScreenFit::standard(),
+                id, "残留窗口恢复", ScreenBehavior::TouchScreen, self.forwarded_events(), None,
+            );
+            self.lane.run(move |hub: &mut DeskHub| hub.remove(&key));
+        }
+        self.lane.run(|hub: &mut DeskHub| hub.set_restore_scan_failed(false));
+        *discovered = true;
     }
 
     /// 把单个 desk 的事件转发成 set 级事件（C# 在 `SetWishes` 里逐 desk 挂回调）。
@@ -254,9 +316,11 @@ impl DeskSet {
     }
 
     pub fn recover(&self) {
+        self.discover_restore_files();
         for desk in self.desks.values() {
             desk.recover();
         }
+        self.lane.run(|hub: &mut DeskHub| hub.settle_retired());
     }
 
     pub fn verify_placement(&self) {
@@ -272,6 +336,7 @@ impl DeskSet {
     }
 
     pub fn settle_displays(&self) {
+        self.discover_restore_files();
         for desk in self.desks.values() {
             desk.settle_displays();
         }
@@ -422,12 +487,15 @@ impl DeskSet {
                 log(&format!("放 {label}：桌面队列开始执行"));
             }
             // 屏没就绪时不要先摘别处的记录：C# 在 `PlaceAsync` 里也是先过 `ReadyDisplay`。
-            let transfer = if ready { hub.detach_for_transfer(&target_key, window_key) } else { None };
-            match hub.core_mut(&target_key) {
-                Some(core) => core.pull_with(window, transfer),
-                None => {
-                    if let Some(log) = &log {
-                        log(&format!("放 {label}：桌面队列里没有屏 {key_label}"));
+            if ready {
+                hub.pull_with_transfer(&target_key, window);
+            } else {
+                match hub.core_mut(&target_key) {
+                    Some(core) => { core.pull_with(window, None); }
+                    None => {
+                        if let Some(log) = &log {
+                            log(&format!("放 {label}：桌面队列里没有屏 {key_label}"));
+                        }
                     }
                 }
             }
@@ -539,6 +607,741 @@ mod tests {
     use crate::screen_fit::ScreenFit;
     use crate::store::RestoreRecordStore;
     use crate::windows::{AppInfo, WindowKey};
+
+    #[cfg(windows)]
+    fn startup_shared_read_failure_preserves_debts(unlock_before_handoff: bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        let mut harness = DeskSetHarness::new();
+        let old = closed_record(960, "Code.exe");
+        let new = closed_record(961, "notepad.exe");
+        let path = harness.paths.left_behind_file();
+        let store = JsonFileStore::<LeftBehindBook>::new(&path);
+        store.save(&LeftBehindBook {
+            entries: vec![LeftBehindEntry::new(old.clone(), 1_800_000_000_000)],
+        }).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        // Deny reads while explicitly allowing replacement of the destination.
+        let guard = std::fs::OpenOptions::new()
+            .write(true).share_mode(0x2 | 0x4).open(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap_err().raw_os_error(), Some(32));
+        restart_set(&mut harness);
+        let mut guard = Some(guard);
+        if unlock_before_handoff {
+            guard.take();
+        }
+        harness.set.set_wishes(vec![harness.wish("a")]);
+        harness.set.idle();
+        let source = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a")));
+        source.record(&new).unwrap();
+        harness.set.recover();
+        harness.set.idle();
+        drop(guard);
+
+        if !unlock_before_handoff {
+            assert_eq!(std::fs::read(&path).unwrap(), original, "unread shared debts must not be overwritten");
+            assert_eq!(source.pending(), Some(new.clone()), "the new source must stay recoverable");
+            assert_eq!(harness.set.state_of("a").unwrap().notice, Some(crate::desk::model::DeskNotice::RecordUnwritable));
+            harness.set.recover();
+            harness.set.idle();
+        }
+        let saved = store.try_load_or_quarantine().unwrap().unwrap();
+        assert!(saved.entries.iter().any(|entry| entry.record == old));
+        assert!(saved.entries.iter().any(|entry| entry.record == new));
+        assert!(source.pending().is_none(), "unlocking must allow the handoff to retry");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_shared_read_failure_retries_after_unlock_before_handoff() {
+        startup_shared_read_failure_preserves_debts(true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_shared_read_failure_preserves_source_while_writes_are_allowed() {
+        startup_shared_read_failure_preserves_debts(false);
+    }
+
+    #[test]
+    fn automatic_returns_skip_other_screen_active_placement() {
+        let harness = ready_two_screens();
+        let key = WindowKey::new(901, 0x9011);
+        let info = window(key, Some("Code.exe"), "active workspace");
+        harness.windows.insert_window(info.clone(), Rect::new(10.0, 20.0, 800.0, 600.0));
+        harness.set.pull("a", info);
+        harness.set.idle();
+        let before = harness.windows.frame_of(key).expect("active frame");
+        let active = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a"))).pending().expect("active debt");
+        let stale = PhoneRecord {
+            window: WindowKey::new(901, 0x9012),
+            original: Rect::new(800.0, 600.0, 700.0, 500.0),
+            title: Some("closed workspace".into()),
+            ..active
+        };
+        harness.set.books.left_behind.lock().expect("shared book").entries.push(crate::left_behind::LeftBehindEntry::new(stale, 1_800_000_000_000));
+        harness.apps.set_pids("Code.exe", vec![901]);
+        harness.set.check_returns();
+        harness.set.idle();
+        let after = harness.windows.frame_of(key).expect("active frame");
+        eprintln!("active A before={before:?}, after B checks={after:?}, zoom_delta={}", harness.windows.zoom_delta_total());
+        assert_eq!(after, before, "B must not move a window currently owned by A");
+        assert_eq!(harness.windows.zoom_delta_total(), 2, "B must not repay A's live zoom debt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_screen_cannot_consume_unsettled_shared_handoff() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let old = WindowKey::new(900, 0x9001);
+        let other = WindowKey::new(900, 0x9002);
+        harness.windows.insert_window(window(other, Some("zed.exe"), "other"), Rect::new(10.0, 20.0, 800.0, 600.0));
+        let record = PhoneRecord {
+            window: old,
+            app: "Zed".into(),
+            app_id: Some("zed.exe".into()),
+            label: "closed source".into(),
+            zoom: 2,
+            original: Rect::new(10.0, 20.0, 800.0, 600.0),
+            filled: Some(Rect::new(2560.0, 0.0, 1080.0, 1800.0)),
+            ..PhoneRecord::default()
+        };
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).expect("source ledger");
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).expect("deny source settlement");
+        harness.set.recover();
+        harness.set.check_returns();
+        harness.set.idle();
+        let while_locked = harness.windows.zoom_delta_total();
+        eprintln!("while source A locked: zoom_delta={while_locked}, source_pending={}", ledger.pending().is_some());
+        drop(guard);
+        harness.set.recover();
+        harness.set.idle();
+        let after_retry = harness.windows.zoom_delta_total();
+        eprintln!("after unlock/recover: zoom_delta={after_retry}, source_pending={}", ledger.pending().is_some());
+        assert_eq!(while_locked, 0, "B must not repay shared destination while A still owns source debt");
+        assert_eq!(after_retry, -2, "repay the source debt exactly once");
+    }
+
+    #[test]
+    fn uncertain_app_zoom_keeps_shared_source_until_manual_confirmation() {
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        let harness = ready_two_screens();
+        let record = closed_record(930, "zed.exe");
+        let key = WindowKey::new(930, 0x9301);
+        let returned = Rect::new(100.0, 100.0, 1080.0, 1800.0);
+        harness.windows.insert_window(window(key, Some("zed.exe"), "returned Zed"), returned);
+        harness.apps.set_pids("zed.exe", vec![930]);
+        let book = LeftBehindBook {
+            entries: vec![LeftBehindEntry::new(record.clone(), 1_800_000_000_000)],
+        };
+        *harness.set.books.left_behind.lock().unwrap() = book.clone();
+        let store = JsonFileStore::<LeftBehindBook>::new(harness.paths.left_behind_file());
+        store.save(&book).unwrap();
+        harness.windows.set_zoom_uncertain(true);
+
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -1);
+        assert_eq!(harness.windows.frame_of(key), Some(returned), "pending zoom must stop the same return scan");
+        assert_eq!(store.try_load_strict().unwrap().unwrap().entries.len(), 1,
+            "the pending journal must retain its only shared source");
+        assert!(harness.paths.data_dir().join("zoom-operation.json").exists());
+
+        harness.windows.set_zoom_uncertain(false);
+        harness.set.desk_for_screen(Some("a")).unwrap().confirm_manual_zoom_reset();
+        harness.set.idle();
+        assert!(!harness.paths.data_dir().join("zoom-operation.json").exists());
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -1, "manual confirmation cannot send more keys");
+        assert_eq!(harness.windows.frame_of(key), Some(record.original));
+        assert!(store.try_load_strict().unwrap().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn uncertain_app_zoom_stops_clearing_later_shared_debts() {
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        let harness = ready_two_screens();
+        let pending = closed_record(931, "zed.exe");
+        let later = closed_record(932, "zed.exe");
+        harness.windows.insert_window(window(WindowKey::new(931, 0x9311), Some("zed.exe"), "active Zed"),
+            Rect::new(100.0, 100.0, 800.0, 600.0));
+        harness.apps.set_running(932, false);
+        let book = LeftBehindBook {
+            entries: vec![LeftBehindEntry::new(pending, 1_800_000_000_000),
+                LeftBehindEntry::new(later.clone(), 1_800_000_000_000)],
+        };
+        *harness.set.books.left_behind.lock().unwrap() = book.clone();
+        let store = JsonFileStore::<LeftBehindBook>::new(harness.paths.left_behind_file());
+        store.save(&book).unwrap();
+        harness.windows.set_zoom_uncertain(true);
+
+        harness.set.check_returns();
+        harness.set.idle();
+        let saved = store.try_load_strict().unwrap().unwrap();
+        assert_eq!(saved.entries[1].record, later, "a pending zoom must stop later shared debt mutations");
+        assert_eq!(harness.windows.zoom_delta_total(), -1);
+        assert!(harness.paths.data_dir().join("zoom-operation.json").exists());
+    }
+
+    #[test]
+    fn rejected_app_zoom_keeps_shared_source_for_retry() {
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        let harness = ready_two_screens();
+        let record = closed_record(933, "zed.exe");
+        let key = WindowKey::new(933, 0x9331);
+        let returned = Rect::new(100.0, 100.0, 1080.0, 1800.0);
+        harness.windows.insert_window(window(key, Some("zed.exe"), "returned Zed"), returned);
+        harness.apps.set_pids("zed.exe", vec![933]);
+        let book = LeftBehindBook {
+            entries: vec![LeftBehindEntry::new(record.clone(), 1_800_000_000_000)],
+        };
+        *harness.set.books.left_behind.lock().unwrap() = book.clone();
+        let store = JsonFileStore::<LeftBehindBook>::new(harness.paths.left_behind_file());
+        store.save(&book).unwrap();
+        harness.windows.set_zoom_ok(false);
+
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.frame_of(key), Some(returned));
+        assert_eq!(store.try_load_strict().unwrap().unwrap().entries[0].record, record,
+            "rejected app-wide input must preserve its zoom debt");
+        assert!(!harness.paths.data_dir().join("zoom-operation.json").exists());
+
+        harness.windows.set_zoom_ok(true);
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert_eq!(harness.windows.frame_of(key), Some(record.original));
+        assert!(store.try_load_strict().unwrap().unwrap().entries.is_empty());
+    }
+
+    fn closed_record(pid: i32, app_id: &str) -> PhoneRecord {
+        PhoneRecord {
+            window: WindowKey::new(pid, pid as u64 * 16),
+            app: app_id.into(),
+            app_id: Some(app_id.into()),
+            label: "closed source".into(),
+            zoom: 2,
+            original: Rect::new(10.0, 20.0, 800.0, 600.0),
+            filled: Some(Rect::new(2560.0, 0.0, 1080.0, 1800.0)),
+            ..PhoneRecord::default()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_placement_waits_for_other_screen_handoff_settlement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let record = closed_record(902, "Code.exe");
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a")));
+        ledger.record(&record).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+            .open(harness.paths.record_file_for_screen(Some("a"))).unwrap();
+        harness.set.recover();
+        harness.set.idle();
+        let key = WindowKey::new(902, 0x9021);
+        let info = window(key, Some("Code.exe"), "returned workspace");
+        harness.windows.insert_window(info.clone(), record.filled.unwrap());
+        harness.set.pull("b", info.clone());
+        harness.set.idle();
+        assert!(harness.set.state_of("b").unwrap().placed.is_none());
+        assert!(!harness.set.record_file_exists("b"));
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(harness.set.books.left_behind.lock().unwrap().entries[0].record, record);
+
+        drop(guard);
+        harness.set.recover();
+        harness.set.idle();
+        harness.set.pull("b", info);
+        harness.set.idle();
+        assert!(harness.set.state_of("b").unwrap().placed.is_some());
+        assert!(ledger.pending().is_none());
+        let target = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("b"))).pending().unwrap();
+        assert_eq!(target.original, record.original);
+        assert_eq!(target.zoom, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retired_source_stays_protected_and_retries_after_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut harness = ready_two_screens();
+        let record = closed_record(903, "zed.exe");
+        let other = WindowKey::new(903, 0x9031);
+        harness.windows.insert_window(window(other, Some("zed.exe"), "other"), record.original);
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        harness.set.recover();
+        harness.set.idle();
+        harness.set.set_wishes(vec![harness.wish("b")]);
+        harness.set.check_returns();
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert!(harness.set.state_of("a").is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending(), Some(record));
+
+        drop(guard);
+        harness.set.settle_displays();
+        harness.set.idle();
+        harness.set.check_returns();
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert!(ledger.pending().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_source_blocks_shared_consumers_until_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let record = closed_record(904, "zed.exe");
+        let key = WindowKey::new(904, 0x9041);
+        let info = window(key, Some("zed.exe"), "returned");
+        harness.windows.insert_window(info.clone(), record.filled.unwrap());
+        harness.apps.set_pids("zed.exe", vec![904]);
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).unwrap();
+        harness.set.books.left_behind.lock().unwrap().entries.push(
+            crate::left_behind::LeftBehindEntry::new(record.clone(), 1_800_000_000_000));
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        harness.set.check_returns();
+        harness.set.pull("b", info);
+        harness.set.idle();
+        assert!(harness.set.state_of("b").unwrap().placed.is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(harness.set.books.left_behind.lock().unwrap().entries[0].record, record);
+
+        drop(guard);
+        harness.set.recover();
+        harness.set.idle();
+        assert!(ledger.pending().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pruning_and_new_handoffs_preserve_other_screen_unsettled_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::left_behind::{LeftBehindEntry, LIMIT};
+
+        let harness = ready_two_screens();
+        let protected = closed_record(905, "Code.exe");
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&protected).unwrap();
+        {
+            let mut book = harness.set.books.left_behind.lock().unwrap();
+            book.entries.push(LeftBehindEntry::new(protected.clone(), 0));
+            for n in 1..LIMIT {
+                book.entries.push(LeftBehindEntry::new(closed_record(1000 + n as i32, "other.exe"), 1_800_000_000_000 + n as i64));
+            }
+        }
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        harness.set.check_returns();
+        harness.set.idle();
+        assert!(harness.set.books.left_behind.lock().unwrap().entries.iter().any(|e| e.record == protected));
+        let arriving = closed_record(906, "Code.exe");
+        let target = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("b")));
+        target.record(&arriving).unwrap();
+        harness.set.recover();
+        harness.set.idle();
+        let book = harness.set.books.left_behind.lock().unwrap();
+        assert_eq!(book.entries.len(), LIMIT);
+        assert!(book.entries.iter().any(|e| e.record == protected));
+        assert!(book.entries.iter().any(|e| e.record == arriving));
+        assert!(target.pending().is_none());
+        assert_eq!(ledger.pending(), Some(protected));
+        drop(guard);
+    }
+
+    #[test]
+    fn placement_can_reuse_handoff_settled_in_the_same_action() {
+        let harness = ready_two_screens();
+        let record = closed_record(907, "Code.exe");
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a")));
+        ledger.record(&record).unwrap();
+        let key = WindowKey::new(907, 0x9071);
+        let info = window(key, Some("Code.exe"), "returned workspace");
+        harness.windows.insert_window(info.clone(), record.filled.unwrap());
+        harness.set.pull("a", info);
+        harness.set.idle();
+        assert!(harness.set.state_of("a").unwrap().placed.is_some(), "the successful settlement must release its guard before matching");
+        assert_eq!(ledger.pending().unwrap().original, record.original);
+        assert!(harness.set.books.left_behind.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn other_screen_pending_record_does_not_block_unrelated_repayment() {
+        let harness = ready_two_screens();
+        let unrelated = closed_record(908, "Code.exe");
+        RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a"))).record(&unrelated).unwrap();
+        let owed = closed_record(909, "zed.exe");
+        let key = WindowKey::new(909, 0x9091);
+        harness.windows.insert_window(window(key, Some("zed.exe"), "other"), owed.original);
+        harness.set.books.left_behind.lock().unwrap().entries.push(
+            crate::left_behind::LeftBehindEntry::new(owed, 1_800_000_000_000));
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_recovers_removed_screen_source_without_creating_its_display() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        for id in ["removed", ScreenConfig::LEGACY_PHONE_ID] {
+            let mut harness = DeskSetHarness::new();
+            let record = PhoneRecord {
+                window: WindowKey::new(910, 0x9100),
+                app: "Zed".into(), app_id: Some("zed.exe".into()), label: "closed source".into(), zoom: 2,
+                original: Rect::new(10.0, 20.0, 800.0, 600.0),
+                filled: Some(Rect::new(2560.0, 0.0, 1080.0, 1800.0)),
+                ..PhoneRecord::default()
+            };
+            let path = harness.paths.record_file_for_screen(Some(id));
+            let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+            ledger.record(&record).unwrap();
+            JsonFileStore::new(harness.paths.left_behind_file()).save(&LeftBehindBook {
+                entries: vec![LeftBehindEntry::new(record.clone(), 1_800_000_000_000)],
+            }).unwrap();
+            let other = WindowKey::new(910, 0x9101);
+            harness.windows.insert_window(window(other, Some("zed.exe"), "other"), record.original);
+            harness.set = DeskSet::new(
+                harness.displays.clone(), harness.windows.clone(), harness.apps.clone(), &harness.paths,
+                DeskSetOptions { timeline: Some(harness.timeline.clone()), ..DeskSetOptions::default() });
+            let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+            harness.set.set_remote(true);
+            harness.set.set_wishes(vec![harness.wish("b")]);
+            harness.set.recover();
+            harness.set.check_returns();
+            harness.set.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 0, "startup must protect removed source {id}");
+            assert_eq!(harness.displays.create_calls().len(), 1, "recovery must not create the removed screen");
+            assert_eq!(ledger.pending(), Some(record));
+            drop(guard);
+            harness.set.settle_displays();
+            harness.set.check_returns();
+            harness.set.idle();
+            assert!(ledger.pending().is_none(), "removed source {id} must have a retry path");
+            assert_eq!(harness.windows.zoom_delta_total(), -2);
+            harness.set.settle_displays();
+            harness.set.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), -2);
+        }
+    }
+
+    fn restart_set(harness: &mut DeskSetHarness) {
+        harness.set = DeskSet::new(
+            harness.displays.clone(), harness.windows.clone(), harness.apps.clone(), &harness.paths,
+            DeskSetOptions { timeline: Some(harness.timeline.clone()), ..DeskSetOptions::default() });
+    }
+
+    fn seed_startup_debt(harness: &DeskSetHarness, id: &str, record: &PhoneRecord) {
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+        RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some(id))).record(record).unwrap();
+        JsonFileStore::new(harness.paths.left_behind_file()).save(&LeftBehindBook {
+            entries: vec![LeftBehindEntry::new(record.clone(), 1_800_000_000_000)],
+        }).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_keeps_unreadable_removed_source_for_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut harness = DeskSetHarness::new();
+        let record = closed_record(911, "zed.exe");
+        seed_startup_debt(&harness, "removed", &record);
+        restart_set(&mut harness);
+        let other = WindowKey::new(911, 0x9111);
+        harness.windows.insert_window(window(other, Some("zed.exe"), "other"), record.original);
+        let path = harness.paths.record_file_for_screen(Some("removed"));
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        harness.set.set_remote(true);
+        harness.set.set_wishes(vec![harness.wish("b")]);
+        harness.set.recover();
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(harness.displays.create_calls().len(), 1);
+        drop(guard);
+        harness.set.recover();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn startup_directory_failure_blocks_consumption_and_retries_discovery() {
+        let mut harness = DeskSetHarness::new();
+        let record = closed_record(912, "zed.exe");
+        seed_startup_debt(&harness, "removed", &record);
+        restart_set(&mut harness);
+        let other = WindowKey::new(912, 0x9121);
+        harness.windows.insert_window(window(other, Some("zed.exe"), "other"), record.original);
+        let hidden = harness.dir.with_extension("unavailable");
+        std::fs::rename(&harness.dir, &hidden).unwrap();
+        std::fs::write(&harness.dir, b"directory temporarily unavailable").unwrap();
+        harness.set.set_remote(true);
+        harness.set.set_wishes(vec![harness.wish("b")]);
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        std::fs::remove_file(&harness.dir).unwrap();
+        std::fs::rename(hidden, &harness.dir).unwrap();
+        harness.set.recover();
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(!harness.paths.record_file_for_screen(Some("removed")).exists());
+        harness.set.set_wishes(vec![harness.wish("b")]);
+        harness.set.recover();
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "successful discovery must not register sources twice");
+        assert_eq!(harness.displays.create_calls().len(), 1);
+    }
+
+    #[test]
+    fn startup_current_wish_keeps_one_owner_for_its_restore_file() {
+        for id in ["a", ScreenConfig::LEGACY_PHONE_ID] {
+            let mut harness = DeskSetHarness::new();
+            let record = closed_record(913, "Code.exe");
+            seed_startup_debt(&harness, id, &record);
+            restart_set(&mut harness);
+            harness.set.set_remote(true);
+            harness.set.set_wishes(vec![harness.wish(id)]);
+            harness.set.recover();
+            harness.set.idle();
+            let key = WindowKey::new(914, 0x9141);
+            let info = window(key, Some("Code.exe"), "new active workspace");
+            harness.windows.insert_window(info.clone(), record.original);
+            harness.set.pull(id, info);
+            harness.set.idle();
+            harness.set.recover();
+            harness.set.settle_displays();
+            harness.set.idle();
+            let active = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some(id))).pending().unwrap();
+            assert_eq!(active.window, key);
+            assert_eq!(active.zoom, 2);
+            assert_eq!(harness.set.state_of(id).unwrap().placed.unwrap().window.key, key);
+            assert_eq!(harness.windows.zoom_delta_total(), 2);
+            assert_eq!(harness.displays.create_calls().len(), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restoring_source_reclaims_failed_handoff_before_changing_its_debt() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::left_behind::LeftBehindEntry;
+
+        let harness = ready_two_screens();
+        let record = closed_record(915, "zed.exe");
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).unwrap();
+        harness.set.books.left_behind.lock().unwrap().entries.push(LeftBehindEntry::new(record.clone(), 1_800_000_000_000));
+        // A failed handoff can be retried after the same process reuses the HWND.
+        harness.windows.insert_window(window(record.window, Some("zed.exe"), "source returned"), record.filled.unwrap());
+        harness.windows.insert_window(window(WindowKey::new(915, 0x9151), Some("zed.exe"), "other"), record.original);
+        let guard = Arc::new(Mutex::new(None));
+        let held = guard.clone();
+        harness.windows.on_zoom(move |_, _| {
+            let mut held = held.lock().unwrap();
+            if held.is_none() {
+                *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap());
+            }
+        });
+        harness.set.desk_for_screen(Some("a")).unwrap().recover();
+        harness.set.idle();
+        assert_eq!(ledger.pending().unwrap().zoom, 0);
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "the original shared copy must not survive source repayment");
+        assert!(harness.set.books.left_behind.lock().unwrap().entries.is_empty());
+        guard.lock().unwrap().take();
+        harness.windows.on_zoom(|_, _| {});
+        harness.set.recover();
+        harness.set.idle();
+        assert!(ledger.pending().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+    }
+
+    #[test]
+    fn startup_keeps_matching_restore_directory_as_an_unreadable_source() {
+        let mut harness = DeskSetHarness::new();
+        let record = closed_record(916, "zed.exe");
+        seed_startup_debt(&harness, "removed", &record);
+        let path = harness.paths.record_file_for_screen(Some("removed"));
+        let hidden = path.with_extension("held");
+        std::fs::rename(&path, &hidden).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        restart_set(&mut harness);
+        harness.windows.insert_window(window(WindowKey::new(916, 0x9161), Some("zed.exe"), "other"), record.original);
+        harness.set.set_remote(true);
+        harness.set.set_wishes(vec![harness.wish("b")]);
+        harness.set.recover();
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "matching unreadable source paths must not be ignored");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(hidden, &path).unwrap();
+        harness.set.settle_displays();
+        harness.set.idle();
+        assert!(!path.exists());
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_repayment_waits_until_shared_copy_can_be_reclaimed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::left_behind::{LeftBehindBook, LeftBehindEntry};
+        use crate::store::JsonFileStore;
+
+        let harness = ready_two_screens();
+        let record = closed_record(917, "zed.exe");
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a")));
+        ledger.record(&record).unwrap();
+        let book = LeftBehindBook { entries: vec![LeftBehindEntry::new(record.clone(), 1_800_000_000_000)] };
+        *harness.set.books.left_behind.lock().unwrap() = book.clone();
+        let path = harness.paths.left_behind_file();
+        JsonFileStore::new(&path).save(&book).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        harness.windows.insert_window(window(record.window, Some("zed.exe"), "source returned"), record.filled.unwrap());
+        harness.set.desk_for_screen(Some("a")).unwrap().recover();
+        harness.set.idle();
+        assert_eq!(ledger.pending(), Some(record.clone()));
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(harness.windows.frame_of(record.window), record.filled);
+        assert_eq!(harness.set.books.left_behind.lock().unwrap().entries[0].record, record);
+        drop(guard);
+        harness.set.desk_for_screen(Some("a")).unwrap().recover();
+        harness.set.check_returns();
+        harness.set.idle();
+        assert!(ledger.pending().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(harness.set.books.left_behind.lock().unwrap().entries.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zoom_change_reclaims_failed_handoff_before_updating_live_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let key = WindowKey::new(918, 0x9181);
+        let info = window(key, Some("zed.exe"), "active Zed");
+        harness.windows.insert_window(info.clone(), Rect::new(10.0, 20.0, 800.0, 600.0));
+        harness.set.pull("a", info.clone());
+        harness.set.idle();
+        let filled = harness.windows.frame_of(key).unwrap();
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        harness.windows.remove(key);
+        harness.set.verify_placement();
+        harness.set.idle();
+        assert!(harness.set.state_of("a").unwrap().placed.is_some());
+        assert_eq!(harness.set.books.left_behind.lock().unwrap().entries.len(), 1);
+        drop(guard);
+        harness.windows.insert_window(info, filled);
+        harness.windows.insert_window(window(WindowKey::new(918, 0x9182), Some("zed.exe"), "other Zed"), Rect::new(30.0, 40.0, 800.0, 600.0));
+        harness.set.zoom("a", 1);
+        harness.set.check_returns();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 3, "the old shared debt must be reclaimed before zoom changes its source");
+        assert!(harness.set.books.left_behind.lock().unwrap().entries.is_empty());
+        harness.set.put_back(Some("a"));
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transfer_reclaims_failed_handoff_before_source_settlement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for lock_shared in [false, true] {
+            let harness = ready_two_screens();
+            let key = WindowKey::new(919, 0x9191);
+            let info = window(key, Some("zed.exe"), "transferred Zed");
+            let original = Rect::new(10.0, 20.0, 800.0, 600.0);
+            harness.apps.set_running(key.pid, true);
+            harness.windows.insert_window(info.clone(), original);
+            harness.set.pull("a", info.clone());
+            harness.set.idle();
+            let filled = harness.windows.frame_of(key).unwrap();
+            let source_path = harness.paths.record_file_for_screen(Some("a"));
+            let source = RestoreRecordStore::<PhoneRecord>::new(&source_path);
+            let record = source.pending().unwrap();
+            let source_guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                .open(&source_path).unwrap();
+            harness.windows.remove(key);
+            harness.set.verify_placement();
+            harness.set.idle();
+            assert_eq!(source.pending(), Some(record.clone()));
+            assert_eq!(harness.set.books.left_behind.lock().unwrap().entries.len(), 1);
+            drop(source_guard);
+            harness.windows.insert_window(info.clone(), filled);
+            harness.windows.insert_window(window(WindowKey::new(919, 0x9192), Some("zed.exe"), "other Zed"), original);
+            let shared_guard = lock_shared.then(|| std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                .open(harness.paths.left_behind_file()).unwrap());
+            harness.set.pull("b", info.clone());
+            harness.set.check_returns();
+            harness.set.idle();
+            if lock_shared {
+                assert_eq!(source.pending(), Some(record.clone()), "failed shared reclaim must retain the source");
+                assert!(harness.set.state_of("a").unwrap().placed.is_some());
+                assert!(harness.set.state_of("b").unwrap().placed.is_none());
+                assert!(!harness.set.record_file_exists("b"));
+                assert_eq!(harness.windows.frame_of(key), Some(filled));
+                assert_eq!(harness.set.books.left_behind.lock().unwrap().entries[0].record, record);
+                assert_eq!(harness.windows.zoom_delta_total(), 2);
+                drop(shared_guard);
+                harness.set.pull("b", info);
+                harness.set.check_returns();
+                harness.set.idle();
+            }
+            assert!(source.pending().is_none());
+            assert!(harness.set.state_of("a").unwrap().placed.is_none());
+            assert!(harness.set.state_of("b").unwrap().placed.is_some());
+            assert!(harness.set.books.left_behind.lock().unwrap().entries.is_empty(), "transfer must withdraw the obsolete shared debt");
+            assert_eq!(harness.windows.zoom_delta_total(), 2, "transfer cannot repay the shared copy of an active debt");
+            harness.set.put_back(Some("b"));
+            harness.set.check_returns();
+            harness.set.idle();
+            assert_eq!(harness.windows.frame_of(key), Some(original));
+            assert_eq!(harness.windows.zoom_delta_total(), 0);
+        }
+    }
 
     fn window(key: WindowKey, app_id: Option<&str>, title: &str) -> WindowInfo {
         WindowInfo {
@@ -730,6 +1533,321 @@ mod tests {
         );
         let record = store.pending().expect("B 屏应有还原记录");
         assert_eq!(record.original, original, "跨屏转移要沿用来源屏的原始还原坐标");
+    }
+
+    #[test]
+    fn transfer_never_leaves_both_persistent_ledgers_absent() {
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+        harness.set.pull("a", window(key, Some("Code.exe"), "continuous debt"));
+        harness.set.idle();
+        let source = harness.paths.record_file_for_screen(Some("a"));
+        let target = harness.paths.record_file_for_screen(Some("b"));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&snapshots);
+        harness.windows.on_look(move |looked_up| {
+            if looked_up == key {
+                observed.lock().unwrap().push((source.is_file(), target.is_file()));
+            }
+        });
+
+        harness.set.pull("b", window(key, Some("Code.exe"), "continuous debt"));
+        harness.set.idle();
+
+        let snapshots = snapshots.lock().unwrap();
+        assert!(!snapshots.is_empty(), "observe target preparation and placement");
+        assert!(snapshots.iter().all(|(source, target)| *source || *target),
+            "a crash at any observed boundary must retain a persistent debt: {snapshots:?}");
+        assert!(!harness.set.record_file_exists("a"));
+        assert!(harness.set.record_file_exists("b"));
+    }
+
+    #[test]
+    fn transfer_rejects_target_record_created_during_preparation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+        harness.set.pull("a", window(key, Some("Code.exe"), "source retained"));
+        harness.set.idle();
+        let source = harness.paths.record_file_for_screen(Some("a"));
+        let source_bytes = std::fs::read(&source).unwrap();
+        let target = harness.paths.record_file_for_screen(Some("b"));
+        let target_bytes = serde_json::to_vec(&closed_record(99, "notepad.exe")).unwrap();
+        let target_path = target.clone();
+        let expected = target_bytes.clone();
+        let observations = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&observations);
+        harness.windows.on_look(move |looked_up| {
+            if looked_up == key && count.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::fs::write(&target_path, &expected).unwrap();
+            }
+        });
+
+        harness.set.pull("b", window(key, Some("Code.exe"), "source retained"));
+        harness.set.idle();
+
+        assert_eq!(observations.load(Ordering::SeqCst), 2, "target appears after leftover check");
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(std::fs::read(&target).unwrap(), target_bytes, "no target replacement");
+        assert!(harness.set.state_of("a").unwrap().placed.is_some());
+        assert!(harness.set.state_of("b").unwrap().placed.is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), 2, "no premature repayment");
+    }
+
+    #[test]
+    fn transfer_store_refuses_existing_target_and_cross_directory_moves() {
+        let harness = ready_two_screens();
+        let source_path = harness.paths.record_file_for_screen(Some("a"));
+        let target_path = harness.paths.record_file_for_screen(Some("b"));
+        let source = RestoreRecordStore::<PhoneRecord>::new(&source_path);
+        let target = RestoreRecordStore::<PhoneRecord>::new(&target_path);
+        let original = closed_record(91, "Code.exe");
+        let other = closed_record(92, "notepad.exe");
+        source.record(&original).unwrap();
+        target.record(&other).unwrap();
+        assert_eq!(source.try_transfer_to(&target).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(source.pending(), Some(original.clone()));
+        assert_eq!(target.pending(), Some(other));
+        let outside_path = harness.dir.join("other-directory").join("restore.json");
+        std::fs::create_dir(outside_path.parent().unwrap()).unwrap();
+        let outside = RestoreRecordStore::<PhoneRecord>::new(&outside_path);
+        assert_eq!(source.try_transfer_to(&outside).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!outside_path.exists());
+        assert_eq!(source.pending(), Some(original));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transfer_store_refuses_a_dangling_target_without_losing_source() {
+        let harness = ready_two_screens();
+        let source = RestoreRecordStore::<PhoneRecord>::new(harness.paths.record_file_for_screen(Some("a")));
+        let target_path = harness.paths.record_file_for_screen(Some("b"));
+        let backing = harness.dir.join("missing-transfer-target");
+        let original = closed_record(91, "Code.exe");
+        source.record(&original).unwrap();
+        std::fs::create_dir(&backing).unwrap();
+        let status = std::process::Command::new("powershell.exe").args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:SNUG_TEST_LINK -Target $env:SNUG_TEST_TARGET | Out-Null",
+        ]).env("SNUG_TEST_LINK", &target_path).env("SNUG_TEST_TARGET", &backing).status().unwrap();
+        assert!(status.success());
+        std::fs::remove_dir(&backing).unwrap();
+        assert!(!target_path.exists());
+        assert!(std::fs::symlink_metadata(&target_path).is_ok());
+
+        let target = RestoreRecordStore::<PhoneRecord>::new(&target_path);
+        let result = source.try_transfer_to(&target);
+        let target_retained = std::fs::symlink_metadata(&target_path).is_ok();
+        std::fs::remove_dir(&target_path).unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(target_retained, "the dangling target entry must be preserved");
+        assert_eq!(source.pending(), Some(original));
+    }
+
+    #[test]
+    fn transfer_settles_source_before_both_desks_recover() {
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+        harness.set.pull("a", window(key, Some("Code.exe"), "single debt"));
+        harness.set.idle();
+        harness.set.pull("b", window(key, Some("Code.exe"), "single debt"));
+        harness.set.idle();
+        assert!(!harness.set.record_file_exists("a"), "移交后只能留下目标债务");
+        harness.set.put_back(Some("b"));
+        harness.set.recover();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "跨屏后只能偿还一次");
+    }
+
+    #[test]
+    fn transfer_with_unwritable_target_keeps_source_for_retry() {
+        for list_visible in [false, true] {
+            let harness = ready_two_screens();
+            let key = WindowKey::new(51, 0x301);
+            harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+            harness.set.pull("a", window(key, Some("Code.exe"), "source retained"));
+            harness.set.idle();
+            if list_visible {
+                harness.set.show_list(Some("a"));
+                harness.set.idle();
+            }
+            assert_eq!(harness.set.state_of("a").expect("source").list_visible, list_visible);
+            let target = harness.paths.record_file_for_screen(Some("b"));
+            std::fs::create_dir(&target).expect("block target source");
+            harness.set.pull("b", window(key, Some("Code.exe"), "source retained"));
+            harness.set.idle();
+            let source = harness.set.state_of("a").expect("source");
+            assert!(source.placed.is_some());
+            assert_eq!(source.list_visible, list_visible, "拒收后应恢复来源屏原来的显示状态");
+            assert!(harness.set.state_of("b").expect("target").placed.is_none());
+            assert_eq!(harness.windows.zoom_delta_total(), 2);
+            std::fs::remove_dir(&target).expect("unblock target source");
+            harness.set.pull("b", window(key, Some("Code.exe"), "source retained"));
+            harness.set.idle();
+            assert!(harness.set.state_of("b").expect("target").placed.is_some());
+            harness.set.put_back(Some("b"));
+            harness.set.recover();
+            harness.set.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 0);
+        }
+    }
+
+    #[test]
+    fn transfer_target_fill_failure_does_not_restore_consumed_source() {
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        let original = Rect::new(10.0, 20.0, 900.0, 600.0);
+        harness.windows.insert(key, original);
+        harness.set.pull("a", window(key, Some("Code.exe"), "failed target fill"));
+        harness.set.idle();
+        harness.windows.misplace_moves(3);
+        harness.set.pull("b", window(key, Some("Code.exe"), "failed target fill"));
+        harness.set.idle();
+        assert!(harness.set.state_of("a").expect("source").placed.is_none());
+        assert!(harness.set.state_of("b").expect("target").placed.is_none());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+        harness.set.recover();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert!(!harness.set.record_file_exists("a"));
+        assert!(!harness.set.record_file_exists("b"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_source_settlement_blocks_transfer_until_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+        harness.set.pull("a", window(key, Some("Code.exe"), "locked source"));
+        harness.set.idle();
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+            .open(&path).expect("deny source settlement");
+        harness.set.pull("b", window(key, Some("Code.exe"), "locked source"));
+        harness.set.idle();
+        assert!(harness.set.state_of("a").expect("source").placed.is_some());
+        assert!(harness.set.state_of("b").expect("target").placed.is_none());
+        drop(guard);
+        harness.set.pull("b", window(key, Some("Code.exe"), "locked source"));
+        harness.set.idle();
+        assert!(harness.set.state_of("b").expect("target").placed.is_some());
+        harness.set.put_back(Some("b"));
+        harness.set.recover();
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transfer_rejects_locked_zoom_rollback_and_retries_after_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = ready_two_screens();
+        let key = WindowKey::new(51, 0x301);
+        harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+        harness.set.pull("a", window(key, Some("Code.exe"), "transfer debt"));
+        harness.set.idle();
+        let path = harness.paths.record_file_for_screen(Some("a"));
+        let guard = Arc::new(std::sync::Mutex::new(None));
+        let lock = Arc::clone(&guard);
+        harness.windows.on_zoom(move |_, _| {
+            let mut held = lock.lock().expect("lock slot");
+            if held.is_none() {
+                *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                    .open(&path).expect("lock after reservation"));
+            }
+        });
+        harness.windows.set_zoom_ok(false);
+        harness.set.put_back(Some("a"));
+        harness.set.pull("b", window(key, Some("Code.exe"), "transfer debt"));
+        harness.set.idle();
+        assert!(harness.set.state_of("a").expect("source").placed.is_some());
+        assert!(harness.set.state_of("b").expect("target").placed.is_none());
+
+        guard.lock().expect("lock slot").take();
+        harness.windows.on_zoom(|_, _| {});
+        harness.windows.set_zoom_ok(true);
+        harness.set.pull("b", window(key, Some("Code.exe"), "transfer debt"));
+        harness.set.idle();
+        assert!(harness.set.state_of("a").expect("source").placed.is_none());
+        assert!(harness.set.state_of("b").expect("target").placed.is_some());
+        harness.set.put_back(Some("b"));
+        harness.set.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readding_screen_inherits_unwritten_zoom_rollback() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for readd_before_unlock in [false, true] {
+            let mut harness = ready_two_screens();
+            let key = WindowKey::new(51, 0x301);
+            harness.windows.insert(key, Rect::new(10.0, 20.0, 900.0, 600.0));
+            harness.set.pull("a", window(key, Some("Code.exe"), "retired debt"));
+            harness.set.idle();
+            let path = harness.paths.record_file_for_screen(Some("a"));
+            let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+            let guard = Arc::new(std::sync::Mutex::new(None));
+            let lock = Arc::clone(&guard);
+            harness.windows.on_zoom(move |_, _| {
+                let mut held = lock.lock().expect("lock slot");
+                if held.is_none() {
+                    *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                        .open(&path).expect("lock after reservation"));
+                }
+            });
+            harness.windows.set_zoom_ok(false);
+            harness.set.put_back(Some("a"));
+            harness.set.idle();
+            harness.set.set_wishes(vec![harness.wish("b")]);
+            harness.set.idle();
+            if readd_before_unlock {
+                harness.set.set_wishes(vec![harness.wish("a"), harness.wish("b")]);
+                harness.set.idle();
+            }
+            let next = WindowKey::new(52, 0x302);
+            harness.windows.insert(next, Rect::new(30.0, 40.0, 800.0, 600.0));
+            harness.set.pull("a", window(next, Some("Code.exe"), "next"));
+            harness.set.settle_displays();
+            harness.set.idle();
+            assert_eq!(ledger.pending().expect("reserved source").zoom, 0);
+            assert_eq!(harness.windows.zoom_delta_total(), 2);
+
+            guard.lock().expect("lock slot").take();
+            harness.windows.on_zoom(|_, _| {});
+            harness.windows.set_zoom_ok(true);
+            harness.set.check_returns();
+            harness.set.settle_displays();
+            harness.set.idle();
+            if readd_before_unlock {
+                assert_eq!(ledger.pending().expect("active desk inherited debt").zoom, 2);
+            } else {
+                assert!(ledger.pending().is_none(), "retired source should finish without a new wish");
+                assert_eq!(harness.windows.zoom_delta_total(), 0);
+            }
+            if !readd_before_unlock {
+                harness.set.set_wishes(vec![harness.wish("a"), harness.wish("b")]);
+                harness.set.idle();
+            }
+            harness.set.pull("a", window(next, Some("Code.exe"), "next"));
+            harness.set.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 2, "先还旧债再放大新窗口");
+            harness.set.put_back(Some("a"));
+            harness.set.recover();
+            harness.set.settle_displays();
+            harness.set.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 0);
+            assert!(ledger.pending().is_none(), "退休core不能重新写回旧影子");
+        }
     }
 
     #[test]

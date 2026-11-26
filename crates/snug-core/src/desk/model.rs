@@ -63,6 +63,7 @@ pub enum DeskNotice {
     Reshaped,
     ReshapeFailed,
     ZoomLeftBehind { app: String, steps: i32 },
+    ZoomUncertain { app: String },
 }
 
 /// 桌面上除了窗口不见了之外，整个 App 或某个窗口消失的通知。

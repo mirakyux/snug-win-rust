@@ -44,7 +44,9 @@ snug.exe
 版本与三个哈希写死在 `scripts/fetch-driver.ps1` 和 `driver/Install-SnugDriver.ps1` 两处，
 升级驱动要同时改这两处，更新 `driver.rs` 的固定哈希回归断言，并重跑真机验收。
 
-`0.4.0.1` 的源码和构建脚本位于 [驱动开发分支](https://github.com/mirakyux/snug-win-rust/tree/feature/driver-0.4.0.1)。更换内嵌驱动前，需核对发行签名和哈希，并在 Windows 上验收全新安装、升级及卸载。
+驱动源码随项目维护于 [vendor/virtual-display-rs](../vendor/virtual-display-rs/)，构建入口为 [build-driver.ps1](../scripts/build-driver.ps1)，版本与来源记录在 [source.lock.json](../driver/source.lock.json)。更换内嵌驱动前，需核对发行签名和哈希，并在 Windows 上验收全新安装、升级及卸载。
+
+使用双向 V2 驱动时，建屏和更新要求驱动支持带归属确认的 `SnugReserve`、`SnugCreate`、`SnugReplace`、`SnugRelease`，以避免并发更新和应答丢失时误删其他客户端的屏幕。[仓库驱动源码](../driver/README.md) 自 `0.4.0.5` 引入这些操作，当前锁定的源码候选为 `0.4.0.12`，包含旧协议归属保护和首选 EDID 时序；`0.4.0.10`、`0.4.0.11` 仅为隔离实验版本。未支持归属请求的 V2 驱动会明确失败，不回退到全量 `Notify`。已登记旧版权限代理的机器需重新登记新版代理。默认内嵌的 0.3.1 仍走 Legacy 协议。
 
 `build-release.ps1` 会用 Rust 侧的 `sha256_hex` 再算一遍 exe 与 zip，和 `Get-FileHash`
 比对——两套独立实现，发布链最容易在这里悄悄分叉。

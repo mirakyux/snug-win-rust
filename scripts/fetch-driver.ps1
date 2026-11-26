@@ -7,8 +7,8 @@
     驱动不重编、不改动，只下载官方 release 里的安装包并核对哈希：
       driver\virtual-desktop-driver-installer-x64.zip
 
-    版本与哈希写死在本脚本（和 driver\Install-SnugDriver.ps1 里的一致）。
-    升级驱动 = 同时改这两处的版本号与三个哈希，并重新跑一遍真机验收。
+    版本与哈希来自 driver\source.lock.json；一致性门禁会拒绝与当前源码协议不兼容的包。
+    升级驱动 = 更新源码清单、重新生成兼容的 releasePackage，并重新跑一遍真机验收。
 
     必须在 cargo test/build 前运行：应用用 include_bytes! 把原版 zip 内嵌到单 exe。
     发布时不用再附带 driver\ 目录，静态门禁会核对 exe 里完整内嵌的字节。
@@ -28,11 +28,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Version = '0.3.1'
-$Url = "https://github.com/MolotovCherry/virtual-display-rs/releases/download/v$Version/virtual-desktop-driver-installer-x64.zip"
-$ExpectedSha256 = 'B3E3A5AB9B49BD56A7E753120CDDB1D913479BC5C0DFA781C3D43392DDE2FB75'
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$consistencyScript = Join-Path $PSScriptRoot 'driver-package-consistency.ps1'
+. $consistencyScript
+$consistencyIssues = @(Get-DriverPackageConsistencyIssues -RepositoryRoot $repoRoot -CheckProtocolSource)
+if ($consistencyIssues.Count -gt 0) {
+    throw "source.lock.json 中的驱动发行包与源码/应用不兼容，拒绝下载：`n - $($consistencyIssues -join "`n - ")"
+}
+$lock = Get-Content -LiteralPath (Join-Path $repoRoot 'driver/source.lock.json') -Raw | ConvertFrom-Json
+$package = $lock.releasePackage
+$Version = [string]$package.driverVersion
+$Url = "https://github.com/MolotovCherry/virtual-display-rs/releases/download/v$Version/$($package.archiveName)"
+$ExpectedSha256 = [string]$package.archiveSha256
 if (-not $Destination) { $Destination = Join-Path $repoRoot 'driver' }
 $zipPath = Join-Path $Destination 'virtual-desktop-driver-installer-x64.zip'
 
@@ -64,5 +71,10 @@ if ($actual -ne $ExpectedSha256) {
 }
 
 Move-Item -LiteralPath $tmp -Destination $zipPath -Force
+$archiveIssues = @(Get-DriverPackageConsistencyIssues -RepositoryRoot $repoRoot -ArchivePath $zipPath -CheckProtocolSource)
+if ($archiveIssues.Count -gt 0) {
+    Remove-Item -LiteralPath $zipPath -Force
+    throw "下载的驱动发行包未通过一致性门禁：`n - $($archiveIssues -join "`n - ")"
+}
 $size = (Get-Item -LiteralPath $zipPath).Length
 Write-Host ("[OK] virtual-display-rs v{0} 已就绪（{1:N0} B，SHA-256 已核对）" -f $Version, $size)

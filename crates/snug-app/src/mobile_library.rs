@@ -24,6 +24,7 @@ pub enum LibraryAction {
     ClosePreview,
     ForceQuit { pid: i32, app: String },
     DismissNotice,
+    ConfirmManualZoomReset,
 }
 
 const TARGET: f32 = 44.0;
@@ -1450,10 +1451,20 @@ fn notice_row(ui: &mut egui::Ui, notice: &DeskNotice, action: &mut Option<Librar
         DeskNotice::ZoomLeftBehind { app, steps } => {
             format!("{app} 的字号保留了 {steps:+} 级，可在应用中手动还原")
         }
+        DeskNotice::ZoomUncertain { app } => {
+            format!("{app} 的字号操作已中断，结果不确定。请先在该应用中手动还原字号，再点击“已手动还原字号”以继续。")
+        }
     };
     ui.label(message);
     ui.horizontal_wrapped(|ui| {
-        if ui.button("稍后").clicked() {
+        if matches!(notice, DeskNotice::ZoomUncertain { .. }) {
+            if ui
+                .add(egui::Button::new("已手动还原字号").min_size(egui::vec2(TARGET, TARGET)))
+                .clicked()
+            {
+                *action = Some(LibraryAction::ConfirmManualZoomReset);
+            }
+        } else if ui.button("稍后").clicked() {
             *action = Some(LibraryAction::DismissNotice);
         }
         if let DeskNotice::QuitStalled { app, pid } = notice
@@ -1610,6 +1621,53 @@ mod tests {
             }],
         )
         .1
+    }
+
+    #[test]
+    fn uncertain_zoom_notice_requires_explicit_manual_reset() {
+        for dark in [false, true] {
+            for size in [egui::vec2(375.0, 812.0), egui::vec2(812.0, 375.0)] {
+                let ctx = egui::Context::default();
+                crate::theme::apply(&ctx, dark);
+                let mut view = MobileLibraryUi::default();
+                let mut library = fixture();
+                let state = DeskState {
+                    notice: Some(DeskNotice::ZoomUncertain { app: "Fixture editor".into() }),
+                    ..Default::default()
+                };
+                frame(&ctx, &mut view, &mut library, &state, size, vec![]);
+                let (output, action) = frame(&ctx, &mut view, &mut library, &state, size, vec![]);
+                assert!(action.is_none());
+                assert!(output.shapes.iter().all(|shape| text_rect(&shape.shape, "稍后").is_none()));
+                assert!(output.shapes.iter().any(|shape| {
+                    text_rect(
+                        &shape.shape,
+                        "Fixture editor 的字号操作已中断，结果不确定。请先在该应用中手动还原字号，再点击“已手动还原字号”以继续。",
+                    )
+                    .is_some()
+                }));
+                assert_eq!(
+                    click("已手动还原字号", &ctx, &mut view, &mut library, &state, size),
+                    Some(LibraryAction::ConfirmManualZoomReset)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_notice_keeps_the_later_action() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let mut view = MobileLibraryUi::default();
+        let mut library = fixture();
+        let state = DeskState {
+            notice: Some(DeskNotice::WindowGone { app: "Fixture editor".into() }),
+            ..Default::default()
+        };
+        assert_eq!(
+            click("稍后", &ctx, &mut view, &mut library, &state, egui::vec2(375.0, 812.0)),
+            Some(LibraryAction::DismissNotice)
+        );
     }
 
     #[test]

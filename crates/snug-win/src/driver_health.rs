@@ -127,7 +127,7 @@ fn describe_direct_error(elevated: bool, error: VddError) -> String {
         VddError::Connect { source, .. } | VddError::Io(source) => {
             source.kind() == std::io::ErrorKind::PermissionDenied
         }
-        VddError::NotConnected => false,
+        VddError::NotConnected | VddError::OutcomeUnknown { .. } => false,
     };
     if elevated && permission_denied {
         ELEVATED_ACCESS_DENIED.into()

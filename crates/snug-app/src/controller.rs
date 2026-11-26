@@ -666,9 +666,7 @@ impl Controller {
     /// 主触控屏的 id（单屏界面默认操作的那块）。
     fn primary_screen_id(&self) -> Option<String> {
         let config = self.config.lock().ok()?;
-        config.primary_touch_screen().filter(|screen| screen.enabled)
-            .or_else(|| config.effective_screens().into_iter().find(|screen| screen.enabled))
-            .map(|screen| screen.id)
+        selected_screen_id(&config, None)
     }
 
     /// 所有已启用屏幕的 `(id, 名字)`，按配置顺序。
@@ -826,6 +824,17 @@ impl Controller {
             return;
         };
         self.enqueue(move |desks| desks.dismiss_notice(&id));
+    }
+
+    pub fn confirm_manual_zoom_reset(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| {
+            if let Some(desk) = desks.desk_for_screen(Some(&id)) {
+                desk.confirm_manual_zoom_reset();
+            }
+        });
     }
 
     /// 把一个 desk 操作排给后台线程（界面线程不在这把锁上等）。
@@ -1130,6 +1139,17 @@ fn wants_phone_display(mode: PhoneScreenMode, in_episode: bool) -> bool {
     }
 }
 
+/// Share the exact screen identity between state lookup, display wishes and settings notices.
+pub(crate) fn selected_screen_id(config: &AppConfig, active_screen: Option<&str>) -> Option<String> {
+    active_screen.map(str::to_string).or_else(|| {
+        config
+            .primary_touch_screen()
+            .filter(|screen| screen.enabled)
+            .or_else(|| config.effective_screens().into_iter().find(|screen| screen.enabled))
+            .map(|screen| screen.id)
+    })
+}
+
 /// 把显示模式、真实远程会话和当前屏幕选择合成为一个建屏愿望。
 fn active_wishes(
     config: &AppConfig,
@@ -1142,18 +1162,10 @@ fn active_wishes(
     let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, true, false);
     // 只留当前显示的那块：我们只有一个窗口，多建几块只会得到几块黑屏。
     //
-    // `None` 必须和 `Controller::state_of(None)` 选同一块——那边用的是
-    // `primary_touch_screen()`（优先竖屏手机），而 `wishes` 是按配置顺序，
-    // 两张表不一致时会出现"建的是电脑副屏、界面却在找手机屏"。
-    let wanted_id = match active_screen {
-        Some(id) => Some(id.to_string()),
-        None => config.primary_touch_screen().filter(|screen| screen.enabled).map(|screen| screen.id),
-    };
-    match wanted_id {
-        Some(id) => wishes.retain(|wish| wish.id == id),
-        // 没有触控屏配置（只有电脑屏）：退回配置里的第一块。
-        None => wishes.truncate(1),
-    }
+    // `None` 必须和 `Controller::state_of(None)` 选同一块：优先启用的主触屏，
+    // 否则按配置顺序取第一块启用屏。
+    let wanted_id = selected_screen_id(config, active_screen);
+    wishes.retain(|wish| wanted_id.as_deref() == Some(wish.id.as_str()));
     wishes
 }
 
@@ -1430,6 +1442,25 @@ mod tests {
         config.screens = Some(screens);
         config.set_phone_screen_mode(snug_core::PhoneScreenMode::Always);
         assert!(active_wishes(&config, true, None).is_empty());
+    }
+
+    #[test]
+    fn disabled_primary_uses_the_same_enabled_fallback_for_state_and_wishes() {
+        let mut config = config_with_two_screens();
+        config.screens.as_mut().unwrap()[0].enabled = false;
+        assert_eq!(
+            super::selected_screen_id(&config, None).as_deref(),
+            Some("tablet-1")
+        );
+        let wishes = active_wishes(&config, true, None);
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, "tablet-1");
+        let disabled = config.effective_screens()[0].id.clone();
+        assert_eq!(
+            super::selected_screen_id(&config, Some(&disabled)),
+            Some(disabled.clone())
+        );
+        assert!(active_wishes(&config, true, Some(&disabled)).is_empty());
     }
 
     /// 配了两块屏，但同一时刻只建一块（只画一块屏，多建就是黑屏）：

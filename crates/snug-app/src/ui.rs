@@ -141,6 +141,164 @@ struct DriverProbe {
     health: Option<snug_win::driver_health::DriverHealth>,
 }
 
+struct DriverProbeWorker {
+    requests: std::sync::mpsc::Sender<bool>,
+    results: std::sync::mpsc::Receiver<DriverProbe>,
+    pending: bool,
+}
+
+impl DriverProbeWorker {
+    fn start(ctx: &egui::Context) -> std::io::Result<Self> {
+        Self::start_with_probe(ctx.clone(), |probe_health| DriverProbe {
+            pipe_ready: crate::driver::pipe_available(),
+            health: probe_health.then(snug_win::driver_health::DriverHealth::probe),
+        }).map(|(worker, _thread)| worker)
+    }
+
+    fn start_with_probe(
+        ctx: egui::Context,
+        mut probe: impl FnMut(bool) -> DriverProbe + Send + 'static,
+    ) -> std::io::Result<(Self, JoinHandle<()>)> {
+        let (requests, request_rx) = std::sync::mpsc::channel();
+        let (result_tx, results) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new().name("snug-driver-status".into()).spawn(move || {
+            while let Ok(probe_health) = request_rx.recv() {
+                if result_tx.send(probe(probe_health)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })?;
+        // Windows health queries can block. Dropping the channels asks the worker
+        // to exit after its current probe; app shutdown must never join it.
+        Ok((Self { requests, results, pending: false }, thread))
+    }
+
+    fn request(&mut self, probe_health: bool) -> bool {
+        if self.pending || self.requests.send(probe_health).is_err() {
+            return false;
+        }
+        self.pending = true;
+        true
+    }
+
+    fn try_recv(&mut self) -> Result<DriverProbe, std::sync::mpsc::TryRecvError> {
+        let result = self.results.try_recv();
+        if !matches!(result, Err(std::sync::mpsc::TryRecvError::Empty)) {
+            self.pending = false;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod driver_probe_worker_tests {
+    use super::*;
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::{Duration, Instant};
+
+    fn receive(worker: &mut DriverProbeWorker) -> DriverProbe {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match worker.try_recv() {
+                Ok(probe) => return probe,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("driver probe did not return"),
+            }
+        }
+    }
+
+    #[test]
+    fn driver_probe_reuses_one_worker_and_forwards_each_health_request() {
+        let (calls, observed) = mpsc::channel();
+        let (mut worker, thread) = DriverProbeWorker::start_with_probe(
+            egui::Context::default(), move |health| {
+                calls.send((std::thread::current().id(), health)).unwrap();
+                DriverProbe { pipe_ready: true, health: None }
+            },
+        ).unwrap();
+        let mut identity = None;
+        for health in [false, true, false, true] {
+            assert!(worker.request(health));
+            assert!(receive(&mut worker).pipe_ready);
+            let (id, requested_health) = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(requested_health, health);
+            assert_ne!(id, std::thread::current().id());
+            assert_eq!(*identity.get_or_insert(id), id);
+        }
+        drop(worker);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn driver_probe_ui_never_waits_or_queues_more_than_one_request() {
+        let (entered, started) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (mut worker, thread) = DriverProbeWorker::start_with_probe(
+            egui::Context::default(), move |_| {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                DriverProbe { pipe_ready: true, health: None }
+            },
+        ).unwrap();
+        assert!(worker.request(false));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(worker.try_recv(), Err(TryRecvError::Empty)));
+        for _ in 0..100 {
+            assert!(!worker.request(true));
+        }
+        release.send(()).unwrap();
+        assert!(receive(&mut worker).pipe_ready);
+        assert!(started.try_recv().is_err(), "no second request may have queued");
+        drop(worker);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn driver_probe_drop_does_not_join_a_blocked_windows_probe() {
+        let (entered, started) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (mut worker, thread) = DriverProbeWorker::start_with_probe(
+            egui::Context::default(), move |_| {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                DriverProbe { pipe_ready: true, health: None }
+            },
+        ).unwrap();
+        assert!(worker.request(false));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (dropped, confirmed) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(worker);
+            dropped.send(()).unwrap();
+        });
+        let returned_without_probe = confirmed.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.send(()).unwrap();
+        dropper.join().unwrap();
+        thread.join().unwrap();
+        assert!(returned_without_probe, "closing settings state must not wait for Windows");
+    }
+
+    #[test]
+    fn driver_probe_stops_after_result_channel_disconnects() {
+        let (calls, observed) = mpsc::channel();
+        let (worker, thread) = DriverProbeWorker::start_with_probe(
+            egui::Context::default(), move |_| {
+                calls.send(()).unwrap();
+                DriverProbe { pipe_ready: true, health: None }
+            },
+        ).unwrap();
+        let DriverProbeWorker { requests, results, .. } = worker;
+        drop(results);
+        requests.send(false).unwrap();
+        thread.join().unwrap();
+        assert_eq!(observed.try_iter().count(), 1);
+        assert!(requests.send(true).is_err(), "worker must stop even while requests remain connected");
+    }
+}
+
 fn start_settings_probe<T: Send + 'static>(
     ctx: &egui::Context,
     name: &str,
@@ -182,7 +340,7 @@ pub struct PhoneHomeApp {
     /// 由 [`Self::refresh_settings_status`] 定时刷新。
     pub pipe_ready: bool,
     driver_probe_checked: Option<std::time::Instant>,
-    driver_probe: Option<std::sync::mpsc::Receiver<DriverProbe>>,
+    driver_probe: Option<DriverProbeWorker>,
     driver_health: Option<snug_win::driver_health::DriverHealth>,
     driver_health_checked: Option<std::time::Instant>,
     driver_retry: Option<std::sync::mpsc::Receiver<Result<snug_win::VddProtocol, String>>>,
@@ -295,6 +453,38 @@ fn select_displayed_screen(
         *active = Some(id.clone());
         Some(id)
     }
+}
+
+/// A deleted selection cannot be reached by the picker once its virtual screen is gone.
+fn repair_removed_screen_selection(active: &mut Option<String>, config: &AppConfig) -> bool {
+    let screens = config.effective_screens();
+    if active
+        .as_ref()
+        .is_none_or(|id| screens.iter().any(|screen| &screen.id == id))
+    {
+        return false;
+    }
+    *active = config
+        .primary_touch_screen()
+        .filter(|screen| screen.enabled)
+        .or_else(|| screens.into_iter().find(|screen| screen.enabled))
+        .map(|screen| screen.id);
+    true
+}
+
+fn failed_resolution_screen(
+    config: &AppConfig,
+    active_screen: Option<&str>,
+    notice: Option<snug_core::desk::DeskNotice>,
+) -> Option<String> {
+    (notice == Some(snug_core::desk::DeskNotice::ReshapeFailed))
+        .then(|| crate::controller::selected_screen_id(config, active_screen))
+        .flatten()
+}
+
+fn selected_screen_config(config: &AppConfig, screen_id: Option<&str>) -> Option<snug_core::ScreenConfig> {
+    let id = crate::controller::selected_screen_id(config, screen_id)?;
+    config.effective_screens().into_iter().find(|screen| screen.id == id)
 }
 
 impl Drop for PhoneHomeApp {
@@ -737,12 +927,22 @@ impl PhoneHomeApp {
         crate::info!("收尾：完成");
     }
 
-    fn save_config(&self) {
+    fn save_config(&mut self) -> bool {
         let file = self.paths.config_file();
-        match self.config.save(&file) {
-            Ok(()) => crate::info!("配置已保存 {}", file.display()),
-            Err(err) => crate::warn!("配置保存失败 {}：{err}", file.display()),
-        }
+        let error = match self.config.save(&file) {
+            Ok(()) => {
+                crate::info!("配置已保存 {}", file.display());
+                None
+            }
+            Err(err) => {
+                crate::warn!("配置保存失败 {}：{err}", file.display());
+                Some(err.to_string())
+            }
+        };
+        let saved = error.is_none();
+        self.settings.set_config_save_error(error);
+        self.desktop_settings.sync_runtime_from(&self.settings);
+        saved
     }
 
     /// 让界面窗口跟着手机屏走：屏在就把窗口搬上去，屏没了就藏起来。
@@ -913,16 +1113,10 @@ impl PhoneHomeApp {
     /// 返回 `None` 表示拿不到主屏区域，调用方按"没有手机屏"处理（窗口挪到屏幕外）。
     fn desktop_layout(&self, ctx: &egui::Context) -> Option<(snug_core::Rect, f32)> {
         let area = self.controller.main_area()?;
-        let screen = displayed_screen(&self.active_screen, &self.preview)
-            .and_then(|id| {
-                self.config
-                    .effective_screens()
-                    .into_iter()
-                    .find(|screen| screen.id == id)
-            })
-            .or_else(|| self.config.primary_touch_screen())
-            .or_else(|| self.config.effective_screens().into_iter().next())
-            .unwrap_or_default();
+        let screen = selected_screen_config(
+            &self.config,
+            displayed_screen(&self.active_screen, &self.preview),
+        ).unwrap_or_default();
         let fit = snug_core::ScreenPlan::fit_of(&screen);
         let (design_width, design_height, scale) = snug_core::ScreenFit::compute_preview_layout(
             snug_core::Size::new(area.width, area.height),
@@ -1142,14 +1336,11 @@ impl PhoneHomeApp {
         let needs_logs = self.settings.needs_logs() || self.desktop_settings.needs_logs();
         self.poll_driver_probe(ctx, needs_logs);
         let state = self.state();
-        let failed_resolution_screen = (state.notice
-            == Some(snug_core::desk::DeskNotice::ReshapeFailed))
-        .then(|| {
-            self.active_screen
-                .clone()
-                .or_else(|| self.config.primary_touch_screen().map(|screen| screen.id))
-        })
-        .flatten();
+        let failed_resolution_screen = failed_resolution_screen(
+            &self.config,
+            self.active_screen.as_deref(),
+            state.notice,
+        );
         let broker_status = snug_win::driver_health::broker_status();
         let driver_broker_connected = matches!(broker_status, snug_win::vdd_broker::BrokerStatus::Connected);
         let driver_connection_result = match broker_status {
@@ -1211,12 +1402,21 @@ impl PhoneHomeApp {
         if mode != before.phone_screen_mode() {
             crate::info!("设置：手机屏显示方式 → {mode:?}");
             self.controller.set_phone_screen_mode(mode);
-            self.save_config();
         }
+        // Every committed edit must survive a crash, including explicit resolution Apply.
+        let saved = self.save_config();
         self.settings.sync_committed_screens(before, &self.config);
         self.desktop_settings.sync_config(&self.config);
+        if repair_removed_screen_selection(&mut self.active_screen, &self.config) {
+            self.controller.set_active_screen(self.active_screen.clone());
+            self.last_phone_rect = None;
+            self.last_offscreen = None;
+        }
+        if let Some(preview) = &mut self.preview {
+            repair_removed_screen_selection(&mut preview.active_screen, &self.config);
+        }
         let impact = crate::settings::classify_change(before, &self.config);
-        if let Some(hint) = crate::settings::change_hint(impact) {
+        if saved && let Some(hint) = crate::settings::change_hint(impact) {
             crate::info!("设置：{hint}");
         }
         match impact {
@@ -1287,8 +1487,10 @@ impl PhoneHomeApp {
     fn poll_driver_probe(&mut self, ctx: &egui::Context, diagnostics_open: bool) {
         const PIPE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-        if let Some(receiver) = &self.driver_probe {
-            match receiver.try_recv() {
+        if let Some(worker) = &mut self.driver_probe
+            && worker.pending
+        {
+            match worker.try_recv() {
                 Ok(probe) => {
                     if probe.pipe_ready != self.pipe_ready {
                         let status = if probe.pipe_ready { "就绪" } else { "未就绪" };
@@ -1302,9 +1504,9 @@ impl PhoneHomeApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     crate::warn!("驱动：诊断任务未返回结果");
+                    self.driver_probe = None;
                 }
             }
-            self.driver_probe = None;
         }
         let probe_health = diagnostics_open
             && self.driver_health_checked.is_none_or(|last| last.elapsed() >= HEALTH_INTERVAL);
@@ -1316,12 +1518,18 @@ impl PhoneHomeApp {
         if probe_health {
             self.driver_health_checked = Some(now);
         }
-        match start_settings_probe(ctx, "snug-driver-status", move || DriverProbe {
-            pipe_ready: crate::driver::pipe_available(),
-            health: probe_health.then(snug_win::driver_health::DriverHealth::probe),
-        }) {
-            Ok(receiver) => self.driver_probe = Some(receiver),
-            Err(error) => crate::warn!("驱动：无法启动诊断任务：{error}"),
+        if self.driver_probe.is_none() {
+            match DriverProbeWorker::start(ctx) {
+                Ok(worker) => self.driver_probe = Some(worker),
+                Err(error) => {
+                    crate::warn!("驱动：无法启动诊断任务：{error}");
+                    return;
+                }
+            }
+        }
+        if !self.driver_probe.as_mut().is_some_and(|worker| worker.request(probe_health)) {
+            crate::warn!("驱动：诊断工作线程已退出");
+            self.driver_probe = None;
         }
     }
 
@@ -1390,6 +1598,9 @@ impl PhoneHomeApp {
                 }
             }
             SettingsAction::RetryResolution(id) => self.controller.retry_resolution(id),
+            SettingsAction::RetrySaveConfig => {
+                self.save_config();
+            }
             SettingsAction::DismissScreen => self.dismiss_active_screen(ctx),
             SettingsAction::ApplyGestureSettings => {
                 crate::info!("设置：手势配置已变，重建钩子");
@@ -1638,14 +1849,8 @@ impl eframe::App for PhoneHomeApp {
 
 impl PhoneHomeApp {
     fn selected_computer_screen(&self) -> bool {
-        let screens = self.config.effective_screens();
-        let selected = if let Some(id) = displayed_screen(&self.active_screen, &self.preview) {
-            screens.into_iter().find(|screen| screen.id == id && screen.enabled)
-        } else {
-            self.config.primary_touch_screen().filter(|screen| screen.enabled)
-                .or_else(|| screens.into_iter().find(|screen| screen.enabled))
-        };
-        selected.is_some_and(|screen| screen.device.kind == snug_core::DeviceKind::Computer)
+        selected_screen_config(&self.config, displayed_screen(&self.active_screen, &self.preview))
+            .is_some_and(|screen| screen.enabled && screen.device.kind == snug_core::DeviceKind::Computer)
     }
 
     fn dismiss_active_screen(&mut self, ctx: &egui::Context) {
@@ -1695,9 +1900,9 @@ impl PhoneHomeApp {
     fn draw_mobile_home(&mut self, ctx: &egui::Context) {
         let state = self.state();
         let screens = self.controller.enabled_screens();
-        let selected_screen = displayed_screen(&self.active_screen, &self.preview)
-            .map(str::to_owned)
-            .or_else(|| self.config.primary_touch_screen().map(|screen| screen.id));
+        let selected_screen = crate::controller::selected_screen_id(
+            &self.config, displayed_screen(&self.active_screen, &self.preview),
+        );
         let name = screens
             .iter()
             .find(|(id, _)| selected_screen.as_ref() == Some(id))
@@ -1726,18 +1931,15 @@ impl PhoneHomeApp {
         let mut chosen = None;
         let mut settings = false;
         let mut dismiss = false;
+        let selected_screen = crate::controller::selected_screen_id(
+            &self.config, displayed_screen(&self.active_screen, &self.preview),
+        );
         let response = egui::Modal::new(egui::Id::new("screen-picker")).show(ctx, |ui| {
             ui.set_width((ctx.screen_rect().width() - 56.0).clamp(180.0, 440.0));
             ui.heading("切换屏幕");
             ui.add_space(12.0);
             for (id, name) in self.controller.enabled_screens() {
-                let selected = displayed_screen(&self.active_screen, &self.preview)
-                    .map(|active| active == id)
-                    .unwrap_or_else(|| {
-                        self.config
-                            .primary_touch_screen()
-                            .is_some_and(|screen| screen.id == id)
-                    });
+                let selected = selected_screen.as_deref() == Some(&id);
                 if touch_button(
                     ui,
                     &format!("{}{}", if selected { "✓  " } else { "" }, name),
@@ -1752,6 +1954,8 @@ impl PhoneHomeApp {
                 settings = true;
                 close = true;
             }
+            ui.label("归属保护模式保留 Windows 当前缩放比例，如需调整请在 Windows 显示设置中修改。");
+            ui.add_space(8.0);
             if self.preview.is_none() && touch_button(ui, "退出这块屏…").clicked() {
                 dismiss = true;
                 close = true;
@@ -1802,6 +2006,7 @@ impl PhoneHomeApp {
             LibraryAction::ZoomOut => self.controller.adjust_zoom(screen, -1),
             LibraryAction::ForceQuit { pid, app } => self.controller.force_quit(screen, pid, app),
             LibraryAction::DismissNotice => self.controller.dismiss_notice(screen),
+            LibraryAction::ConfirmManualZoomReset => self.controller.confirm_manual_zoom_reset(screen),
             LibraryAction::Settings => {
                 self.settings.select_tab(SettingsTab::Screens);
                 self.settings.open();
@@ -1925,6 +2130,96 @@ mod mobile_layout_tests {
     use super::*;
 
     #[test]
+    fn preview_uses_the_enabled_default_screen_resolution() {
+        let mut config = AppConfig::default().sanitize();
+        let first = config.effective_screens()[0].clone();
+        let mut fallback = first.clone();
+        fallback.id = "enabled-tablet".into();
+        fallback.resolution = Some(snug_core::config::ScreenResolution { width: 1536, height: 2048 });
+        config.screens = Some(vec![snug_core::ScreenConfig { enabled: false, ..first }, fallback.clone()]);
+        let selected = selected_screen_config(&config, None).unwrap();
+        assert_eq!(selected.id, fallback.id);
+        let fit = snug_core::ScreenPlan::fit_of(&selected);
+        assert_eq!(fit.pixel_size(fit.base_width()), (1536, 2048));
+    }
+
+    #[test]
+    fn preview_screen_lookup_preserves_explicit_selection_without_implicit_fallback() {
+        let config = AppConfig::default().sanitize();
+        let first = config.effective_screens()[0].clone();
+        assert_eq!(selected_screen_config(&config, Some(&first.id)), Some(first));
+        assert_eq!(selected_screen_config(&config, Some("deleted-screen")), None);
+        let mut disabled = config;
+        disabled.screens.as_mut().unwrap()[0].enabled = false;
+        assert_eq!(selected_screen_config(&disabled, None), None);
+    }
+
+    #[test]
+    fn resolution_failure_follows_the_enabled_default_screen() {
+        let mut config = AppConfig::default().sanitize();
+        let mut first = config.effective_screens().remove(0);
+        first.id = "disabled-phone".into();
+        first.enabled = false;
+        let mut fallback = first.clone();
+        fallback.id = "enabled-phone".into();
+        fallback.enabled = true;
+        config.screens = Some(vec![first, fallback]);
+        assert_eq!(
+            failed_resolution_screen(
+                &config,
+                None,
+                Some(snug_core::desk::DeskNotice::ReshapeFailed)
+            ),
+            Some("enabled-phone".into())
+        );
+        assert_eq!(
+            failed_resolution_screen(
+                &config,
+                Some("disabled-phone"),
+                Some(snug_core::desk::DeskNotice::ReshapeFailed)
+            ),
+            Some("disabled-phone".into()),
+            "an explicit selection retains its own state, including when disabled"
+        );
+        assert_eq!(failed_resolution_screen(&config, None, None), None);
+        config.screens.as_mut().unwrap()[1].enabled = false;
+        assert_eq!(
+            failed_resolution_screen(
+                &config,
+                None,
+                Some(snug_core::desk::DeskNotice::ReshapeFailed)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn deleting_selected_screen_recovers_an_enabled_screen_without_changing_other_selections() {
+        let mut config = AppConfig::default().sanitize();
+        let mut first = config.effective_screens()[0].clone();
+        first.id = "first".into();
+        let mut second = first.clone();
+        second.id = "second".into();
+        config.screens = Some(vec![first, second]);
+        let mut active = Some("first".into());
+        assert!(!repair_removed_screen_selection(&mut active, &config));
+        assert_eq!(active.as_deref(), Some("first"));
+        config = config.with_screen_removed("first");
+        assert!(repair_removed_screen_selection(&mut active, &config));
+        assert_eq!(active.as_deref(), Some("second"));
+        assert!(!repair_removed_screen_selection(&mut active, &config));
+
+        let mut implicit = None;
+        assert!(!repair_removed_screen_selection(&mut implicit, &config));
+        assert!(implicit.is_none());
+        config.screens.as_mut().unwrap()[0].enabled = false;
+        assert!(!repair_removed_screen_selection(&mut active, &config));
+        active = Some("deleted".into());
+        assert!(repair_removed_screen_selection(&mut active, &config));
+        assert!(active.is_none());
+    }
+
+    #[test]
     fn temporary_preview_selection_does_not_leak_after_close_or_phone_takeover() {
         for original in [None, Some("A".to_string())] {
             let mut active = original.clone();
@@ -2011,6 +2306,7 @@ mod mobile_layout_tests {
                 app: "test".into(),
             },
             LibraryAction::DismissNotice,
+            LibraryAction::ConfirmManualZoomReset,
         ] {
             assert!(library_action_changes_desktop(&action));
         }

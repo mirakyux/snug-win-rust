@@ -1,0 +1,27 @@
+{
+  "repository": "https://github.com/MolotovCherry/virtual-display-rs",
+  "commit": "22fcd2e065aac13745cb27dc869848091b9e3a23",
+  "license": "MIT",
+  "cargoPackage": "virtual-display-driver",
+  "driverVersion": "0.4.0.12",
+  "minimumDriverVersion": "0.4.0.9",
+  "driverDate": "11/26/2026",
+  "sourceArchiveSha256": "6026df3a5521b4b8d22997d6de5fd898fbd0a4386ba13ffdc15833c2ac9a5f70",
+  "sourceTreeSha256": "E7BADA48580BE1091A6C58A4AD2C5538F39FB5515411A7F9497D376425F889F2",
+  "requiredProtocolCapabilities": [
+    "SnugReserve",
+    "SnugCreate",
+    "SnugReplace",
+    "SnugRelease",
+    "SnugCheck"
+  ],
+  "releasePackage": {
+    "driverVersion": "0.3.1",
+    "archiveName": "virtual-desktop-driver-installer-x64.zip",
+    "archiveSha256": "B3E3A5AB9B49BD56A7E753120CDDB1D913479BC5C0DFA781C3D43392DDE2FB75",
+    "msiSha256": "036E27CEA782B1297AB7D822CC59694105952CDE5BA885D0B2850D4005D79390",
+    "certificateSha256": "D8C5783083BF892339F5ED4191BBF3BE502CBF85F19FF29EFB00568B5F8462B7",
+    "certificateThumbprint": "5DFA7E68997ED52D4B10420407860D1C29B6F427",
+    "protocolCapabilities": ["Legacy"]
+  }
+}

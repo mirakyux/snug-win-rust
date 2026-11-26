@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 
-use crate::vdd::{is_driver_pipe_available, VddClient, VddError, VddMode, VddMonitor};
+use crate::vdd::{is_driver_pipe_available, RemoveDisposition, VddClient, VddError, VddMode, VddMonitor};
 use crate::wide::{contains_ignore_case, from_wide, to_wide};
 
 /// 驱动里这块虚拟屏的名字（C# `PhoneScreenSpec.Name`）。
@@ -414,24 +414,63 @@ pub trait DisplayApi: Send {
     fn restart_virtual_display_device(&self) -> bool;
 }
 
+/// Whether creation was acknowledged by the driver or only submitted to a write-only protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyDisposition {
+    Confirmed,
+    SubmittedOnly,
+}
+
 /// 虚拟屏驱动管道。真机实现是 [`VddClient`]。
 pub trait VirtualDisplays: Send {
-    fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError>;
+    fn verify_owner(&mut self, id: u32, owner: Option<&str>) -> Result<(), VddError>;
+    fn reserve_owned(&mut self, id: u32, owner: &str) -> Result<bool, VddError>;
+    fn create_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<NotifyDisposition, VddError>;
+    fn replace_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<(), VddError>;
+    fn remove_owned(&mut self, ids: &[u32], owner: &str) -> Result<RemoveDisposition, VddError>;
+    fn notify(&mut self, monitors: &[VddMonitor]) -> Result<NotifyDisposition, VddError>;
     fn replace_legacy(&mut self, remove_ids: &[u32], add: &[VddMonitor]) -> Result<(), VddError>;
-    fn remove(&mut self, ids: &[u32]) -> Result<(), VddError>;
+    fn remove(&mut self, ids: &[u32]) -> Result<RemoveDisposition, VddError>;
     fn remove_all(&mut self) -> Result<(), VddError>;
 }
 
 impl VirtualDisplays for VddClient {
-    fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
-        VddClient::notify(self, monitors)
+    fn verify_owner(&mut self, id: u32, owner: Option<&str>) -> Result<(), VddError> {
+        VddClient::verify_owner(self, id, owner)
+    }
+
+    fn reserve_owned(&mut self, id: u32, owner: &str) -> Result<bool, VddError> {
+        VddClient::reserve_owned(self, id, owner)
+    }
+
+    fn create_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<NotifyDisposition, VddError> {
+        VddClient::create_owned(self, monitors, owner).map(|()| NotifyDisposition::Confirmed)
+    }
+
+    fn remove_owned(&mut self, ids: &[u32], owner: &str) -> Result<RemoveDisposition, VddError> {
+        VddClient::remove_owned(self, ids, owner)
+    }
+
+    fn replace_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<(), VddError> {
+        VddClient::replace_owned(self, monitors, owner)
+    }
+
+    fn notify(&mut self, monitors: &[VddMonitor]) -> Result<NotifyDisposition, VddError> {
+        VddClient::notify(self, monitors)?;
+        // V2 succeeds only after SnugUpdate Applied. The broker also returns the
+        // protocol used for this successful operation; an unknown protocol is conservative.
+        Ok(if self.protocol() == Some(crate::vdd::VddProtocol::V2) {
+            NotifyDisposition::Confirmed
+        } else {
+            NotifyDisposition::SubmittedOnly
+        })
     }
 
     fn replace_legacy(&mut self, remove_ids: &[u32], add: &[VddMonitor]) -> Result<(), VddError> {
         VddClient::replace_legacy(self, remove_ids, add)
     }
 
-    fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
+    fn remove(&mut self, ids: &[u32]) -> Result<RemoveDisposition, VddError> {
         VddClient::remove(self, ids)
     }
 
@@ -533,6 +572,11 @@ struct PhoneScreen<A: DisplayApi, V: VirtualDisplays> {
     timings: Timings,
     last_modeset: Option<Instant>,
     maps: Arc<Mutex<ScreenMaps>>,
+    /// Desktop retirement can finish before the driver can confirm removal.
+    /// Keep unconfirmed IDs reserved even after their active mappings are gone.
+    removals: HashMap<u32, RemoveDisposition>,
+    /// Request tokens guard both pending creations and confirmed V2 entries.
+    owners: HashMap<u32, String>,
     /// 归属记录（C# v1.3.0 `_ownedStore`）：只记本程序建的屏，启动清理只拆这些。
     /// `None` = 不记账（内存版构造函数、单测用）。
     owned: Option<OwnedDisplayStore>,
@@ -552,7 +596,16 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         maps: Arc<Mutex<ScreenMaps>>,
         owned: Option<OwnedDisplayStore>,
     ) -> Self {
-        Self { api, ipc, timings, last_modeset: None, maps, owned }
+        Self {
+            api,
+            ipc,
+            timings,
+            last_modeset: None,
+            maps,
+            removals: HashMap::new(),
+            owners: HashMap::new(),
+            owned,
+        }
     }
 
     fn wait_for_modeset_cooldown(&self) {
@@ -577,37 +630,34 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         let Some(store) = &self.owned else {
             return;
         };
-        let owned_ids = store.load_ids();
-        if owned_ids.is_empty() {
+        let ids = store.try_load_ids().and_then(|mut ids| {
+            ids.extend(store.try_load_reserved_ids()?);
+            ids.sort_unstable();
+            ids.dedup();
+            Ok(ids)
+        });
+        let ids = match ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                crate::warn(&format!("启动清理无法读取归属记录，未删除虚拟屏：{error}"));
+                return;
+            }
+        };
+        if ids.is_empty() {
             return;
         }
         if !self.api.driver_pipe_available() {
-            // C#：保留记录，等管道恢复后再清。
             crate::warn("启动清理时驱动管道暂未就绪，保留归属记录以便管道恢复后清理");
             return;
         }
-        // C# 一次 RemoveAsync(全部 id)；驱动拒收就保留整本账（下一次启动再试）。
-        match self.ipc.remove(&owned_ids) {
-            Ok(()) => {
-                sleep_for(self.timings.cleanup_settle);
-                let monitors = self.api.active_monitors();
-                let mut removed = Vec::new();
-                for id in owned_ids {
-                    // IPC 接受删除不等于显示器已下线；无可核对编号的虚拟屏也不能猜成已清理。
-                    if retirement_is_online(&monitors, id, None) {
-                        crate::warn(&format!("残留手机屏 #{id} 尚未确认下线，保留归属记录"));
-                    } else {
-                        store.release_owned(id);
-                        removed.push(id);
-                    }
-                }
-                if !removed.is_empty() {
-                    crate::info(&cleanup_log_line(&removed));
-                }
+        let mut removed = Vec::new();
+        for id in ids {
+            if self.retire(id) && !self.removals.contains_key(&id) {
+                removed.push(id);
             }
-            Err(error) => crate::warn(&format!(
-                "启动清理残留虚拟屏时异常：{error}（保留归属记录）"
-            )),
+        }
+        if !removed.is_empty() {
+            crate::info(&cleanup_log_line(&removed));
         }
     }
 
@@ -655,11 +705,33 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             .count();
         let modes = build_modes(&fit);
         let (base_width, base_height) = fit.pixel_size(fit.base_width());
+        let owned_ids = match &self.owned {
+            Some(store) => store.try_load_ids().map_err(|error| {
+                PhoneScreenException::with_detail(
+                    PhoneScreenErrorKind::CreateFailed,
+                    format!("无法读取手机屏归属记录，未创建虚拟屏：{error}"),
+                )
+            })?,
+            None => Vec::new(),
+        };
+        let reserved_ids = match &self.owned {
+            Some(store) => store.try_load_reserved_ids().map_err(|error| {
+                PhoneScreenException::with_detail(
+                    PhoneScreenErrorKind::CreateFailed,
+                    format!("无法读取手机屏创建意图，未创建虚拟屏：{error}"),
+                )
+            })?,
+            None => Vec::new(),
+        };
 
         for candidate in candidates_starting_after(existing_virtual_count) {
             // C# v1.3.0：已经归本程序管的编号不再重复 Notify，否则会把那块屏
             // 的模式覆盖成这次请求的档位（多屏时两块屏会互踩）。
             if lock_maps(&self.maps).fits.contains_key(&candidate)
+                || self.removals.contains_key(&candidate)
+                || owned_ids.contains(&candidate)
+                || reserved_ids.contains(&candidate)
+                || self.owners.contains_key(&candidate)
                 || before_monitors.iter().any(|monitor| monitor.virtual_display_id == Some(candidate))
             {
                 continue;
@@ -668,29 +740,122 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             self.check_physical_displays(&before_monitors).map_err(|detail| {
                 PhoneScreenException::with_detail(PhoneScreenErrorKind::CreateFailed, detail)
             })?;
-            let monitor = VddMonitor {
+            let mut monitor = VddMonitor {
                 id: candidate,
                 name: Some(vdd_name.to_string()),
                 enabled: true,
                 modes: modes.clone(),
             };
-            let submitted = self.ipc.notify(&[monitor]);
+            // Reserve first: an empty reservation has no desktop effect and expires.
+            // Its token must be persisted before sending the topology-changing Create.
+            let owner = unsafe { windows::Win32::System::Com::CoCreateGuid() }.map_err(|error| {
+                PhoneScreenException::with_detail(
+                    PhoneScreenErrorKind::CreateFailed,
+                    format!("无法生成手机屏归属标记：{error}"),
+                )
+            })?;
+            let owner = format!("{:032x}", owner.to_u128());
+            self.owners.insert(candidate, owner.clone());
+            let reserved = match self.ipc.reserve_owned(candidate, &owner) {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    // Release uses the same token and cannot remove somebody else's
+                    // entry, including when this reservation's ACK was lost.
+                    let occupied = matches!(&error,
+                        VddError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists);
+                    let retired = self.retire(candidate);
+                    // An inactive foreign entry can be absent from before_monitors.
+                    // Only an explicit conflict plus completed cleanup permits retry.
+                    if occupied && retired {
+                        continue;
+                    }
+                    return Err(PhoneScreenException::with_detail(
+                        PhoneScreenErrorKind::CreateFailed,
+                        format!("手机屏 #{candidate} 未确认预留，未发送创建请求：{error}"),
+                    ).with_pending_display(candidate));
+                }
+            };
+            if !reserved {
+                self.owners.remove(&candidate);
+                return Err(PhoneScreenException::with_detail(
+                    PhoneScreenErrorKind::CreateFailed,
+                    format!("驱动不支持带归属凭据的建屏，Legacy 下未创建手机屏 #{candidate}"),
+                ));
+            }
+            let submitted = if reserved {
+                // The driver owns the compare-and-swap. Offer only the requested
+                // mode so Windows can adopt it without a GDI-name-addressed write.
+                monitor.modes = vec![VddMode {
+                    width: base_width.max(0) as u32,
+                    height: base_height.max(0) as u32,
+                    refresh_rates: vec![60],
+                }];
+                if let Some(store) = &self.owned
+                    && let Err(error) = store.try_reserve(candidate, &owner)
+                {
+                    let retired = self.retire(candidate);
+                    let error = PhoneScreenException::with_detail(
+                        PhoneScreenErrorKind::CreateFailed,
+                        format!("无法保存手机屏 #{candidate} 的创建意图，未创建虚拟屏：{error}"),
+                    );
+                    return Err(if retired { error } else { error.with_pending_display(candidate) });
+                }
+                self.ipc.create_owned(&[monitor], &owner)
+            } else {
+                unreachable!("unreserved legacy creates are rejected above")
+            };
             self.last_modeset = Some(Instant::now());
-            if let Err(error) = submitted {
-                // C# `PhoneDisplayService.cs:73`：`Log.Warn($"手机屏（id={candidateId}）IPC Notify 失败：{ex.Message}")`
-                // 这一行是排障关键：没有它，「Notify 全被驱动拒了」和「Notify 成功但驱动
-                // 没把屏挂上来」在日志里长得一模一样。
-                crate::warn(&format!("手机屏（id={candidate}）IPC Notify 失败：{error}"));
-                continue;
+            let disposition = match submitted {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    // C# `PhoneDisplayService.cs:73`：`Log.Warn($"手机屏（id={candidateId}）IPC Notify 失败：{ex.Message}")`
+                    // 这一行是排障关键：没有它，「Notify 全被驱动拒了」和「Notify 成功但驱动
+                    // 没把屏挂上来」在日志里长得一模一样。
+                    crate::warn(&format!("手机屏（id={candidate}）IPC Notify 失败：{error}"));
+                    if reserved {
+                        // The reservation proves which token may release this attempt;
+                        // an unacknowledged Create is never replayed under another ID.
+                        return Err(PhoneScreenException::with_detail(
+                            PhoneScreenErrorKind::CreateFailed,
+                            error.to_string(),
+                        ).with_pending_display(candidate));
+                    }
+                    if matches!(&error, VddError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported) {
+                        return Err(PhoneScreenException::with_detail(
+                            PhoneScreenErrorKind::CreateFailed,
+                            error.to_string(),
+                        ));
+                    }
+                    continue;
+                }
+            };
+            if disposition == NotifyDisposition::Confirmed {
+                // The driver owns this entry even while Windows has no active GDI output.
+                // Reserve it before persistence so a failed write still has a retirable ID.
+                lock_maps(&self.maps).fits.insert(candidate, fit.clone());
+                if let Some(store) = &self.owned {
+                    store.try_record_owned(candidate).map_err(|error| {
+                        PhoneScreenException::with_detail(
+                            PhoneScreenErrorKind::CreateFailed,
+                            format!("无法保存手机屏 #{candidate} 的归属记录：{error}"),
+                        )
+                        .with_pending_display(candidate)
+                    })?;
+                }
             }
             let Some(snapshot) = self.wait_for_online(
                 &before_monitors,
                 &existing,
                 candidate,
-                base_width,
-                base_height,
             )
             else {
+                if disposition == NotifyDisposition::Confirmed {
+                    crate::warn(&format!(
+                        "手机屏 #{candidate} 已由驱动确认创建，但 Windows 尚未上线，保留归属并等待清理"
+                    ));
+                    return Err(PhoneScreenException::new(PhoneScreenErrorKind::NeverOnline)
+                        .with_pending_display(candidate));
+                }
                 // C# `6f548dd`：超时后**不要** Remove 这个 id。那个 id 可能对应 C# 版
                 // 或别的程序建的屏（同机跑两版时很常见），误删会把别人的手机屏拆掉。
                 // 只跳过这个候选，换下一个。
@@ -709,9 +874,17 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 maps.device_names
                     .insert(candidate, snapshot.device_name.clone());
             }
-            // C# v1.3.0：确认上线后才记账；没上线就跳过、绝不写进归属记录。
-            if let Some(store) = &self.owned {
-                store.record_owned(candidate);
+            // Legacy cannot confirm creation; only a uniquely verified online output establishes it.
+            if disposition == NotifyDisposition::SubmittedOnly
+                && let Some(store) = &self.owned
+            {
+                store.try_record_owned(candidate).map_err(|error| {
+                    PhoneScreenException::with_detail(
+                        PhoneScreenErrorKind::CreateFailed,
+                        format!("无法保存手机屏 #{candidate} 的归属记录：{error}"),
+                    )
+                    .with_pending_display(candidate)
+                })?;
             }
             let mode = self.check_physical_displays(&before_monitors).and_then(|()| {
                 if !self.set_width(candidate, fit.base_width()) {
@@ -744,8 +917,6 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         before_monitors: &[MonitorSnapshot],
         existing: &HashSet<String>,
         driver_id: u32,
-        base_width: i32,
-        base_height: i32,
     ) -> Option<MonitorSnapshot> {
         let start = Instant::now();
         while start.elapsed() < self.timings.online {
@@ -758,24 +929,8 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 continue;
             }
 
-            let right_edge = all
-                .iter()
-                .map(|m| m.bounds.max_x())
-                .fold(f64::NEG_INFINITY, f64::max);
-            let right_edge = if right_edge.is_finite() { right_edge as i32 } else { 2560 };
-            if self
-                .api
-                .try_attach_virtual_display(driver_id, base_width, base_height, right_edge, 0)
-                .is_some()
-            {
-                self.last_modeset = Some(Instant::now());
-                sleep_for(self.timings.attach_settle);
-                let attached_monitors = self.api.active_monitors();
-                if let Some(attached) = pick_new_monitor(existing, &attached_monitors, driver_id) {
-                    return Some(attached);
-                }
-            }
-
+            // Native attach addresses a recyclable GDI name and applies global
+            // topology without an ownership token. Never attach tokenlessly.
             sleep_for(self.timings.online_poll);
         }
         None
@@ -836,16 +991,40 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
     }
 
     fn send_modes(&mut self, display_id: u32, fit: &ScreenFit) -> Result<(), VddError> {
+        let owner = self.owner_of(display_id)?;
+        let Some(owner_token) = owner else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy 模式表更新缺少归属凭据，未发送替换请求",
+            ).into());
+        };
+        let (width, height) = fit.pixel_size(fit.base_width());
+        let modes = vec![VddMode {
+            width: width.max(0) as u32,
+            height: height.max(0) as u32,
+            refresh_rates: vec![60],
+        }];
         let monitor = VddMonitor {
             id: display_id,
             name: Some(MONITOR_NAME.to_string()),
             enabled: true,
-            modes: build_modes(fit),
+            modes,
         };
-        // Let the connected client choose the protocol. It may have changed since the last call.
-        let submitted = self.ipc.replace_legacy(&[display_id], &[monitor]);
+        // Updating a token-owned entry must preserve its owner. A protocol downgrade
+        // cannot turn this into an unguarded remove-and-add operation.
+        let submitted = self.ipc.replace_owned(&[monitor], &owner_token);
         self.last_modeset = Some(Instant::now());
         submitted
+    }
+
+    fn owner_of(&self, display_id: u32) -> std::io::Result<Option<String>> {
+        if let Some(owner) = self.owners.get(&display_id) {
+            return Ok(Some(owner.clone()));
+        }
+        match &self.owned {
+            Some(store) => store.try_owner(display_id),
+            None => Ok(None),
+        }
     }
 
     fn refresh_binding(&self, display_id: u32) -> Option<MonitorSnapshot> {
@@ -888,30 +1067,61 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// 撤屏（C# `RetireAsync`）：等它真的下线，顺手把走丢的光标捞回来。
     fn retire(&mut self, display_id: u32) -> bool {
-        let device_name = lock_maps(&self.maps).device_names.get(&display_id).cloned();
+        let owner = match self.owner_of(display_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                crate::warn(&format!("无法读取手机屏 #{display_id} 的归属标记，未发送移除请求：{error}"));
+                return false;
+            }
+        };
+        let Some(owner_token) = owner else {
+            crate::warn(&format!(
+                "手机屏 #{display_id} 缺少归属凭据，未发送撤屏请求并保留归属记录"
+            ));
+            return false;
+        };
+        let device_name = {
+            let maps = lock_maps(&self.maps);
+            maps.device_names.get(&display_id).cloned()
+        };
         let online = retirement_is_online(
             &self.api.active_monitors(), display_id, device_name.as_deref(),
         );
-        if !online {
-            self.finish_retirement(display_id);
+        // An inactive output may still occupy a driver entry. A confirmed removal
+        // requires desktop retirement; NotOwned proves any surviving screen is foreign.
+        if self.removals.get(&display_id) == Some(&RemoveDisposition::NotOwned)
+            || (!online && self.removals.get(&display_id) == Some(&RemoveDisposition::Confirmed))
+        {
+            if !self.finish_retirement(display_id, &owner_token) {
+                return false;
+            }
             self.restore_cursor_if_stranded();
             return true;
         }
-        let owned = self.owned.as_ref().is_some_and(|store| store.load_ids().contains(&display_id));
-        if device_name.is_none() && !owned {
-            // 无内存映射或持久归属时，不能因碰巧匹配编号而删除别的程序的屏。
-            return false;
-        }
-        if let Err(error) = self.ipc.remove(&[display_id]) {
-            crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}（保留归属与映射）"));
-            return false;
+        let removed = self.ipc.remove_owned(&[display_id], &owner_token);
+        match removed {
+            Ok(disposition) => {
+                self.removals.insert(display_id, disposition);
+                if disposition == RemoveDisposition::SubmittedOnly {
+                    crate::warn(&format!(
+                        "旧版驱动已接收移除手机屏 #{display_id} 的请求，等待桌面下线（保留归属待驱动确认）"
+                    ));
+                }
+            }
+            Err(error) => {
+                crate::warn(&format!("移除手机屏 #{display_id} 失败：{error}（保留归属与映射）"));
+                return false;
+            }
         }
         let start = Instant::now();
         loop {
-            if !retirement_is_online(
+            if self.removals.get(&display_id) == Some(&RemoveDisposition::NotOwned)
+                || !retirement_is_online(
                 &self.api.active_monitors(), display_id, device_name.as_deref(),
             ) {
-                self.finish_retirement(display_id);
+                if !self.finish_retirement(display_id, &owner_token) {
+                    return false;
+                }
                 self.restore_cursor_if_stranded();
                 return true;
             }
@@ -922,14 +1132,25 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
         }
     }
 
-    fn finish_retirement(&self, display_id: u32) {
+    fn finish_retirement(&mut self, display_id: u32, owner_token: &str) -> bool {
+        if matches!(self.removals.get(&display_id), Some(RemoveDisposition::Confirmed | RemoveDisposition::NotOwned)) {
+            if let Some(store) = &self.owned {
+                // The driver may report NotOwned after another Snug instance has
+                // taken this numeric ID. Release the on-disk records only while
+                // the reservation still carries this exact token; a mismatch is
+                // a safe no-op and must never delete the other instance's entry.
+                if let Err(error) = store.try_release_owned_if_owner(display_id, owner_token) {
+                    crate::warn(&format!("手机屏 #{display_id} 已撤除但销账失败，保留归属以便重试：{error}"));
+                    return false;
+                }
+            }
+            self.removals.remove(&display_id);
+            self.owners.remove(&display_id);
+        }
         let mut maps = lock_maps(&self.maps);
         maps.fits.remove(&display_id);
         maps.device_names.remove(&display_id);
-        drop(maps);
-        if let Some(store) = &self.owned {
-            store.release_owned(display_id);
-        }
+        true
     }
 
     /// 光标停在被撤掉的屏上时挪到主屏中央（C# `RestoreCursorIfStranded`）。
@@ -945,7 +1166,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
 
     /// Restore an external physical display from `other_displays()`. Driver connector IDs
     /// belong to a different namespace and must never select a virtual screen here.
-    fn set_mode(&mut self, display_id: u32, mode: DisplayModeInfo) {
+    fn set_mode(&mut self, display_id: u32, mode: DisplayModeInfo) -> bool {
         let phone_names = lock_maps(&self.maps).phone_names();
         let targets: Vec<_> = self
             .api
@@ -960,7 +1181,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
             .take(2)
             .collect();
         let [target] = targets.as_slice() else {
-            return;
+            return false;
         };
         let mut actual = target.clone();
         if !resolution_matches(target.mode, mode) {
@@ -971,7 +1192,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                 mode.refresh_rate,
             ) {
                 crate::warn(&format!("恢复显示器 {} 的分辨率失败", target.device_name));
-                return;
+                return false;
             }
             sleep_for(self.timings.resolution_settle);
             let start = Instant::now();
@@ -984,7 +1205,7 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                         && monitor.virtual_display_id.is_none()
                         && !is_virtual_monitor(monitor)
                 }) else {
-                    return;
+                    return false;
                 };
                 if resolution_matches(observed.mode, mode) {
                     actual = observed;
@@ -995,18 +1216,44 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
                         "恢复显示器 {} 后的实际分辨率未达到目标",
                         target.device_name
                     ));
-                    return;
+                    return false;
                 }
                 sleep_for(self.timings.reshape_poll);
             }
         }
         if actual.mode.dpi_scale_percent != mode.dpi_scale_percent {
-            self.api
-                .set_dpi_scale(actual.adapter_id, actual.source_id, mode.dpi_scale_percent);
+            if !self.api.set_dpi_scale(actual.adapter_id, actual.source_id, mode.dpi_scale_percent) {
+                crate::warn(&format!("恢复显示器 {} 的 DPI 缩放失败", target.device_name));
+                return false;
+            }
+            let start = Instant::now();
+            loop {
+                let Some(observed) = self.api.active_monitors().into_iter().find(|monitor| {
+                    monitor.stable_id == display_id
+                        && normalized(&monitor.device_name) == normalized(&target.device_name)
+                        && monitor.adapter_id == target.adapter_id
+                        && monitor.source_id == target.source_id
+                        && monitor.virtual_display_id.is_none()
+                        && !is_virtual_monitor(monitor)
+                }) else {
+                    return false;
+                };
+                if resolution_matches(observed.mode, mode)
+                    && observed.mode.dpi_scale_percent == mode.dpi_scale_percent
+                {
+                    break;
+                }
+                if start.elapsed() >= self.timings.reshape {
+                    crate::warn(&format!("恢复显示器 {} 后的实际 DPI 未达到目标", target.device_name));
+                    return false;
+                }
+                sleep_for(self.timings.reshape_poll);
+            }
         }
+        true
     }
 
-    /// 确认目标分辨率和刷新率，再应用 ScreenFit 指定的 DPI。
+    /// 确认目标分辨率和刷新率；V2 保留 Windows 实测 DPI。
     fn set_width(&mut self, display_id: u32, width: i32) -> bool {
         let fit = {
             let maps = lock_maps(&self.maps);
@@ -1032,83 +1279,77 @@ impl<A: DisplayApi, V: VirtualDisplays> PhoneScreen<A, V> {
     }
 
     fn apply_mode(&mut self, display_id: u32, mode: DisplayModeInfo) -> bool {
-        let Some(current) = bound_monitor_of(&self.api, &self.maps, display_id) else {
-            crate::warn(&format!(
-                "手机屏 #{display_id} 的显示器身份已失效，未修改模式"
-            ));
-            return false;
-        };
-        let needs_resolution = !resolution_matches(current.mode, mode);
-        let mut after = current;
-        if needs_resolution {
-            let started = std::time::Instant::now();
-            let applied = self.api.set_temporary_resolution(
-                &after.device_name,
-                mode.width,
-                mode.height,
-                mode.refresh_rate,
-            );
-            self.last_modeset = Some(Instant::now());
-            if !applied {
-                let Some(current) = bound_monitor_of(&self.api, &self.maps, display_id) else {
-                    return false;
-                };
-                let applied = self.api.set_resolution(
-                    &current.device_name,
-                    mode.width,
-                    mode.height,
-                    mode.refresh_rate,
-                );
-                self.last_modeset = Some(Instant::now());
-                if !applied {
-                    return false;
-                }
-            }
-            let ms = started.elapsed().as_secs_f64() * 1000.0;
-            if ms >= 200.0 {
-                crate::info(&format!(
-                    "屏幕：换分辨率到 {}x{} 用了 {ms:.0}ms（{}）",
-                    mode.width, mode.height, after.device_name
+        match self.owner_of(display_id) {
+            Ok(Some(owner)) => return self.apply_owned_mode(display_id, mode, &owner),
+            Ok(None) => {
+                crate::warn(&format!(
+                    "手机屏 #{display_id} 缺少归属凭据，未修改分辨率或 DPI"
                 ));
+                return false;
             }
-            sleep_for(self.timings.resolution_settle);
-            let start = Instant::now();
-            loop {
-                let Some(observed) = bound_monitor_of(&self.api, &self.maps, display_id) else {
-                    return false;
-                };
-                if resolution_matches(observed.mode, mode) {
-                    after = observed;
-                    break;
-                }
-                if start.elapsed() >= self.timings.reshape {
-                    crate::warn(&format!(
-                        "手机屏 #{display_id} 的实际模式仍为 {}×{} @ {} Hz，目标为 {}×{} @ {} Hz",
-                        observed.mode.width,
-                        observed.mode.height,
-                        observed.mode.refresh_rate,
-                        mode.width,
-                        mode.height,
-                        mode.refresh_rate
-                    ));
-                    return false;
-                }
-                sleep_for(self.timings.reshape_poll);
+            Err(error) => {
+                crate::warn(&format!("无法读取手机屏 #{display_id} 的归属标记，未修改模式：{error}"));
+                return false;
             }
         }
+    }
+
+    fn apply_owned_mode(&mut self, display_id: u32, mode: DisplayModeInfo, owner: &str) -> bool {
+        if mode.width <= 0 || mode.height <= 0
+            || !mode.refresh_rate.is_finite() || mode.refresh_rate < 1.0
         {
-            let target_dpi = mode.dpi_scale_percent;
-            if after.mode.dpi_scale_percent != target_dpi {
-                let started = std::time::Instant::now();
-                self.api
-                    .set_dpi_scale(after.adapter_id, after.source_id, target_dpi);
-                let ms = started.elapsed().as_secs_f64() * 1000.0;
-                if ms >= 200.0 {
-                    crate::info(&format!("屏幕：换 DPI 到 {target_dpi}% 用了 {ms:.0}ms"));
-                }
+            return false;
+        }
+        let current = bound_monitor_of(&self.api, &self.maps, display_id);
+        if !current.as_ref().is_some_and(|monitor| resolution_matches(monitor.mode, mode)) {
+            let monitor = VddMonitor {
+                id: display_id,
+                name: Some(current.as_ref().map(|monitor| monitor.friendly_name.clone())
+                    .unwrap_or_else(|| MONITOR_NAME.to_string())),
+                enabled: true,
+                modes: vec![VddMode {
+                    width: mode.width as u32,
+                    height: mode.height as u32,
+                    refresh_rates: vec![mode.refresh_rate.round() as u32],
+                }],
+            };
+            // Do not authorize a later Win32 write with SnugCheck. The driver
+            // checks owner and mutates this mode table under one mutation lock.
+            let submitted = self.ipc.replace_owned(&[monitor], owner);
+            self.last_modeset = Some(Instant::now());
+            if let Err(error) = submitted {
+                crate::warn(&format!("手机屏 #{display_id} 的归属保护模式更新失败，未回退原生写入：{error}"));
+                return false;
             }
         }
-        true
+        let start = Instant::now();
+        loop {
+            // This is read-back confirmation only; no native write follows it.
+            if let Err(error) = self.ipc.verify_owner(display_id, Some(owner)) {
+                crate::warn(&format!("手机屏 #{display_id} 的模式更新归属未获确认，保留归属以便重试：{error}"));
+                return false;
+            }
+            if let Some(observed) = self.refresh_binding(display_id)
+                && resolution_matches(observed.mode, mode)
+            {
+                if observed.mode.dpi_scale_percent != mode.dpi_scale_percent {
+                    crate::info(&format!(
+                        "手机屏 #{display_id} 已确认 {}×{} @ {} Hz；为避免可复用路径写错屏幕，保留 Windows 当前 DPI {}%（建议值 {}%，可在 Windows 显示设置中调整）",
+                        observed.mode.width, observed.mode.height, observed.mode.refresh_rate,
+                        observed.mode.dpi_scale_percent, mode.dpi_scale_percent,
+                    ));
+                }
+                return true;
+            }
+            if start.elapsed() >= self.timings.reshape {
+                crate::warn(&format!(
+                    "手机屏 #{display_id} 未实际采用归属保护目标模式 {}×{} @ {} Hz，未执行原生分辨率/DPI/附加写入，保留归属以便重试",
+                    mode.width, mode.height, mode.refresh_rate,
+                ));
+                return false;
+            }
+            sleep_for(self.timings.reshape_poll);
+        }
     }
 }
 
@@ -1121,11 +1362,7 @@ fn find_monitor_of<A: DisplayApi>(
     maps: &Mutex<ScreenMaps>,
     display_id: u32,
 ) -> Option<MonitorSnapshot> {
-    let device_name = lock_maps(maps).device_names.get(&display_id).cloned()?;
-    let wanted = normalized(&device_name);
-    api.active_monitors()
-        .into_iter()
-        .find(|m| normalized(&m.device_name) == wanted)
+    bound_monitor_of(api, maps, display_id)
 }
 
 fn bound_monitor_of<A: DisplayApi>(
@@ -1160,14 +1397,12 @@ fn is_online_of<A: DisplayApi>(api: &A, maps: &Mutex<ScreenMaps>, display_id: u3
 }
 
 fn retirement_is_online(monitors: &[MonitorSnapshot], display_id: u32, device_name: Option<&str>) -> bool {
-    monitors.iter().any(|monitor| {
-        match monitor.virtual_display_id {
+    monitors.iter().any(|monitor| match monitor.virtual_display_id {
             Some(id) => id == display_id,
             None => match device_name {
                 Some(name) => normalized(&monitor.device_name) == normalized(name),
                 None => is_virtual_monitor(monitor),
-            },
-        }
+            }
     })
 }
 
@@ -2741,10 +2976,14 @@ mod tests {
         temporary_attempts: usize,
         temporary_resolution_error: bool,
         dpi_calls: Vec<(u32, u32, i32)>,
+        dpi_error: bool,
+        ignore_dpi_changes: bool,
+        invalidate_identity_on_dpi: bool,
         attaches: Vec<(i32, i32, i32, i32)>,
         pending_attach: Option<String>,
         modes: HashSet<(String, i32, i32)>,
         notified: Vec<Vec<u32>>,
+        notify_attempts: usize,
         /// 每次 Notify/ReplaceLegacy 带上去的显示名（v2 协议字段 `name`）。
         notified_names: Vec<Vec<String>>,
         removed: Vec<u32>,
@@ -2761,9 +3000,22 @@ mod tests {
         ignore_resolution_changes: bool,
         ignore_mode_registration: bool,
         next_device_name: Option<String>,
-        fail_next_legacy_add: bool,
         /// 非 `None` 时所有 `notify` 都失败（模拟驱动拒收/管道已断）。
-        notify_error: Option<String>,
+        notify_error: Option<(std::io::ErrorKind, String)>,
+        reservations: HashMap<u32, String>,
+        driver_owners: HashMap<u32, String>,
+        reserve_calls: Vec<(u32, String)>,
+        guarded_removals: Vec<(Vec<u32>, String)>,
+        guarded_replacements: Vec<(Vec<u32>, String)>,
+        guarded_mode_requests: Vec<Vec<VddMonitor>>,
+        owner_checks: usize,
+        foreign_owner_on_check: Option<usize>,
+        owner_check_error: bool,
+        reserve_ack_lost: bool,
+        create_ack_lost: bool,
+        replace_owner_on_create: bool,
+        foreign_owner_before_replace: bool,
+        owned_replace_error: bool,
         primary_change_on_arrival: Option<PrimaryChange>,
     }
 
@@ -2876,9 +3128,19 @@ mod tests {
             world
                 .dpi_calls
                 .push((adapter_id.low_part, source_id, percent));
+            if world.dpi_error {
+                return false;
+            }
+            if world.ignore_dpi_changes {
+                return true;
+            }
+            let invalidate_identity = world.invalidate_identity_on_dpi;
             for monitor in world.monitors.iter_mut() {
                 if monitor.adapter_id == adapter_id && monitor.source_id == source_id {
                     monitor.mode.dpi_scale_percent = percent;
+                    if invalidate_identity && monitor.virtual_display_id.is_some() {
+                        monitor.virtual_display_id = None;
+                    }
                 }
             }
             true
@@ -2933,11 +3195,153 @@ mod tests {
     struct FakeVdd(Arc<Mutex<World>>);
 
     impl VirtualDisplays for FakeVdd {
-        fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
+        fn verify_owner(&mut self, id: u32, owner: Option<&str>) -> Result<(), VddError> {
             let mut world = self.0.lock().unwrap();
-            if let Some(message) = world.notify_error.clone() {
+            world.owner_checks += 1;
+            if world.foreign_owner_on_check == Some(world.owner_checks) {
+                world.driver_owners.insert(id, "f".repeat(32));
+            }
+            if world.owner_check_error {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            }
+            if match owner {
+                Some(owner) => !world.legacy && world.driver_owners.get(&id).map(String::as_str) == Some(owner),
+                None => false,
+            } {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "display owner not confirmed").into())
+            }
+        }
+
+        fn reserve_owned(&mut self, id: u32, owner: &str) -> Result<bool, VddError> {
+            let mut world = self.0.lock().unwrap();
+            if world.legacy {
+                return Ok(false);
+            }
+            world.reserve_calls.push((id, owner.to_string()));
+            if world.driver_owners.contains_key(&id)
+                || world.reservations.get(&id).is_some_and(|previous| previous != owner)
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "occupied ID").into());
+            }
+            world.reservations.insert(id, owner.to_string());
+            if world.reserve_ack_lost {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "reserve ACK lost").into());
+            }
+            Ok(true)
+        }
+
+        fn create_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<NotifyDisposition, VddError> {
+            {
+                let world = self.0.lock().unwrap();
+                if world.legacy || monitors.iter().any(|monitor| {
+                    world.reservations.get(&monitor.id).map(String::as_str) != Some(owner)
+                }) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "reservation required").into());
+                }
+            }
+            let disposition = self.notify(monitors)?;
+            let mut world = self.0.lock().unwrap();
+            for monitor in monitors {
+                let actual_owner = if world.replace_owner_on_create { "f".repeat(32) } else { owner.to_string() };
+                world.driver_owners.insert(monitor.id, actual_owner);
+            }
+            if world.create_ack_lost {
+                return Err(VddError::OutcomeUnknown { source: std::io::ErrorKind::BrokenPipe.into() });
+            }
+            Ok(disposition)
+        }
+
+        fn remove_owned(&mut self, ids: &[u32], owner: &str) -> Result<RemoveDisposition, VddError> {
+            let mut world = self.0.lock().unwrap();
+            world.guarded_removals.push((ids.to_vec(), owner.to_string()));
+            if world.legacy {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "guarded removal unavailable").into());
+            }
+            let had_owned_entry = ids.iter().any(|id| world.driver_owners.get(id).map(String::as_str) == Some(owner));
+            for &id in ids {
+                if world.driver_owners.get(&id).map(String::as_str) == Some(owner) {
+                    world.removed.push(id);
+                }
+            }
+            if world.remove_error {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            }
+            for &id in ids {
+                if world.driver_owners.get(&id).map(String::as_str) == Some(owner)
+                    && !world.keep_online_on_remove.contains(&id)
+                {
+                    world.driver_offline(id);
+                    world.driver_owners.remove(&id);
+                }
+                if world.reservations.get(&id).map(String::as_str) == Some(owner) {
+                    world.reservations.remove(&id);
+                }
+            }
+            Ok(if had_owned_entry { RemoveDisposition::Confirmed } else { RemoveDisposition::NotOwned })
+        }
+
+        fn replace_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<(), VddError> {
+            {
+                let mut world = self.0.lock().unwrap();
+                world.guarded_replacements.push((monitors.iter().map(|monitor| monitor.id).collect(), owner.to_string()));
+                world.guarded_mode_requests.push(monitors.to_vec());
+                if world.foreign_owner_before_replace {
+                    world.foreign_owner_before_replace = false;
+                    for monitor in monitors {
+                        world.driver_offline(monitor.id);
+                        world.driver_owners.insert(monitor.id, "f".repeat(32));
+                        world.driver_online(monitor.id);
+                    }
+                }
+                if world.legacy || monitors.iter().any(|monitor| {
+                    world.driver_owners.get(&monitor.id).map(String::as_str) != Some(owner)
+                }) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "guarded replacement unavailable").into());
+                }
+                if world.owned_replace_error {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "guarded replacement failed").into());
+                }
+            }
+            let previous_dpi: HashMap<_, _> = self.0.lock().unwrap().monitors.iter()
+                .filter_map(|monitor| Some((monitor.virtual_display_id?, monitor.mode.dpi_scale_percent)))
+                .collect();
+            self.notify(monitors)?;
+            let mut world = self.0.lock().unwrap();
+            if !world.ignore_mode_registration && !world.ignore_resolution_changes {
+                for requested in monitors {
+                    if requested.modes.len() == 1 {
+                        let mode = &requested.modes[0];
+                        if let Some(actual) = world.monitors.iter_mut()
+                            .find(|monitor| monitor.virtual_display_id == Some(requested.id))
+                        {
+                            actual.mode.width = mode.width as i32;
+                            actual.mode.height = mode.height as i32;
+                            actual.mode.refresh_rate = mode.refresh_rates[0] as f64;
+                            actual.mode.dpi_scale_percent = previous_dpi.get(&requested.id).copied().unwrap_or(100);
+                            actual.bounds.width = mode.width as f64;
+                            actual.bounds.height = mode.height as f64;
+                            actual.work_area = actual.bounds;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn notify(&mut self, monitors: &[VddMonitor]) -> Result<NotifyDisposition, VddError> {
+            let mut world = self.0.lock().unwrap();
+            if world.legacy {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Legacy creation is disabled without an ownership token",
+                ).into());
+            }
+            world.notify_attempts += 1;
+            if let Some((kind, message)) = world.notify_error.clone() {
                 return Err(VddError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
+                    kind,
                     message,
                 )));
             }
@@ -2962,7 +3366,7 @@ mod tests {
                     }
                 }
             }
-            Ok(())
+            Ok(NotifyDisposition::Confirmed)
         }
 
         fn replace_legacy(
@@ -2970,61 +3374,26 @@ mod tests {
             remove_ids: &[u32],
             add: &[VddMonitor],
         ) -> Result<(), VddError> {
-            if !self.0.lock().unwrap().legacy {
-                return self.notify(add);
-            }
-            let mut world = self.0.lock().unwrap();
-            world.removed.extend_from_slice(remove_ids);
-            if world.fail_next_legacy_add {
-                world.fail_next_legacy_add = false;
-                for &id in remove_ids {
-                    world.driver_offline(id);
-                }
-                return Err(VddError::Io(std::io::ErrorKind::BrokenPipe.into()));
-            }
-            let ids: Vec<u32> = add.iter().map(|m| m.id).collect();
-            world.notified.push(ids.clone());
-            world.notified_names.push(
-                add.iter()
-                    .map(|m| m.name.clone().unwrap_or_default())
-                    .collect(),
-            );
-            for monitor in add {
-                if world.online_ids.contains(&monitor.id) {
-                    world.driver_online(monitor.id);
-                }
-                if !world.ignore_mode_registration
-                    && let Some(device) = world.devices.get(&monitor.id).cloned()
-                {
-                    for mode in &monitor.modes {
-                        world
-                            .modes
-                            .insert((device.clone(), mode.width as i32, mode.height as i32));
-                    }
-                }
-            }
-            Ok(())
+            let _ = (remove_ids, add);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy replacement is disabled without an ownership token",
+            ).into())
         }
 
-        fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
-            let mut world = self.0.lock().unwrap();
-            world.removed.extend_from_slice(ids);
-            if world.remove_error {
-                return Err(VddError::Io(std::io::ErrorKind::BrokenPipe.into()));
-            }
-            for &id in ids {
-                if !world.keep_online_on_remove.contains(&id) {
-                    world.driver_offline(id);
-                }
-            }
-            Ok(())
+        fn remove(&mut self, ids: &[u32]) -> Result<RemoveDisposition, VddError> {
+            let _ = ids;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy removal is disabled without an ownership token",
+            ).into())
         }
 
         fn remove_all(&mut self) -> Result<(), VddError> {
-            let mut world = self.0.lock().unwrap();
-            world.remove_all_calls += 1;
-            world.monitors.clear();
-            Ok(())
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unowned bulk removal is disabled",
+            ).into())
         }
 
     }
@@ -3100,6 +3469,14 @@ mod tests {
         (screen, shared)
     }
 
+    fn record_v2_owned(store: &OwnedDisplayStore, world: &mut World, id: u32) {
+        let owner = format!("{id:032x}");
+        store.try_reserve(id, &owner).unwrap();
+        store.record_owned(id);
+        world.driver_owners.insert(id, owner.clone());
+        world.reservations.insert(id, owner);
+    }
+
     #[test]
     fn create_reports_missing_driver_pipe() {
         let mut world = world_with_phone(&[0]);
@@ -3166,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn create_sets_200_percent_dpi_after_going_online() {
+    fn owned_create_keeps_windows_dpi_after_going_online() {
         let (mut screen, shared) = screen(world_with_phone(&[0]));
         let id = screen.create(ScreenFit::standard()).expect("建屏成功");
         assert_eq!(id, 0);
@@ -3176,8 +3553,8 @@ mod tests {
             assert_eq!(world.notified, vec![vec![0]]);
             // 驱动上线时系统已经给了 1080×1900，不用再改分辨率。
             assert!(world.resolutions.is_empty(), "分辨率已经对了就别再下发");
-            assert_eq!(world.dpi_calls.len(), 1);
-            assert_eq!(world.dpi_calls[0].2, TARGET_DPI_PERCENT);
+            assert!(world.dpi_calls.is_empty());
+            assert_eq!(world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap().mode.dpi_scale_percent, 100);
         }
         assert!(is_online_of(&screen.api, &screen.maps, id));
         assert_eq!(width_of_display(&screen.api, &screen.maps, id), Some(540));
@@ -3185,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_width_uses_one_snapshot_without_writing_resolution_or_dpi() {
+    fn unchanged_owned_width_confirms_snapshot_without_writing_resolution_or_dpi() {
         let (mut screen, shared) = screen(world_with_phone(&[0]));
         let id = screen.create(ScreenFit::standard()).unwrap();
         {
@@ -3196,7 +3573,7 @@ mod tests {
         }
         screen.set_width(id, ScreenFit::standard().base_width());
         let world = shared.lock().unwrap();
-        assert_eq!(world.snapshot_calls, 1);
+        assert_eq!(world.snapshot_calls, 2);
         assert!(world.resolutions.is_empty());
         assert!(world.dpi_calls.is_empty());
     }
@@ -3258,12 +3635,13 @@ mod tests {
         screen.set_width(id, 600);
         let world = shared.lock().unwrap();
         assert_eq!(world.snapshot_calls, 2, "模式变化后仍须重新采样 DPI");
-        assert_eq!(world.resolutions.len(), 1);
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.guarded_replacements.len(), 1);
         assert!(world.dpi_calls.is_empty());
     }
 
     #[test]
-    fn big_computer_screen_targets_100_percent_dpi() {
+    fn owned_big_computer_screen_keeps_windows_dpi_with_its_exact_mode() {
         // 4K 电脑屏（横握 2160×3840 的竖写规格 → 3840×2160 横向）：
         // v1.3 起 2× 会超过 3840×2400 阈值，改用 1 倍像素 + 100% DPI。
         let fit = ScreenFit::from_device(
@@ -3280,16 +3658,14 @@ mod tests {
         screen.create(fit).expect("建屏成功");
         {
             let world = shared.lock().unwrap();
-            assert_eq!(
-                world.resolutions,
-                vec![(r"\\.\DISPLAY2".to_string(), 3840, 2160, 60.0)],
-                "1 倍屏不该再放大"
-            );
+            assert!(world.resolutions.is_empty());
+            let actual = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(0)).unwrap();
+            assert_eq!((actual.mode.width, actual.mode.height), (3840, 2160));
             // 假驱动上线时报的就是 100%，所以这里不该重复下发 DPI。
             assert!(world.dpi_calls.is_empty(), "已经是 100% 就不用再设");
         }
 
-        // 驱动把 DPI 报成 200% 时，`set_width` 要按 v1.3 拉回 100%。
+        // Preserve a user-selected Windows DPI instead of writing through a recyclable source id.
         {
             let mut world = shared.lock().unwrap();
             for monitor in world.monitors.iter_mut() {
@@ -3298,11 +3674,8 @@ mod tests {
         }
         screen.set_width(0, base_width);
         let world = shared.lock().unwrap();
-        assert_eq!(
-            world.dpi_calls.last().map(|call| call.2),
-            Some(100),
-            "大电脑屏的目标缩放是 100%"
-        );
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(0)).unwrap().mode.dpi_scale_percent, 200);
     }
 
     #[test]
@@ -3314,25 +3687,26 @@ mod tests {
         screen.create(ScreenFit::standard()).expect("建屏成功");
 
         let world = shared.lock().unwrap();
-        assert_eq!(
-            world.resolutions,
-            vec![(r"\\.\DISPLAY2".to_string(), 1080, 1900, 60.0)]
-        );
-        assert_eq!(world.dpi_calls.len(), 1);
-        assert_eq!(world.temporary_attempts, 1);
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert_eq!(world.guarded_replacements.len(), 1);
     }
 
     #[test]
-    fn virtual_mode_falls_back_to_persistent_gdi_mode_when_temporary_mode_fails() {
+    fn owned_virtual_mode_does_not_fall_back_to_native_resolution_writes() {
         let mut world = world_with_phone(&[0]);
         world.online_mode = Some((1920, 1080));
         world.temporary_resolution_error = true;
         let (mut screen, shared) = screen(world);
-        screen.create(ScreenFit::standard()).unwrap();
+        screen.create(ScreenFit::standard()).expect("owner-guarded replacement settles the requested mode");
 
         let world = shared.lock().unwrap();
-        assert_eq!(world.temporary_attempts, 1);
-        assert_eq!(world.resolutions, vec![(r"\\.\DISPLAY2".into(), 1080, 1900, 60.0)]);
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.guarded_replacements.len(), 1);
+        let actual = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(0)).unwrap();
+        assert_eq!((actual.mode.width, actual.mode.height), (1080, 1900));
     }
 
     #[test]
@@ -3342,7 +3716,8 @@ mod tests {
         screen.last_modeset = None;
 
         assert!(screen.set_width(id, 600));
-        assert_eq!(shared.lock().unwrap().temporary_attempts, 1);
+        assert_eq!(shared.lock().unwrap().guarded_replacements.len(), 1);
+        assert_eq!(shared.lock().unwrap().temporary_attempts, 0);
         assert!(screen.last_modeset.is_some());
     }
 
@@ -3393,7 +3768,7 @@ mod tests {
                 (1080, 1900)
             });
             world.online_refresh_rate = Some(refresh);
-            world.resolution_error = reject;
+            world.owned_replace_error = reject;
             world.ignore_resolution_changes = ignore;
             let (mut screen, shared) = screen_with_owned(world, &path);
             screen.timings.reshape = Duration::ZERO;
@@ -3417,7 +3792,7 @@ mod tests {
         let path = owned_path("failed-create-retire");
         let mut world = world_with_phone(&[0]);
         world.online_mode = Some((1920, 1080));
-        world.resolution_error = true;
+        world.owned_replace_error = true;
         world.remove_error = true;
         let (mut screen, shared) = screen_with_owned(world, &path);
         let error = screen.create(ScreenFit::standard()).unwrap_err();
@@ -3459,12 +3834,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reshape_rebinds_verified_id_when_the_gdi_name_changes() {
-        let (mut screen, shared) = screen(world_with_phone(&[0]));
+    fn owned_reshape_rebinds_verified_id_when_the_gdi_name_changes() {
+        let world = world_with_phone(&[0]);
+        let (mut screen, shared) = screen(world);
         let id = screen.create(ScreenFit::standard()).unwrap();
         {
             let mut world = shared.lock().unwrap();
-            world.legacy = true;
             world.next_device_name = Some(r"\\.\DISPLAY9".into());
         }
         let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
@@ -3490,15 +3865,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reshape_restores_the_previous_screen_after_partial_ipc_failure() {
-        let (mut screen, shared) = screen(world_with_phone(&[0]));
+    fn owned_reshape_keeps_the_previous_fit_after_replacement_failure() {
+        let mut world = world_with_phone(&[0]);
+        world.owned_replace_error = true;
+        let (mut screen, shared) = screen(world);
         let old_fit = ScreenFit::standard();
         let id = screen.create(old_fit.clone()).unwrap();
-        {
-            let mut world = shared.lock().unwrap();
-            world.legacy = true;
-            world.fail_next_legacy_add = true;
-        }
         let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
         assert!(!screen.reshape(id, fit));
         assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
@@ -3537,48 +3909,92 @@ mod tests {
     }
 
     #[test]
-    fn create_skips_candidate_that_never_comes_online() {
-        // 只有 1 号候选能上线，0 号会等超时。
-        let (mut screen, shared) = screen(world_with_phone(&[1]));
-        // 超时调短，免得单测真的等 2 秒。
+    fn managed_queries_reject_a_gdi_name_reused_by_another_monitor() {
+        for replacement_id in [None, Some(3)] {
+            let (mut screen, shared) = screen(world_with_phone(&[0]));
+            let id = screen.create(ScreenFit::standard()).unwrap();
+            {
+                let mut world = shared.lock().unwrap();
+                let monitor = world
+                    .monitors
+                    .iter_mut()
+                    .find(|monitor| monitor.virtual_display_id == Some(id))
+                    .unwrap();
+                monitor.virtual_display_id = replacement_id;
+                monitor.device_string = "NVIDIA".into();
+            }
+            assert!(find_monitor_of(&screen.api, &screen.maps, id).is_none());
+            assert!(width_of_display(&screen.api, &screen.maps, id).is_none());
+            assert!(window_area_of_display(&screen.api, &screen.maps, id).is_none());
+            assert!(phone_layout_of_display(&screen.api, &screen.maps, id).is_none());
+        }
+    }
+
+    #[test]
+    fn managed_queries_reject_ambiguous_driver_ids() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            let mut duplicate = world
+                .monitors
+                .iter()
+                .find(|monitor| monitor.virtual_display_id == Some(id))
+                .unwrap()
+                .clone();
+            duplicate.device_name = r"\\.\DISPLAY99".into();
+            world.monitors.push(duplicate);
+        }
+        assert!(find_monitor_of(&screen.api, &screen.maps, id).is_none());
+        assert!(window_area_of_display(&screen.api, &screen.maps, id).is_none());
+    }
+
+    #[test]
+    fn owned_create_does_not_retry_an_unconfirmed_candidate_that_never_comes_online() {
+        // 只有 1 号候选能上线。0 号创建结果已确认但桌面未上线时，必须停下并保留归属。
+        let world = world_with_phone(&[1]);
+        let (mut screen, shared) = screen(world);
         screen.timings.online = Duration::from_millis(5);
 
-        let id = screen.create(ScreenFit::standard()).expect("换候选后成功");
-        assert_eq!(id, 1);
+        let error = screen.create(ScreenFit::standard()).expect_err("未知桌面结果不能换候选重试");
+        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+        assert_eq!(error.pending_display_id, Some(0));
 
         let world = shared.lock().unwrap();
-        assert_eq!(world.notified, vec![vec![0], vec![1]]);
-        // C# `6f548dd`：超时的候选只跳过、**不** Remove —— 那个 id 可能对应
-        // C# 版或别的程序创建的屏，误删会把别人的手机屏拆掉。
-        assert!(
-            !world.removed.contains(&0),
-            "超时的候选不能被撤掉（可能误删别人的屏）"
-        );
+        assert_eq!(world.notified, vec![vec![0]]);
+        assert!(world.removed.is_empty());
+        assert!(screen.owners.contains_key(&0));
+        assert!(world.driver_owners.contains_key(&0));
     }
 
     #[test]
-    fn create_attaches_arrived_but_disabled_virtual_screen() {
+    fn legacy_create_attaches_arrived_but_disabled_virtual_screen() {
         let mut world = world_with_phone(&[]);
+        world.legacy = true;
         world.pending_attach = Some(r"\\.\DISPLAY2".to_string());
         let (mut screen, shared) = screen(world);
-        screen.timings.online = Duration::from_millis(200);
-
-        let id = screen.create(ScreenFit::standard()).expect("主动扩展桌面后上线");
-        assert_eq!(id, 0);
+        let error = screen.create(ScreenFit::standard()).expect_err("Legacy 不得创建屏或附加桌面");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
         let world = shared.lock().unwrap();
-        assert_eq!(world.attaches, vec![(1080, 1900, 1920, 0)]);
+        assert!(world.notified.is_empty(), "Legacy 下不得发送 Add");
+        assert!(world.attaches.is_empty(), "Legacy 下不得写入桌面拓扑");
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
     }
 
     #[test]
-    fn notify_failure_logs_candidate_id_and_ipc_error() {
+    fn owned_create_failure_logs_candidate_id_and_ipc_error_without_retrying() {
         // C# `PhoneDisplayService.cs:73` 的那行 Warn。没有它，「Notify 全被驱动拒了」
         // 和「Notify 成功但驱动没把屏挂上来」在日志里完全分不出来。
         let mut world = world_with_phone(&[]);
-        world.notify_error = Some("管道已断开（ERROR_BROKEN_PIPE）".to_string());
+        world.notify_error = Some((
+            std::io::ErrorKind::BrokenPipe,
+            "管道已断开（ERROR_BROKEN_PIPE）".to_string(),
+        ));
         let (mut screen, _shared) = screen(world);
 
         let error = screen.create(ScreenFit::standard()).expect_err("Notify 全被拒就不能建屏");
-        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
 
         let warnings = crate::test_warnings();
         assert!(
@@ -3586,25 +4002,32 @@ mod tests {
                 && line.contains("管道已断开")),
             "告警里要能读到候选 id 和 IPC 错误：{warnings:?}"
         );
-        // 四个候选都失败时每个都要留痕，否则分不清"只挂在 0 号"还是"四个全被拒"。
-        for id in 0..4u32 {
-            assert!(
-                warnings
-                    .iter()
-                    .any(|line| line.contains(&format!("手机屏（id={id}）IPC Notify 失败"))),
-                "缺少候选 {id} 的日志：{warnings:?}"
-            );
-        }
+        assert!(!warnings.iter().any(|line| line.contains("手机屏（id=1）IPC Notify 失败")),
+            "unknown create outcome must not proceed to the next ID: {warnings:?}");
     }
 
     #[test]
-    fn reshape_sends_new_modes_and_keeps_legacy_protocol() {
-        let (mut screen, shared) = screen(world_with_phone(&[1]));
+    fn unsupported_driver_stops_after_one_notify_and_preserves_the_upgrade_hint() {
+        let hint = "当前驱动不支持原子显示更新，请升级 virtual-display-rs 驱动";
+        let mut world = world_with_phone(&[]);
+        world.notify_error = Some((std::io::ErrorKind::Unsupported, hint.to_string()));
+        let (mut screen, shared) = screen(world);
+
+        let error = screen.create(ScreenFit::standard()).expect_err("旧驱动应直接失败");
+        assert_eq!(shared.lock().unwrap().notify_attempts, 1, "同一驱动能力错误无需换候选重试");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.detail, format!("管道读写失败：{hint}"));
+        assert!(lock_maps(&screen.maps).fits.is_empty());
+    }
+
+    #[test]
+    fn reshape_sends_new_modes_with_the_owner_guarded_protocol() {
+        let world = world_with_phone(&[0]);
+        let (mut screen, shared) = screen(world);
         let id = screen.create(ScreenFit::standard()).expect("建屏成功");
         {
             let mut world = shared.lock().unwrap();
             world.notified.clear();
-            world.legacy = true;
             world.modes.clear();
         }
 
@@ -3614,7 +4037,8 @@ mod tests {
 
         {
             let world = shared.lock().unwrap();
-            assert_eq!(world.notified, vec![vec![id]], "legacy 走 ReplaceLegacy 也要把新模式发出去");
+            assert_eq!(world.notified, vec![vec![id]]);
+            assert_eq!(world.guarded_replacements.len(), 1);
         }
         assert_eq!(lock_maps(&screen.maps).fits.get(&id).cloned(), Some(iphone8));
     }
@@ -3641,8 +4065,180 @@ mod tests {
 
     #[test]
     fn retire_without_device_name_is_a_no_op() {
-        let (mut screen, _) = screen(world_with_phone(&[0]));
-        assert!(screen.retire(9), "没建过的编号直接算撤干净");
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        assert!(!screen.retire(9), "没有 owner token 的编号不能确认已撤除");
+        assert!(shared.lock().unwrap().removed.is_empty(), "未归属的编号不能发 Remove");
+    }
+
+    #[test]
+    fn inactive_mapped_screen_is_removed_before_clearing_its_mapping() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        for attempt in 1..=2 {
+            let id = screen.create(ScreenFit::standard()).unwrap();
+            shared.lock().unwrap().driver_offline(id);
+
+            assert!(screen.retire(id));
+            assert_eq!(shared.lock().unwrap().removed, vec![id; attempt]);
+            assert!(!lock_maps(&screen.maps).fits.contains_key(&id));
+            assert!(!lock_maps(&screen.maps).device_names.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn inactive_owned_orphan_is_removed_before_releasing_persistent_ownership() {
+        let path = owned_path("inactive-retire-orphan");
+        let mut world = world_with_phone(&[]);
+        record_v2_owned(&OwnedDisplayStore::new(&path), &mut world, 0);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+
+        assert!(screen.retire(0));
+        assert_eq!(shared.lock().unwrap().removed, vec![0]);
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inactive_retire_failure_keeps_mapping_and_ownership_for_retry() {
+        let path = owned_path("inactive-retire-error");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.driver_offline(id);
+            world.remove_error = true;
+        }
+
+        assert!(!screen.retire(id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert!(lock_maps(&screen.maps).device_names.contains_key(&id));
+
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(id));
+        assert_eq!(shared.lock().unwrap().removed, vec![id, id]);
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        assert!(!lock_maps(&screen.maps).fits.contains_key(&id));
+        assert!(!lock_maps(&screen.maps).device_names.contains_key(&id));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_retirement_is_rejected_and_preserves_persisted_ownership() {
+        let path = owned_path("legacy-remove-unconfirmed");
+        let world = world_with_phone(&[0, 1]);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        shared.lock().unwrap().legacy = true;
+        assert!(!screen.retire(id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+        assert!(screen.owners.contains_key(&id));
+        assert_eq!(shared.lock().unwrap().removed, Vec::<u32>::new());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_retirement_without_a_persistent_store_keeps_owner_until_v2_returns() {
+        let world = world_with_phone(&[0, 1]);
+        let (mut screen, shared) = screen(world);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        shared.lock().unwrap().legacy = true;
+
+        assert!(!screen.retire(id));
+        assert!(screen.owners.contains_key(&id));
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert!(shared.lock().unwrap().removed.is_empty());
+        shared.lock().unwrap().legacy = false;
+        assert!(screen.retire(id));
+        assert!(!screen.owners.contains_key(&id));
+    }
+
+    #[test]
+    fn legacy_retirement_does_not_wait_or_write_while_owner_capability_is_absent() {
+        let path = owned_path("legacy-remove-delayed");
+        let world = world_with_phone(&[0]);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+        }
+        screen.timings.offline = Duration::ZERO;
+
+        assert!(!screen.retire(id), "Legacy cannot prove owner-scoped removal");
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert!(is_online_of(&screen.api, &screen.maps, id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+        assert!(shared.lock().unwrap().removed.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_retirement_never_retries_an_unguarded_remove_after_a_driver_error() {
+        let path = owned_path("legacy-remove-confirmation-error");
+        let world = world_with_phone(&[0]);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.remove_error = true;
+        }
+
+        assert!(!screen.retire(id));
+        assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+        assert!(shared.lock().unwrap().removed.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_orphan_cleanup_preserves_persistent_ownership() {
+        let path = owned_path("legacy-cleanup-unconfirmed");
+        OwnedDisplayStore::new(&path).record_owned(0);
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[1]), &path);
+        shared.lock().unwrap().legacy = true;
+
+        screen.cleanup_orphans();
+        assert!(shared.lock().unwrap().removed.is_empty(), "tokenless Legacy orphan must not be removed");
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(screen.create(ScreenFit::standard()).is_err(), "Legacy 下不可创建另一块屏");
+        assert!(shared.lock().unwrap().notified.is_empty(), "失败路径不得发送 tokenless Add");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tokenless_legacy_mode_change_and_retirement_are_no_ops_and_keep_the_record() {
+        let path = owned_path("legacy-tokenless-mode-retire");
+        let store = OwnedDisplayStore::new(&path);
+        store.record_owned(0);
+        let mut world = world_with_phone(&[0]);
+        world.legacy = true;
+        world.driver_online(0);
+        let shared = Arc::new(Mutex::new(world));
+        let maps = Arc::new(Mutex::new(ScreenMaps::default()));
+        {
+            let mut maps = maps.lock().unwrap();
+            maps.fits.insert(0, ScreenFit::standard());
+            maps.device_names.insert(0, r"\\.\DISPLAY2".into());
+        }
+        let mut screen = PhoneScreen::with_maps(
+            FakeApi(shared.clone()),
+            FakeVdd(shared.clone()),
+            fast_timings(),
+            maps,
+            Some(OwnedDisplayStore::new(&path)),
+        );
+
+        assert!(!screen.set_width(0, 600));
+        assert!(!screen.retire(0));
+        let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+        assert!(world.removed.is_empty());
+        assert!(lock_maps(&screen.maps).fits.contains_key(&0));
+        assert_eq!(store.load_ids(), vec![0]);
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3686,8 +4282,8 @@ mod tests {
     #[test]
     fn owned_orphan_without_memory_mapping_uses_verified_driver_id() {
         let path = owned_path("retire-orphan");
-        OwnedDisplayStore::new(&path).record_owned(0);
         let mut world = world_with_phone(&[0]);
+        record_v2_owned(&OwnedDisplayStore::new(&path), &mut world, 0);
         world.driver_online(0);
         world.keep_online_on_remove.insert(0);
         let (mut screen, shared) = screen_with_owned(world, &path);
@@ -3704,8 +4300,8 @@ mod tests {
     #[test]
     fn unknown_virtual_identity_preserves_ownership_and_never_deletes_unowned_monitors() {
         let path = owned_path("retire-unidentified");
-        OwnedDisplayStore::new(&path).record_owned(0);
         let mut world = world_with_phone(&[0]);
+        record_v2_owned(&OwnedDisplayStore::new(&path), &mut world, 0);
         world.driver_online(0);
         world.monitors.last_mut().unwrap().virtual_display_id = None;
         world.keep_online_on_remove.insert(0);
@@ -3834,9 +4430,9 @@ mod tests {
     #[test]
     fn cleanup_orphans_only_removes_ids_in_the_book() {
         let path = owned_path("cleanup");
-        OwnedDisplayStore::new(&path).record_owned(1);
-
-        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0, 1]), &path);
+        let mut world = world_with_phone(&[0, 1]);
+        record_v2_owned(&OwnedDisplayStore::new(&path), &mut world, 1);
+        let (mut screen, shared) = screen_with_owned(world, &path);
         {
             let mut world = shared.lock().unwrap();
             world.driver_online(0); // 别人的屏（比如 C# 版建的）
@@ -3868,9 +4464,9 @@ mod tests {
     fn cleanup_logs_the_ids_it_removed() {
         // C# 成功分支的 `Log.Info("已按归属记录清理残留手机屏：#…")`：成功路径也要留痕。
         let path = owned_path("cleanup-log");
-        OwnedDisplayStore::new(&path).record_owned(1);
-
-        let (mut screen, _shared) = screen_with_owned(world_with_phone(&[1]), &path);
+        let mut world = world_with_phone(&[1]);
+        record_v2_owned(&OwnedDisplayStore::new(&path), &mut world, 1);
+        let (mut screen, _shared) = screen_with_owned(world, &path);
         screen.cleanup_orphans();
 
         assert!(
@@ -3939,9 +4535,9 @@ mod tests {
     fn cleanup_keeps_only_the_ownership_of_monitors_still_online() {
         let path = owned_path("cleanup-partial");
         let store = OwnedDisplayStore::new(&path);
-        store.record_owned(0);
-        store.record_owned(1);
         let mut world = world_with_phone(&[0, 1]);
+        record_v2_owned(&store, &mut world, 0);
+        record_v2_owned(&store, &mut world, 1);
         world.driver_online(0);
         world.driver_online(1);
         world.keep_online_on_remove.insert(1);
@@ -3964,6 +4560,7 @@ mod tests {
         let id = screen.create(ScreenFit::standard()).expect("建屏成功");
         assert_eq!(id, 0);
         assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0], "上线后才记账");
+        assert!(OwnedDisplayStore::new(&path).try_owner(id).unwrap().is_some());
 
         assert!(screen.retire(id));
         assert!(
@@ -3971,22 +4568,131 @@ mod tests {
             "撤屏成功后要销账"
         );
         assert!(!path.exists(), "最后一条销掉后文件也该删");
+        assert!(!path.with_extension("reservations.json").exists());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn create_does_not_record_a_screen_that_never_came_online() {
+    fn owned_create_timeout_keeps_an_unconfirmed_screen_reserved() {
         let path = owned_path("never-online");
-        let (mut screen, _) = screen_with_owned(world_with_phone(&[]), &path);
+        let world = world_with_phone(&[]);
+        let (mut screen, _) = screen_with_owned(world, &path);
         screen.timings.online = Duration::from_millis(5);
 
         let error = screen.create(ScreenFit::standard()).expect_err("没有候选上线");
         assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
-        assert!(
-            OwnedDisplayStore::new(&path).load_ids().is_empty(),
-            "没确认上线绝不能记账"
-        );
+        assert_eq!(error.pending_display_id, Some(0));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(OwnedDisplayStore::new(&path).try_owner(0).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn confirmed_create_timeout_keeps_pending_ownership_until_a_late_arrival_is_retired() {
+        let path = owned_path("confirmed-never-online");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[1]), &path);
+        screen.timings.online = Duration::from_millis(5);
+        let error = screen
+            .create(ScreenFit::standard())
+            .expect_err("确认创建但未上线应先清理");
+        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+        assert_eq!(error.pending_display_id, Some(0));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert_eq!(shared.lock().unwrap().notified, vec![vec![0]]);
+        assert!(lock_maps(&screen.maps).fits.contains_key(&0));
+
+        {
+            let mut world = shared.lock().unwrap();
+            world.driver_online(0);
+            world.remove_error = true;
+        }
+        assert!(!screen.retire(0));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(lock_maps(&screen.maps).fits.contains_key(&0));
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(0));
+        assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+        assert!(!is_online_of(&screen.api, &screen.maps, 0));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn confirmed_create_without_a_store_retains_pending_ownership_on_remove_failure() {
+        let (mut screen, shared) = screen(world_with_phone(&[]));
+        screen.timings.online = Duration::from_millis(5);
+        let error = screen
+            .create(ScreenFit::standard())
+            .expect_err("没有候选上线");
+        assert_eq!(error.pending_display_id, Some(0));
+        shared.lock().unwrap().remove_error = true;
+        assert!(!screen.retire(0));
+        assert!(lock_maps(&screen.maps).fits.contains_key(&0));
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(0));
+        assert!(!lock_maps(&screen.maps).fits.contains_key(&0));
+        assert_eq!(shared.lock().unwrap().removed, vec![0, 0]);
+    }
+
+    #[test]
+    fn create_with_an_unwritable_intention_cancels_its_empty_reservation_without_creating() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = owned_path("unwritable-book");
+        let store = OwnedDisplayStore::new(&path);
+        let existing_owner = "f".repeat(32);
+        store.try_reserve(1, &existing_owner).unwrap();
+        // Keep the existing, valid intention readable while denying replace/delete.
+        // This makes the later reservation persistence fail after the driver has
+        // granted its empty reservation, exercising the cleanup path itself.
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(path.with_extension("reservations.json"))
+            .unwrap();
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let error = screen
+            .create(ScreenFit::standard())
+            .expect_err("记账失败应停止建屏");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.pending_display_id, None, "the empty reservation was confirmed released");
+        assert!(lock_maps(&screen.maps).fits.is_empty());
+        assert!(screen.owners.is_empty());
+        assert!(screen.removals.is_empty());
+        {
+            let world = shared.lock().unwrap();
+            assert_eq!(world.reserve_calls.len(), 1);
+            assert_eq!(world.reserve_calls[0].0, 0);
+            assert_eq!(world.guarded_removals, vec![(vec![0], world.reserve_calls[0].1.clone())]);
+            assert!(!world.reservations.contains_key(&0));
+            assert!(world.notified.is_empty());
+        }
+        assert!(screen.owners.is_empty());
+        assert!(screen.removals.is_empty());
+        assert_eq!(store.try_load_reserved_ids().unwrap(), vec![1]);
+        assert_eq!(store.try_owner(1).unwrap(), Some(existing_owner));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn create_does_not_notify_when_the_ownership_book_cannot_be_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = owned_path("locked-book");
+        OwnedDisplayStore::new(&path).record_owned(1);
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let error = screen
+            .create(ScreenFit::standard())
+            .expect_err("不能把暂时读不到的账本当作空白");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert!(shared.lock().unwrap().notified.is_empty());
+        drop(guard);
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![1]);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4045,6 +4751,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn native_mode_rejects_reused_connector_after_owner_changes() {
+        for same_gdi in [false, true] {
+            for width in [540, 600] {
+                let (mut screen, shared) = screen(world_with_phone(&[0]));
+                let id = screen.create(ScreenFit::standard()).unwrap();
+                let owner = screen.owners[&id].clone();
+                {
+                    let mut world = shared.lock().unwrap();
+                    world.driver_offline(id);
+                    world.reservations.remove(&id);
+                    world.driver_owners.insert(id, "f".repeat(32));
+                    if !same_gdi {
+                        world.next_device_name = Some(r"\\.\DISPLAY9".into());
+                    }
+                    world.driver_online(id);
+                    world.resolutions.clear();
+                    world.temporary_attempts = 0;
+                    world.dpi_calls.clear();
+                }
+                assert!(!screen.set_width(id, width), "foreign owner: same_gdi={same_gdi}, width={width}");
+                let world = shared.lock().unwrap();
+                assert!(world.resolutions.is_empty());
+                assert_eq!(world.temporary_attempts, 0);
+                assert!(world.dpi_calls.is_empty());
+                assert_eq!(world.driver_owners.get(&id), Some(&"f".repeat(32)));
+                assert_eq!(screen.owners.get(&id), Some(&owner));
+            }
+        }
+    }
+
+    #[test]
+    fn tokenless_legacy_session_rejects_mode_writes_after_v2_upgrade() {
+        let world = world_with_phone(&[0]);
+        let shared = Arc::new(Mutex::new(world));
+        let maps = Arc::new(Mutex::new(ScreenMaps::default()));
+        {
+            let mut maps = maps.lock().unwrap();
+            maps.fits.insert(0, ScreenFit::standard());
+            maps.device_names.insert(0, r"\\.\DISPLAY2".into());
+        }
+        let mut screen = PhoneScreen::with_maps(
+            FakeApi(shared.clone()), FakeVdd(shared.clone()), fast_timings(), maps, None,
+        );
+        let id = 0;
+        assert!(!screen.owners.contains_key(&id));
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = false;
+            world.driver_owners.insert(id, "f".repeat(32));
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        assert!(!screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+    }
+
+    #[test]
+    fn owned_mode_confirms_owner_after_atomic_replacement_before_success() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.owner_checks = 0;
+            world.foreign_owner_on_check = Some(1);
+            world.temporary_resolution_error = true;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        assert!(!screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        assert_eq!(world.owner_checks, 1);
+        assert_eq!(world.guarded_replacements.len(), 1);
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+    }
+
+    #[test]
+    fn owned_mode_does_not_call_native_dpi_even_if_the_native_api_would_fail() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.monitors.iter_mut().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap()
+                .mode.dpi_scale_percent = 100;
+            world.owner_checks = 0;
+            world.dpi_error = true;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        assert!(screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        assert_eq!(world.owner_checks, 1);
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+    }
+
+    #[test]
+    fn mode_readback_failure_keeps_the_session_for_a_confirmed_retry() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let fit = lock_maps(&screen.maps).fits[&id].clone();
+        let owners = shared.lock().unwrap().driver_owners.clone();
+        let previous_notifies = shared.lock().unwrap().notified.clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.owner_check_error = true;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        assert!(!screen.set_width(id, 600));
+        {
+            let mut world = shared.lock().unwrap();
+            assert!(world.resolutions.is_empty());
+            assert_eq!(world.temporary_attempts, 0);
+            assert!(world.dpi_calls.is_empty());
+            assert_eq!(world.driver_owners, owners);
+            // The owner-guarded replacement may already have been applied before
+            // the read-back confirmation failed. The session remains valid and
+            // the retry must issue a fresh guarded replacement; neither path may
+            // fall back to native display writes.
+            assert_eq!(world.notified.len(), previous_notifies.len() + 1);
+            world.owner_check_error = false;
+        }
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&fit));
+        assert!(screen.set_width(id, 600), "the same valid session can retry after a read failure");
+        let world = shared.lock().unwrap();
+        assert_eq!(world.notified.len(), previous_notifies.len() + 1);
+        assert_eq!(world.driver_owners, owners);
+    }
+
+    #[test]
+    fn owned_mode_last_moment_connector_reuse_never_writes_native_display_state() {
+        for same_gdi in [false, true] {
+            let (mut screen, shared) = screen(world_with_phone(&[0]));
+            let id = screen.create(ScreenFit::standard()).unwrap();
+            let owner = screen.owners[&id].clone();
+            {
+                let mut world = shared.lock().unwrap();
+                world.foreign_owner_before_replace = true;
+                if !same_gdi {
+                    world.next_device_name = Some(r"\\.\DISPLAY9".into());
+                }
+                world.resolutions.clear();
+                world.temporary_attempts = 0;
+                world.dpi_calls.clear();
+            }
+            assert!(!screen.set_width(id, 600));
+            let world = shared.lock().unwrap();
+            assert!(world.resolutions.is_empty());
+            assert_eq!(world.temporary_attempts, 0);
+            assert!(world.dpi_calls.is_empty());
+            assert_eq!(world.driver_owners.get(&id), Some(&"f".repeat(32)));
+            assert_eq!(screen.owners.get(&id), Some(&owner));
+        }
+    }
+
+    #[test]
+    fn owned_mode_uses_one_owner_guarded_mode_and_keeps_observed_dpi() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.monitors.iter_mut().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap()
+                .mode.dpi_scale_percent = 175;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+            world.guarded_replacements.clear();
+            world.guarded_mode_requests.clear();
+        }
+        assert!(screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        let actual = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap();
+        assert_eq!((actual.mode.width, actual.mode.height), ScreenFit::standard().pixel_size(600));
+        assert_eq!(actual.mode.dpi_scale_percent, 175);
+        assert_eq!(world.guarded_replacements.len(), 1);
+        let requested = &world.guarded_mode_requests[0][0];
+        assert_eq!(requested.id, id);
+        assert_eq!(requested.modes, vec![VddMode { width: actual.mode.width as u32, height: actual.mode.height as u32, refresh_rates: vec![60] }]);
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        let expected = (actual.bounds, home_bar_area(actual, window_area(actual, 600)));
+        drop(world);
+        assert_eq!(phone_layout_of_display(&screen.api, &screen.maps, id), Some(expected));
+    }
+
+    #[test]
+    fn owned_mode_unconfirmed_desktop_state_fails_without_a_native_fallback() {
+        let path = owned_path("owned-mode-no-convergence");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let owner = screen.owners[&id].clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.ignore_resolution_changes = true;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        screen.timings.reshape = Duration::ZERO;
+        assert!(!screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(screen.owners.get(&id), Some(&owner));
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(id).unwrap(), Some(owner));
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_create_keeps_an_unenabled_output_without_a_recyclable_native_attach() {
+        let path = owned_path("owned-no-native-attach");
+        let mut world = world_with_phone(&[]);
+        world.pending_attach = Some(r"\\.\DISPLAY2".into());
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.timings.online = Duration::from_millis(1);
+        let error = screen.create(ScreenFit::standard()).unwrap_err();
+        assert_eq!(error.kind, PhoneScreenErrorKind::NeverOnline);
+        assert_eq!(error.pending_display_id, Some(0));
+        let world = shared.lock().unwrap();
+        assert!(world.attaches.is_empty());
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![0]);
+        assert!(screen.owners.contains_key(&0));
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     // ----- 测试夹具 -----
 
     fn mode(width: i32, height: i32) -> DisplayModeInfo {
@@ -4073,4 +5021,539 @@ mod tests {
             source_id: stable_id(device_name, AdapterLuid::default(), 0),
         }
     }
+    #[test]
+    fn legacy_driver_without_owned_protocol_rejects_creation_without_native_writes() {
+        for report_success in [false, true] {
+            let path = owned_path(&format!("dpi-create-{report_success}"));
+            let mut world = world_with_phone(&[0]);
+            world.legacy = true;
+            world.dpi_error = !report_success;
+            world.ignore_dpi_changes = report_success;
+            let (mut screen, shared) = screen_with_owned(world, &path);
+            let error = screen.create(ScreenFit::standard()).expect_err("Legacy has no owner-guarded create");
+            assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+            assert_eq!(error.pending_display_id, None);
+            let world = shared.lock().unwrap();
+            assert!(world.reserve_calls.is_empty());
+            assert!(world.notified.is_empty());
+            assert!(world.removed.is_empty());
+            assert!(world.resolutions.is_empty());
+            assert!(world.dpi_calls.is_empty());
+            assert!(world.attaches.is_empty());
+            assert!(lock_maps(&screen.maps).fits.is_empty());
+            assert!(screen.owners.is_empty());
+            assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+            drop(world);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn legacy_protocol_downgrade_cannot_change_or_natively_restore_an_owned_mode() {
+        let old_fit = ScreenFit::from_device(
+            &snug_core::PhoneSpec::new(2160.0, 3840.0, None),
+            snug_core::DeviceKind::Computer,
+            snug_core::ScreenOrientation::Landscape,
+        );
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(old_fit.clone()).unwrap();
+        let previous_notifies = shared.lock().unwrap().notified.clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.dpi_error = true;
+            world.resolutions.clear();
+            world.dpi_calls.clear();
+            world.attaches.clear();
+        }
+        assert!(!screen.reshape(id, ScreenFit::standard()));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+        let world = shared.lock().unwrap();
+        let actual = world.monitors.iter().find(|m| m.virtual_display_id == Some(id)).unwrap();
+        assert_eq!((actual.mode.width, actual.mode.height), old_fit.pixel_size(old_fit.base_width()));
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+        assert!(world.attaches.is_empty());
+        assert_eq!(world.notified, previous_notifies);
+    }
+
+    #[test]
+    fn owned_mode_keeps_the_windows_dpi_even_when_native_dpi_would_fail() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let previous = bound_monitor_of(&screen.api, &screen.maps, id).unwrap().mode;
+        {
+            let mut world = shared.lock().unwrap();
+            world.monitors.iter_mut().find(|m| m.virtual_display_id == Some(id)).unwrap()
+                .mode.dpi_scale_percent = 100;
+            world.dpi_error = true;
+        }
+        assert!(screen.apply_mode(id, previous));
+        let world = shared.lock().unwrap();
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(world.monitors.iter().find(|m| m.virtual_display_id == Some(id)).unwrap().mode.dpi_scale_percent, 100);
+    }
+
+    #[test]
+    fn owner_loss_during_mode_change_never_uses_native_identity_writes() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.foreign_owner_before_replace = true;
+            world.resolutions.clear();
+            world.dpi_calls.clear();
+            world.attaches.clear();
+        }
+        assert!(!screen.set_width(id, 600));
+        let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert!(world.dpi_calls.is_empty());
+        assert!(world.attaches.is_empty());
+        assert_eq!(world.driver_owners.get(&id), Some(&"f".repeat(32)));
+    }
+
+    #[test]
+    fn dpi_failure_is_reported_when_restoring_a_physical_mode() {
+        for report_success in [false, true] {
+            let (mut screen, shared) = screen(world_with_phone(&[]));
+            let stable = {
+                let mut world = shared.lock().unwrap();
+                world.dpi_error = !report_success;
+                world.ignore_dpi_changes = report_success;
+                world.monitors[0].stable_id
+            };
+            screen.timings.reshape = Duration::ZERO;
+            assert!(!screen.set_mode(stable, DisplayModeInfo {
+                width: 1920,
+                height: 1080,
+                refresh_rate: 60.0,
+                dpi_scale_percent: 200,
+            }));
+            assert_eq!(shared.lock().unwrap().monitors[0].mode.dpi_scale_percent, 100);
+        }
+    }
+
+    #[test]
+    fn owned_create_lost_ack_keeps_token_and_stops_before_another_candidate() {
+        let path = owned_path("owned-lost-ack");
+        let mut world = world_with_phone(&[0, 1]);
+        world.create_ack_lost = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).expect_err("lost ACK must stop creation");
+        assert_eq!(error.pending_display_id, Some(0));
+        let store = OwnedDisplayStore::new(&path);
+        let owner = store.try_owner(0).unwrap().expect("persist pending owner");
+        assert_eq!(owner.len(), 32);
+        assert!(store.load_ids().is_empty(), "unconfirmed IDs must not enter the legacy book");
+        assert_eq!(shared.lock().unwrap().notified, vec![vec![0]]);
+        assert!(screen.retire(0));
+        assert_eq!(shared.lock().unwrap().guarded_removals, vec![(vec![0], owner)]);
+        assert!(store.try_load_reserved_ids().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_create_lost_ack_does_not_remove_an_id_reassigned_to_another_owner() {
+        let path = owned_path("owned-lost-ack-foreign");
+        let mut world = world_with_phone(&[0]);
+        world.create_ack_lost = true;
+        world.replace_owner_on_create = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).expect_err("unknown create result");
+        assert_eq!(error.pending_display_id, Some(0));
+        assert!(screen.retire(0));
+        let world = shared.lock().unwrap();
+        assert!(world.removed.is_empty());
+        assert!(world.monitors.iter().any(|monitor| monitor.virtual_display_id == Some(0)));
+        assert_eq!(world.guarded_removals.len(), 1);
+        assert!(OwnedDisplayStore::new(&path).try_load_reserved_ids().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_reservation_lost_ack_never_sends_create() {
+        let path = owned_path("owned-reserve-lost-ack");
+        let mut world = world_with_phone(&[0]);
+        world.reserve_ack_lost = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        assert!(screen.create(ScreenFit::standard()).is_err());
+        let world = shared.lock().unwrap();
+        assert!(world.notified.is_empty());
+        assert_eq!(world.reserve_calls.len(), 1);
+        assert_eq!(world.guarded_removals.len(), 1);
+        assert!(OwnedDisplayStore::new(&path).try_load_reserved_ids().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_creation_fails_closed_and_preserves_existing_v2_intentions() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = owned_path("legacy-no-new-intention");
+        let store = OwnedDisplayStore::new(&path);
+        let old_owner = "f".repeat(32);
+        store.try_reserve(1, &old_owner).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(1)
+            .open(path.with_extension("reservations.json")).unwrap();
+        let mut world = world_with_phone(&[0]);
+        world.legacy = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).expect_err("Legacy create requires an owner token");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.pending_display_id, None);
+        assert!(screen.owners.is_empty());
+        assert_eq!(store.try_load_reserved_ids().unwrap(), vec![1]);
+        assert_eq!(store.try_owner(1).unwrap(), Some(old_owner.clone()));
+        {
+            let world = shared.lock().unwrap();
+            assert!(world.reserve_calls.is_empty());
+            assert!(world.notified.is_empty());
+            assert!(world.guarded_removals.is_empty());
+            assert!(world.removed.is_empty());
+            assert!(world.resolutions.is_empty());
+            assert!(world.dpi_calls.is_empty());
+        }
+        screen.cleanup_orphans();
+        assert_eq!(store.try_owner(1).unwrap(), Some(old_owner.clone()));
+        assert_eq!(shared.lock().unwrap().guarded_removals, vec![(vec![1], old_owner)]);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_reservation_with_failed_intention_persistence_never_sends_create() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = owned_path("owned-reserved-intention-locked");
+        let store = OwnedDisplayStore::new(&path);
+        let old_owner = "f".repeat(32);
+        store.try_reserve(1, &old_owner).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(1)
+            .open(path.with_extension("reservations.json")).unwrap();
+        let mut world = world_with_phone(&[0]);
+        world.reservations.insert(1, old_owner.clone());
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).expect_err("Create requires durable ownership");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.pending_display_id, None, "failed persistence is cleaned before any create request");
+        assert!(screen.owners.is_empty(), "confirmed release leaves no local owner token");
+        {
+            let world = shared.lock().unwrap();
+            let owner = world.reserve_calls[0].1.clone();
+            assert_eq!(world.reserve_calls, vec![(0, owner.clone())]);
+            assert_eq!(world.guarded_removals, vec![(vec![0], owner)]);
+            assert!(world.notified.is_empty());
+            assert!(world.removed.is_empty());
+            assert!(!world.reservations.contains_key(&0));
+            assert_eq!(world.reservations.get(&1), Some(&old_owner));
+        }
+        assert_eq!(store.try_load_reserved_ids().unwrap(), vec![1]);
+        drop(guard);
+        assert_eq!(shared.lock().unwrap().guarded_removals.len(), 1);
+        assert_eq!(store.try_owner(1).unwrap(), Some(old_owner));
+        assert_eq!(screen.create(ScreenFit::standard()).unwrap(), 0);
+        assert_eq!(shared.lock().unwrap().notified, vec![vec![0]]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_create_skips_an_inactive_foreign_id_after_guarded_cleanup() {
+        for foreign_monitor in [true, false] {
+            let path = owned_path(&format!("hidden-foreign-id-{foreign_monitor}"));
+            let mut world = world_with_phone(&[0, 1]);
+            let foreign_owner = "f".repeat(32);
+            if foreign_monitor {
+                world.driver_owners.insert(0, foreign_owner.clone());
+            } else {
+                world.reservations.insert(0, foreign_owner.clone());
+            }
+            let (mut screen, shared) = screen_with_owned(world, &path);
+            assert_eq!(screen.create(ScreenFit::standard()).expect("skip the occupied ID"), 1);
+            let world = shared.lock().unwrap();
+            assert_eq!(world.reserve_calls.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![0, 1]);
+            assert_eq!(world.notified, vec![vec![1]]);
+            assert_eq!(world.guarded_removals, vec![(vec![0], world.reserve_calls[0].1.clone())]);
+            assert!(world.removed.is_empty());
+            let foreign_entries = if foreign_monitor { &world.driver_owners } else { &world.reservations };
+            assert_eq!(foreign_entries.get(&0), Some(&foreign_owner));
+            assert!(!screen.owners.contains_key(&0));
+            let store = OwnedDisplayStore::new(&path);
+            assert_eq!(store.try_load_ids().unwrap(), vec![1]);
+            assert_eq!(store.try_load_reserved_ids().unwrap(), vec![1]);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn occupied_owned_candidate_keeps_its_token_when_guarded_cleanup_fails() {
+        let path = owned_path("hidden-foreign-id-release-failed");
+        let mut world = world_with_phone(&[0, 1]);
+        let foreign_owner = "f".repeat(32);
+        world.driver_owners.insert(0, foreign_owner.clone());
+        world.remove_error = true;
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let error = screen.create(ScreenFit::standard()).expect_err("cleanup must finish before advancing");
+        assert_eq!(error.kind, PhoneScreenErrorKind::CreateFailed);
+        assert_eq!(error.pending_display_id, Some(0));
+        let owner = screen.owners[&0].clone();
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(0).unwrap(), None);
+        {
+            let world = shared.lock().unwrap();
+            assert_eq!(world.reserve_calls, vec![(0, owner.clone())]);
+            assert_eq!(world.guarded_removals, vec![(vec![0], owner.clone())]);
+            assert!(world.notified.is_empty());
+            assert!(world.removed.is_empty());
+            assert_eq!(world.driver_owners.get(&0), Some(&foreign_owner));
+        }
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(0));
+        assert!(!screen.owners.contains_key(&0));
+        assert!(OwnedDisplayStore::new(&path).try_load_reserved_ids().unwrap().is_empty());
+        assert_eq!(shared.lock().unwrap().driver_owners.get(&0), Some(&foreign_owner));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_cleanup_uses_the_pending_token_after_restarting_the_client() {
+        let path = owned_path("owned-pending-restart");
+        let mut world = world_with_phone(&[0]);
+        world.create_ack_lost = true;
+        let (mut first, shared) = screen_with_owned(world, &path);
+        first.create(ScreenFit::standard()).unwrap_err();
+        let owner = OwnedDisplayStore::new(&path).try_owner(0).unwrap().unwrap();
+        let mut second = PhoneScreen::with_maps(
+            FakeApi(shared.clone()), FakeVdd(shared.clone()), fast_timings(),
+            Arc::new(Mutex::new(ScreenMaps::default())), Some(OwnedDisplayStore::new(&path)),
+        );
+        second.cleanup_orphans();
+        assert_eq!(shared.lock().unwrap().guarded_removals, vec![(vec![0], owner)]);
+        assert!(OwnedDisplayStore::new(&path).try_load_reserved_ids().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_reshape_preserves_the_token_needed_for_guarded_retirement() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let owner = screen.owners[&id].clone();
+        let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+        assert!(screen.reshape(id, fit));
+        assert_eq!(shared.lock().unwrap().guarded_replacements, vec![(vec![id], owner.clone())]);
+        assert_eq!(shared.lock().unwrap().driver_owners.get(&id), Some(&owner));
+        assert!(screen.retire(id));
+        assert_eq!(shared.lock().unwrap().guarded_removals, vec![(vec![id], owner)]);
+        assert!(screen.owners.is_empty());
+    }
+
+    #[test]
+    fn owned_screen_never_downgrades_reshape_or_retirement_to_unguarded_requests() {
+        let (mut screen, shared) = screen(world_with_phone(&[0]));
+        let old_fit = ScreenFit::standard();
+        let id = screen.create(old_fit.clone()).unwrap();
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.notified.clear();
+        }
+        let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+        assert!(!screen.reshape(id, fit));
+        assert!(!screen.retire(id));
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+        assert!(screen.owners.contains_key(&id));
+        assert!(shared.lock().unwrap().notified.is_empty());
+        assert!(shared.lock().unwrap().removed.is_empty());
+        shared.lock().unwrap().legacy = false;
+        assert!(screen.retire(id));
+    }
+
+    #[test]
+    fn owned_retirement_finishes_when_a_bound_driver_id_is_reused_by_another_owner() {
+        for same_gdi_name in [true, false] {
+            let path = owned_path(if same_gdi_name { "bound-foreign-same-gdi" } else { "bound-foreign-new-gdi" });
+            let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+            let id = screen.create(ScreenFit::standard()).unwrap();
+            assert!(lock_maps(&screen.maps).device_names.contains_key(&id));
+            {
+                let mut world = shared.lock().unwrap();
+                // A legacy client replaces the real entry and clears its reservation.
+                world.driver_offline(id);
+                world.reservations.remove(&id);
+                world.driver_owners.insert(id, "f".repeat(32));
+                if !same_gdi_name {
+                    world.next_device_name = Some(r"\\.\DISPLAY9".into());
+                }
+                world.driver_online(id);
+            }
+            screen.timings.offline = Duration::ZERO;
+            assert!(screen.retire(id), "a foreign screen must not keep the old session alive");
+            let world = shared.lock().unwrap();
+            assert!(world.removed.is_empty(), "guarded release must preserve the replacement screen");
+            assert_eq!(world.guarded_removals.len(), 1);
+            assert!(world.monitors.iter().any(|monitor| monitor.virtual_display_id == Some(id)));
+            assert!(!lock_maps(&screen.maps).fits.contains_key(&id));
+            assert!(!lock_maps(&screen.maps).device_names.contains_key(&id));
+            assert!(screen.owners.is_empty());
+            assert!(OwnedDisplayStore::new(&path).load_ids().is_empty());
+            assert!(OwnedDisplayStore::new(&path).try_owner(id).unwrap().is_none());
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn owned_unknown_create_keeps_a_guarded_cleanup_token_without_a_store() {
+        let mut world = world_with_phone(&[0, 1]);
+        world.create_ack_lost = true;
+        let (mut screen, shared) = screen(world);
+        let error = screen.create(ScreenFit::standard()).unwrap_err();
+        assert_eq!(error.pending_display_id, Some(0));
+        let owner = screen.owners[&0].clone();
+        shared.lock().unwrap().remove_error = true;
+        assert!(!screen.retire(0));
+        assert_eq!(screen.owners.get(&0), Some(&owner));
+        shared.lock().unwrap().remove_error = false;
+        assert!(screen.retire(0));
+        assert!(screen.owners.is_empty());
+        assert_eq!(shared.lock().unwrap().guarded_removals,
+            vec![(vec![0], owner.clone()), (vec![0], owner)]);
+        assert_eq!(shared.lock().unwrap().notified, vec![vec![0]]);
+    }
+
+    #[test]
+    fn corrupt_intentions_block_creation_and_never_fall_back_to_unguarded_cleanup() {
+        let path = owned_path("corrupt-intentions");
+        let store = OwnedDisplayStore::new(&path);
+        store.record_owned(0);
+        std::fs::write(path.with_extension("reservations.json"), "[").unwrap();
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        assert!(screen.create(ScreenFit::standard()).is_err());
+        screen.cleanup_orphans();
+        assert!(!screen.retire(0));
+        let world = shared.lock().unwrap();
+        assert!(world.reserve_calls.is_empty());
+        assert!(world.notified.is_empty());
+        assert!(world.removed.is_empty());
+        assert!(world.guarded_removals.is_empty());
+        assert_eq!(store.load_ids(), vec![0]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_persistent_release_keeps_maps_and_token_until_the_retry_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for (block_compatibility_book, foreign_entry) in [(true, false), (false, false), (true, true), (false, true)] {
+            let path = owned_path(&format!("release-locked-book-{block_compatibility_book}-foreign-{foreign_entry}"));
+            let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+            let id = screen.create(ScreenFit::standard()).unwrap();
+            if foreign_entry {
+                let mut world = shared.lock().unwrap();
+                world.reservations.remove(&id);
+                world.driver_owners.insert(id, "f".repeat(32));
+            }
+            let token_path = path.with_extension("reservations.json");
+            let locked_path = if block_compatibility_book { &path } else { &token_path };
+            // Permit the lifecycle's checked reads, but deny deletion and replacement.
+            let guard = std::fs::OpenOptions::new().read(true).share_mode(1).open(locked_path).unwrap();
+            assert!(!screen.retire(id));
+            assert!(lock_maps(&screen.maps).fits.contains_key(&id));
+            assert!(lock_maps(&screen.maps).device_names.contains_key(&id));
+            assert!(screen.owners.contains_key(&id));
+            assert!(token_path.exists(), "token must survive every partial release");
+            assert_eq!(shared.lock().unwrap().guarded_removals.len(), 1);
+            drop(guard);
+            assert!(screen.retire(id));
+            assert_eq!(shared.lock().unwrap().guarded_removals.len(), 1, "confirmed removal only needs a bookkeeping retry");
+            assert!(!lock_maps(&screen.maps).fits.contains_key(&id));
+            assert!(screen.owners.is_empty());
+            assert!(!path.exists());
+            assert!(!token_path.exists());
+            assert_eq!(shared.lock().unwrap().monitors.iter()
+                .any(|monitor| monitor.virtual_display_id == Some(id)), foreign_entry);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn owned_pending_creation_waits_for_its_screen_to_go_offline_after_applied_release() {
+        let mut world = world_with_phone(&[0]);
+        world.create_ack_lost = true;
+        let (mut screen, shared) = screen(world);
+        let error = screen.create(ScreenFit::standard()).unwrap_err();
+        let id = error.pending_display_id.unwrap();
+        assert!(!lock_maps(&screen.maps).device_names.contains_key(&id));
+        shared.lock().unwrap().keep_online_on_remove.insert(id);
+        screen.timings.offline = Duration::ZERO;
+        assert!(!screen.retire(id), "Applied does not prove that the owned desktop output is offline");
+        assert!(screen.owners.contains_key(&id));
+        shared.lock().unwrap().driver_offline(id);
+        assert!(screen.retire(id));
+        assert!(screen.owners.is_empty());
+        assert_eq!(shared.lock().unwrap().guarded_removals.len(), 1);
+    }
+
+    #[test]
+    fn tokenless_legacy_record_preserves_foreign_owned_monitor() {
+        let path = owned_path("reviewer-tokenless-foreign");
+        let store = OwnedDisplayStore::new(&path);
+        store.record_owned(0);
+        assert!(store.try_owner(0).unwrap().is_none());
+        let mut world = world_with_phone(&[0]);
+        let foreign_owner = "f".repeat(32);
+        world.driver_owners.insert(0, foreign_owner.clone());
+        world.reservations.insert(0, foreign_owner);
+        world.driver_online(0);
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        screen.cleanup_orphans();
+        let world = shared.lock().unwrap();
+        assert_eq!(store.load_ids(), vec![0], "unverified legacy ownership must remain on disk");
+        assert!(world.removed.is_empty(), "foreign monitor removed by tokenless compatibility record: {:?}", world.removed);
+        assert!(world.monitors.iter().any(|monitor| monitor.virtual_display_id == Some(0)));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_session_preserves_foreign_replacement_after_v2_upgrade() {
+        let world = world_with_phone(&[0]);
+        let path = owned_path("legacy-session-v2-foreign");
+        let old_fit = ScreenFit::standard();
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(old_fit.clone()).unwrap();
+        let owner = screen.owner_of(id).unwrap().expect("the V2 session retains its token");
+        {
+            let mut world = shared.lock().unwrap();
+            world.legacy = true;
+            world.driver_offline(id);
+            world.driver_owners.insert(id, "f".repeat(32));
+            world.reservations.insert(id, "f".repeat(32));
+            world.driver_online(id);
+            world.notified.clear();
+            world.guarded_replacements.clear();
+        }
+        let fit = ScreenFit::from_phone(&snug_core::PhoneSpec::new(750.0, 1334.0, Some(375.0)));
+        let reshaped = screen.reshape(id, fit);
+        assert!(!screen.retire(id), "the same tokenless binding must not remove the foreign V2 screen");
+        let world = shared.lock().unwrap();
+        assert!(!reshaped, "an unguarded V2 reshape must fail closed");
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&old_fit));
+        assert_eq!(OwnedDisplayStore::new(&path).load_ids(), vec![id]);
+        assert_eq!(screen.owner_of(id).unwrap(), Some(owner));
+        assert!(world.removed.is_empty());
+        assert!(world.monitors.iter().any(|monitor| monitor.virtual_display_id == Some(id)));
+        assert!(lock_maps(&screen.maps).device_names.contains_key(&id));
+        assert!(world.notified.is_empty(), "foreign replacement received unguarded mode changes: {:?}, reported success: {reshaped}", world.notified);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tokenless_v2_empty_connector_keeps_legacy_ownership_and_is_not_reused() {
+        let path = owned_path("tokenless-v2-empty");
+        let store = OwnedDisplayStore::new(&path);
+        store.record_owned(0);
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[1]), &path);
+        screen.cleanup_orphans();
+        assert_eq!(store.load_ids(), vec![0], "an empty State does not establish ownership");
+        assert!(shared.lock().unwrap().removed.is_empty());
+        assert_eq!(screen.create(ScreenFit::standard()).unwrap(), 1);
+        assert_eq!(store.load_ids(), vec![0, 1]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
 }

@@ -7,6 +7,7 @@
 //! - [`engine`]：桌面本体（C# `PhoneDesk` 的字段与动作）。
 
 mod engine;
+mod zoom_operation;
 pub mod lane;
 pub mod model;
 mod set;

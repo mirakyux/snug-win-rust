@@ -23,9 +23,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
-use crate::vdd::{DEFAULT_PIPE_NAME, VddClient, VddMonitor, VddProtocol};
+use crate::vdd::{DEFAULT_PIPE_NAME, RemoveDisposition, VddClient, VddError, VddMonitor, VddProtocol};
 
-const MAX_FRAME: usize = 128 * 1024;
+const MAX_REQUEST_FRAME: usize = 128 * 1024;
+const MAX_RESPONSE_FRAME: usize = crate::vdd::MAX_STATE_RESPONSE_BYTES;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -35,15 +36,43 @@ const POLL: Duration = Duration::from_millis(10);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", content = "arguments", deny_unknown_fields)]
 pub(crate) enum Request {
+    #[serde(rename = "AtomicNotify")]
     Notify {
         monitors: Vec<VddMonitor>,
     },
+    // These names also gate enrolled helpers that predate tokenless V2 guards.
+    #[serde(rename = "LegacyOnlyReplace")]
     ReplaceLegacy {
         remove_ids: Vec<u32>,
         monitors: Vec<VddMonitor>,
     },
+    #[serde(rename = "LegacyOnlyRemove")]
     Remove {
         ids: Vec<u32>,
+    },
+    #[serde(rename = "OwnedReserve")]
+    ReserveOwned {
+        id: u32,
+        owner: String,
+    },
+    VerifyOwner {
+        id: u32,
+        owner: Option<String>,
+    },
+    #[serde(rename = "OwnedCreate")]
+    CreateOwned {
+        monitors: Vec<VddMonitor>,
+        owner: String,
+    },
+    #[serde(rename = "OwnedReplace")]
+    ReplaceOwned {
+        monitors: Vec<VddMonitor>,
+        owner: String,
+    },
+    #[serde(rename = "OwnedRelease")]
+    RemoveOwned {
+        ids: Vec<u32>,
+        owner: String,
     },
     State,
 }
@@ -53,7 +82,64 @@ pub(crate) enum Request {
 pub(crate) struct Reply {
     pub legacy: Option<bool>,
     pub monitors: Option<Vec<VddMonitor>>,
+    pub removal: Option<RemoveDisposition>,
     error: Option<String>,
+    #[serde(default)]
+    unsupported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome_unknown: Option<BrokerErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_kind: Option<BrokerErrorKind>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum BrokerErrorKind {
+    AlreadyExists,
+    NotFound,
+    PermissionDenied,
+    Unsupported,
+    InvalidInput,
+    NotConnected,
+    BrokenPipe,
+    TimedOut,
+    InvalidData,
+    Other,
+}
+
+impl BrokerErrorKind {
+    fn from_io(kind: io::ErrorKind) -> Self {
+        match kind {
+            io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::Unsupported => Self::Unsupported,
+            io::ErrorKind::InvalidInput => Self::InvalidInput,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            io::ErrorKind::TimedOut => Self::TimedOut,
+            io::ErrorKind::InvalidData => Self::InvalidData,
+            _ => Self::Other,
+        }
+    }
+
+    fn into_io(self) -> io::ErrorKind {
+        match self {
+            Self::AlreadyExists => io::ErrorKind::AlreadyExists,
+            Self::NotFound => io::ErrorKind::NotFound,
+            Self::PermissionDenied => io::ErrorKind::PermissionDenied,
+            Self::Unsupported => io::ErrorKind::Unsupported,
+            Self::InvalidInput => io::ErrorKind::InvalidInput,
+            Self::NotConnected => io::ErrorKind::NotConnected,
+            Self::BrokenPipe => io::ErrorKind::BrokenPipe,
+            Self::TimedOut => io::ErrorKind::TimedOut,
+            Self::InvalidData => io::ErrorKind::InvalidData,
+            Self::Other => io::ErrorKind::Other,
+        }
+    }
+}
+
+fn unknown_outcome(source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), VddError::OutcomeUnknown { source })
 }
 
 impl Reply {
@@ -61,7 +147,40 @@ impl Reply {
         Self {
             legacy: None,
             monitors: None,
+            removal: None,
             error: Some(error.to_string().chars().take(1024).collect()),
+            unsupported: false,
+            outcome_unknown: None,
+            error_kind: None,
+        }
+    }
+
+    fn driver_failure(error: VddError) -> Self {
+        let unsupported = matches!(&error, VddError::Io(error) if error.kind() == io::ErrorKind::Unsupported);
+        let outcome_unknown = match &error {
+            VddError::OutcomeUnknown { source } => Some(BrokerErrorKind::from_io(source.kind())),
+            _ => None,
+        };
+        let error_kind = match &error {
+            VddError::Io(source) | VddError::Connect { source, .. } => Some(BrokerErrorKind::from_io(source.kind())),
+            VddError::NotConnected => Some(BrokerErrorKind::NotConnected),
+            VddError::OutcomeUnknown { .. } => None,
+        };
+        Self { unsupported, outcome_unknown, error_kind, ..Self::failure(error) }
+    }
+
+    fn into_result(self) -> io::Result<Self> {
+        match &self.error {
+            Some(error) if self.outcome_unknown.is_some() => Err(unknown_outcome(io::Error::new(
+                self.outcome_unknown.unwrap().into_io(), error.clone(),
+            ))),
+            Some(error) => Err(io::Error::new(
+                self.error_kind.map(BrokerErrorKind::into_io).unwrap_or(
+                    if self.unsupported { io::ErrorKind::Unsupported } else { io::ErrorKind::Other }
+                ),
+                error.clone(),
+            )),
+            None => Ok(self),
         }
     }
 }
@@ -83,8 +202,17 @@ fn validate_ids(ids: &[u32]) -> io::Result<()> {
 
 impl Request {
     fn validate(&self) -> io::Result<()> {
+        let owner = match self {
+            Self::ReserveOwned { owner, .. } | Self::CreateOwned { owner, .. } | Self::ReplaceOwned { owner, .. }
+                | Self::RemoveOwned { owner, .. } => Some(owner),
+            Self::VerifyOwner { owner, .. } => owner.as_ref(),
+            _ => None,
+        };
+        if owner.is_some_and(|owner| owner.len() != 32 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            return Err(invalid("invalid monitor ownership token"));
+        }
         let monitors = match self {
-            Self::Notify { monitors } => monitors,
+            Self::Notify { monitors } | Self::CreateOwned { monitors, .. } | Self::ReplaceOwned { monitors, .. } => monitors,
             Self::ReplaceLegacy {
                 remove_ids,
                 monitors,
@@ -92,7 +220,8 @@ impl Request {
                 validate_ids(remove_ids)?;
                 monitors
             }
-            Self::Remove { ids } => return validate_ids(ids),
+            Self::Remove { ids } | Self::RemoveOwned { ids, .. } => return validate_ids(ids),
+            Self::ReserveOwned { id, .. } | Self::VerifyOwner { id, .. } => return validate_ids(&[*id]),
             Self::State => return Ok(()),
         };
         validate_ids(
@@ -215,6 +344,11 @@ pub(crate) fn retry_connection_without_prompt() -> io::Result<Option<VddProtocol
 fn retry_connection_with(start: impl FnOnce() -> io::Result<Broker>) -> io::Result<Option<VddProtocol>> {
     let session = SESSION.get_or_init(|| Mutex::new(Session::Unstarted));
     let mut session = try_session(session)?;
+    // Only an explicit connection attempt may replace a stale helper. Ordinary
+    // requests still fail without relaunching or replaying a possible mutation.
+    if matches!(&*session, Session::Connected(broker) if check_wait(None, &broker.process).is_err()) {
+        *session = Session::Unstarted;
+    }
     authorize(&mut session, start);
     let reply = exchange_request(&mut session, &Request::State)?;
     Ok(reply.legacy.map(|legacy| {
@@ -280,11 +414,7 @@ fn try_session(session: &Mutex<Session>) -> io::Result<std::sync::MutexGuard<'_,
 }
 
 fn exchange_request(session: &mut Session, request: &Request) -> io::Result<Reply> {
-    let reply = transact(session, |broker| broker.request(request))?;
-    match &reply.error {
-        Some(error) => Err(io::Error::other(error.clone())),
-        None => Ok(reply),
-    }
+    transact(session, |broker| broker.request(request))?.into_result()
 }
 
 fn authorize(session: &mut Session, start: impl FnOnce() -> io::Result<Broker>) {
@@ -350,9 +480,17 @@ impl Broker {
     fn request(&mut self, request: &Request) -> io::Result<Reply> {
         let deadline = Instant::now() + IO_TIMEOUT;
         let payload = serde_json::to_vec(request).map_err(io::Error::other)?;
-        send_frame(&mut self.pipe, &payload, deadline, &self.process)?;
-        let payload = receive_frame(&mut self.pipe, Some(deadline), &self.process)?;
-        serde_json::from_slice(&payload).map_err(io::Error::other)
+        send_frame(&mut self.pipe, &payload, deadline, &self.process, MAX_REQUEST_FRAME)?;
+        let reply = receive_frame(&mut self.pipe, Some(deadline), &self.process, MAX_RESPONSE_FRAME)
+            .and_then(|payload| serde_json::from_slice(&payload).map_err(io::Error::other));
+        // The helper can mutate the driver once the full request was sent. A lost
+        // response cannot establish success, rejection or ownership of any ID.
+        reply.map_err(|error| match request {
+            Request::State | Request::VerifyOwner { .. } => error,
+            Request::ReserveOwned { .. } => io::Error::new(io::ErrorKind::Unsupported,
+                format!("驱动权限代理未确认归属预留：{error}")),
+            _ => unknown_outcome(error),
+        })
     }
 }
 
@@ -380,28 +518,39 @@ fn verify_scheduled_client(
     Ok(client.process)
 }
 
-fn execute(request: Request, driver: &mut VddClient) -> Reply {
+pub(crate) fn execute(request: Request, driver: &mut VddClient) -> Reply {
     if let Err(error) = request.validate() {
         return Reply::failure(error);
     }
     let outcome = match request {
-        Request::Notify { monitors } => driver.notify(&monitors).map(|()| None),
+        Request::Notify { monitors } => driver.notify(&monitors).map(|()| (None, None)),
         Request::ReplaceLegacy {
             remove_ids,
             monitors,
-        } => driver.replace_legacy(&remove_ids, &monitors).map(|()| None),
-        Request::Remove { ids } => driver.remove(&ids).map(|()| None),
-        Request::State => driver.state(),
+        } => driver
+            .replace_legacy(&remove_ids, &monitors)
+            .map(|()| (None, None)),
+        Request::Remove { ids } => driver.remove(&ids).map(|removal| (None, Some(removal))),
+        Request::ReserveOwned { id, owner } => driver.reserve_owned(id, &owner).map(|_| (None, None)),
+        Request::VerifyOwner { id, owner } => driver.verify_owner(id, owner.as_deref()).map(|()| (None, None)),
+        Request::CreateOwned { monitors, owner } => driver.create_owned(&monitors, &owner).map(|()| (None, None)),
+        Request::ReplaceOwned { monitors, owner } => driver.replace_owned(&monitors, &owner).map(|()| (None, None)),
+        Request::RemoveOwned { ids, owner } => driver.remove_owned(&ids, &owner).map(|removal| (None, Some(removal))),
+        Request::State => driver.state().map(|monitors| (monitors, None)),
     };
     match outcome {
-        Ok(monitors) => Reply {
+        Ok((monitors, removal)) => Reply {
             legacy: driver
                 .protocol()
                 .map(|protocol| protocol == VddProtocol::Legacy),
             monitors,
+            removal,
             error: None,
+            unsupported: false,
+            outcome_unknown: None,
+            error_kind: None,
         },
-        Err(error) => Reply::failure(error),
+        Err(error) => Reply::driver_failure(error),
     }
 }
 
@@ -473,7 +622,7 @@ fn serve_connection(parent_pid: u32, pipe_name: &str, parent: &OwnedHandle) -> i
             }
         })?;
     loop {
-        let payload = receive_frame(&mut pipe, None, parent)?;
+        let payload = receive_frame(&mut pipe, None, parent, MAX_REQUEST_FRAME)?;
         let reply = match serde_json::from_slice::<Request>(&payload) {
             Ok(request) => match request.validate() {
                 Err(error) => Reply::failure(error),
@@ -495,7 +644,7 @@ fn serve_connection(parent_pid: u32, pipe_name: &str, parent: &OwnedHandle) -> i
             Err(error) => Reply::failure(error),
         };
         let payload = serde_json::to_vec(&reply).map_err(io::Error::other)?;
-        send_frame(&mut pipe, &payload, Instant::now() + IO_TIMEOUT, parent)?;
+        send_frame(&mut pipe, &payload, Instant::now() + IO_TIMEOUT, parent, MAX_RESPONSE_FRAME)?;
     }
 }
 
@@ -541,8 +690,8 @@ fn create_server(name: &str) -> io::Result<File> {
             3 | 0x0008_0000,
             1 | 8,
             1,
-            MAX_FRAME as u32,
-            MAX_FRAME as u32,
+            MAX_REQUEST_FRAME as u32,
+            MAX_REQUEST_FRAME as u32,
             0,
             (&attributes as *const SecurityAttributes).cast_mut().cast(),
         )
@@ -827,8 +976,9 @@ fn send_frame(
     payload: &[u8],
     deadline: Instant,
     peer: &OwnedHandle,
+    maximum: usize,
 ) -> io::Result<()> {
-    if payload.len() > MAX_FRAME {
+    if payload.len() > maximum {
         return Err(invalid("VDD broker frame is too large"));
     }
     let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
@@ -836,7 +986,10 @@ fn send_frame(
     let mut offset = 0;
     while offset < framed.len() {
         check_wait(Some(deadline), peer)?;
-        match pipe.write(&framed[offset..]) {
+        // PIPE_NOWAIT can make no progress when a write exceeds the pipe's
+        // kernel buffer. A legal full-state reply is larger than that buffer.
+        let end = (offset + 4096).min(framed.len());
+        match pipe.write(&framed[offset..end]) {
             Ok(0) => std::thread::sleep(POLL),
             Ok(written) => offset += written,
             Err(error)
@@ -855,11 +1008,12 @@ fn receive_frame(
     pipe: &mut File,
     deadline: Option<Instant>,
     peer: &OwnedHandle,
+    maximum: usize,
 ) -> io::Result<Vec<u8>> {
     let mut header = [0u8; 4];
     read_exact_poll(pipe, &mut header, deadline, peer)?;
     let length = u32::from_le_bytes(header) as usize;
-    if length == 0 || length > MAX_FRAME {
+    if length == 0 || length > maximum {
         return Err(invalid("invalid VDD broker frame length"));
     }
     let mut payload = vec![0; length];
@@ -1110,6 +1264,85 @@ mod tests {
     }
 
     #[test]
+    fn explicit_retry_restarts_an_exited_broker_and_reuses_a_live_session() {
+        use std::cell::Cell;
+        use std::os::windows::io::AsHandle;
+        use std::os::windows::process::CommandExt;
+
+        let command = crate::system_paths::system_tool("cmd.exe").unwrap();
+        let mut child = std::process::Command::new(command)
+            .args(["/D", "/C", "exit 0"])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let dead = child.as_handle().try_clone_to_owned().unwrap();
+        child.wait().unwrap();
+        let pid = std::process::id();
+        let pipe = create_server(&new_pipe_name(pid).unwrap()).unwrap();
+        let session = SESSION.get_or_init(|| Mutex::new(Session::Unstarted));
+        *session.lock().unwrap() = Session::Connected(Broker {
+            pipe,
+            process: dead,
+        });
+
+        let name = new_pipe_name(pid).unwrap();
+        let mut server = create_server(&name).unwrap();
+        let peer = std::thread::spawn(move || {
+            let process = open_process(pid).unwrap();
+            let mut client = connect_client(&name, pid, &process).unwrap();
+            for _ in 0..2 {
+                let payload =
+                    receive_frame(&mut client, Some(Instant::now() + IO_TIMEOUT), &process, MAX_REQUEST_FRAME)
+                        .unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<Request>(&payload).unwrap(),
+                    Request::State
+                ));
+                let reply = Reply {
+                    legacy: Some(false),
+                    monitors: Some(Vec::new()),
+                    removal: None,
+                    error: None,
+                    unsupported: false,
+                    outcome_unknown: None,
+                    error_kind: None,
+                };
+                send_frame(
+                    &mut client,
+                    &serde_json::to_vec(&reply).unwrap(),
+                    Instant::now() + IO_TIMEOUT,
+                    &process,
+                    MAX_RESPONSE_FRAME,
+                )
+                .unwrap();
+            }
+        });
+        let process = open_process(pid).unwrap();
+        accept_verified(&mut server, pid, &process).unwrap();
+        let starts = Cell::new(0);
+        let protocol = retry_connection_with(|| {
+            starts.set(starts.get() + 1);
+            Ok(Broker {
+                pipe: server,
+                process,
+            })
+        })
+        .unwrap();
+        assert_eq!(protocol, Some(VddProtocol::V2));
+        assert_eq!(
+            starts.get(),
+            1,
+            "the first explicit retry must replace the exited helper"
+        );
+        assert_eq!(
+            retry_connection_with(|| panic!("a live broker must be reused")).unwrap(),
+            Some(VddProtocol::V2)
+        );
+        *session.lock().unwrap() = Session::Unstarted;
+        peer.join().unwrap();
+    }
+
+    #[test]
     fn requests_can_report_busy_without_waiting_for_authorization() {
         let session = Mutex::new(Session::Unstarted);
         let _pending_authorization = session.lock().unwrap();
@@ -1163,6 +1396,270 @@ mod tests {
         assert!(
             serde_json::from_str::<Request>(r#"{"command":"State","unexpected":true}"#).is_err()
         );
+    }
+
+    #[test]
+    fn atomic_updates_are_rejected_by_old_brokers_before_driver_access() {
+        // Scheduled helpers may still be an older enrolled executable. Their old
+        // commands used State + Notify, so sharing those wire names would bypass
+        // the new client's atomic-update guarantee.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "command", content = "arguments", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum OldRequest {
+            Notify { monitors: Vec<VddMonitor> },
+            ReplaceLegacy { remove_ids: Vec<u32>, monitors: Vec<VddMonitor> },
+            Remove { ids: Vec<u32> },
+            State,
+        }
+
+        for (request, command, old_command) in [
+            (Request::Notify { monitors: vec![monitor()] }, "AtomicNotify", "Notify"),
+            (Request::ReplaceLegacy { remove_ids: vec![0], monitors: vec![monitor()] },
+                "LegacyOnlyReplace", "ReplaceLegacy"),
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(encoded["command"], command);
+            assert!(serde_json::from_value::<Request>(encoded.clone()).is_ok());
+            assert!(serde_json::from_value::<OldRequest>(encoded.clone()).is_err());
+            let mut old_encoded = encoded;
+            old_encoded["command"] = old_command.into();
+            assert!(serde_json::from_value::<OldRequest>(old_encoded.clone()).is_ok());
+            assert!(serde_json::from_value::<Request>(old_encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_only_mutations_are_rejected_by_pre_guard_brokers_before_driver_access() {
+        // An enrolled helper may understand ownership commands but still allow
+        // tokenless V2 mutations. New names make it reject before driver access.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "command", content = "arguments", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum PreGuardRequest {
+            AtomicNotify { monitors: Vec<VddMonitor> },
+            AtomicReplace { remove_ids: Vec<u32>, monitors: Vec<VddMonitor> },
+            Remove { ids: Vec<u32> },
+            OwnedReserve { id: u32, owner: String },
+            OwnedCreate { monitors: Vec<VddMonitor>, owner: String },
+            OwnedReplace { monitors: Vec<VddMonitor>, owner: String },
+            OwnedRelease { ids: Vec<u32>, owner: String },
+            State,
+        }
+
+        for (request, command, old_command) in [
+            (Request::ReplaceLegacy { remove_ids: vec![0], monitors: vec![monitor()] },
+                "LegacyOnlyReplace", "AtomicReplace"),
+            (Request::Remove { ids: vec![0] }, "LegacyOnlyRemove", "Remove"),
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(encoded["command"], command);
+            assert!(serde_json::from_value::<Request>(encoded.clone()).is_ok());
+            assert!(serde_json::from_value::<PreGuardRequest>(encoded.clone()).is_err());
+            let mut old_encoded = encoded;
+            old_encoded["command"] = old_command.into();
+            assert!(serde_json::from_value::<PreGuardRequest>(old_encoded.clone()).is_ok());
+            assert!(serde_json::from_value::<Request>(old_encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn broker_reply_preserves_remove_confirmation_independently_of_protocol() {
+        // A legacy write can reconnect to V2 without querying the new driver's state.
+        // Protocol detection must not strengthen the deletion evidence in transit.
+        for (legacy, removal) in [
+            (false, "SubmittedOnly"),
+            (false, "Confirmed"),
+            (false, "NotOwned"),
+            (true, "SubmittedOnly"),
+        ] {
+            let encoded = serde_json::json!({
+                "legacy": legacy,
+                "monitors": null,
+                "removal": removal,
+                "error": null,
+                "unsupported": false,
+            });
+            let reply: Reply = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&reply).unwrap(), encoded);
+            let expected = serde_json::from_value::<RemoveDisposition>(encoded["removal"].clone()).unwrap();
+            assert_eq!(reply.into_result().unwrap().removal, Some(expected));
+        }
+    }
+
+    #[test]
+    fn broker_preserves_explicit_driver_error_kinds_without_guessing_from_text() {
+        for kind in [
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+        ] {
+            let reply = Reply::driver_failure(io::Error::new(kind, "driver rejected request").into());
+            let round_trip: Reply = serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+            let VddError::Io(error) = VddError::from_broker(round_trip.into_result().unwrap_err()) else {
+                panic!("a trusted rejection became an unknown mutation outcome");
+            };
+            assert_eq!(error.kind(), kind);
+        }
+        let ordinary = Reply::failure("AlreadyExists: NotFound: permission denied");
+        assert_eq!(ordinary.into_result().unwrap_err().kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn broker_replies_without_remove_evidence_leave_confirmation_absent() {
+        let old_reply: Reply = serde_json::from_value(serde_json::json!({
+            "legacy": false,
+            "monitors": null,
+            "error": null,
+        }))
+        .unwrap();
+        assert_eq!(old_reply.removal, None);
+        let failed = Reply::failure("driver disconnected");
+        assert_eq!(failed.removal, None);
+        assert!(failed.error.is_some());
+    }
+
+    #[test]
+    fn broker_understands_explicit_unsupported_errors() {
+        let encoded = serde_json::json!({
+            "legacy": null,
+            "monitors": null,
+            "removal": null,
+            "error": "atomic update unavailable",
+            "unsupported": true,
+        });
+        let reply: Reply = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&reply).unwrap(), encoded);
+        assert_eq!(reply.into_result().unwrap_err().kind(), io::ErrorKind::Unsupported);
+
+        let driver_error = Reply::driver_failure(io::Error::new(
+            io::ErrorKind::Unsupported, "atomic update unavailable"
+        ).into());
+        let round_trip: Reply = serde_json::from_slice(&serde_json::to_vec(&driver_error).unwrap()).unwrap();
+        assert_eq!(round_trip.into_result().unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn broker_preserves_unknown_outcomes_and_their_causes() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::TimedOut, io::ErrorKind::InvalidData] {
+            let reply = Reply::driver_failure(VddError::OutcomeUnknown {
+                source: io::Error::new(kind, "write was applied; acknowledgement was lost"),
+            });
+            let encoded = serde_json::to_vec(&reply).unwrap();
+            let round_trip: Reply = serde_json::from_slice(&encoded).unwrap();
+            let error = VddError::from_broker(round_trip.into_result().unwrap_err());
+            assert!(matches!(error, VddError::OutcomeUnknown { source } if source.kind() == kind));
+
+            let transport = VddError::from_broker(unknown_outcome(io::Error::new(kind, "helper response lost")));
+            assert!(matches!(transport, VddError::OutcomeUnknown { source } if source.kind() == kind));
+        }
+        assert!(matches!(VddError::from_broker(io::Error::other("not authorized")), VddError::Io(_)));
+    }
+
+    #[test]
+    fn owned_commands_have_distinct_wire_names_and_validate_tokens() {
+        let token = "0123456789abcdef0123456789abcdef";
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "command", content = "arguments", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum PreOwnedRequest {
+            AtomicNotify { monitors: Vec<VddMonitor> },
+            AtomicReplace { remove_ids: Vec<u32>, monitors: Vec<VddMonitor> },
+            Remove { ids: Vec<u32> },
+            State,
+        }
+        for (request, command) in [
+            (Request::ReserveOwned { id: 0, owner: token.into() }, "OwnedReserve"),
+            (Request::CreateOwned { monitors: vec![monitor()], owner: token.into() }, "OwnedCreate"),
+            (Request::ReplaceOwned { monitors: vec![monitor()], owner: token.into() }, "OwnedReplace"),
+            (Request::RemoveOwned { ids: vec![0], owner: token.into() }, "OwnedRelease"),
+        ] {
+            assert!(request.validate().is_ok());
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(encoded["command"], command);
+            assert!(serde_json::from_value::<PreOwnedRequest>(encoded.clone()).is_err());
+            assert!(serde_json::from_value::<Request>(encoded).is_ok());
+        }
+        assert!(Request::ReserveOwned { id: 4, owner: token.into() }.validate().is_err());
+        for owner in ["", "0123456789abcdef0123456789abcdeg", "not-a-token"] {
+            assert!(Request::ReserveOwned { id: 0, owner: owner.into() }.validate().is_err());
+            assert!(Request::RemoveOwned { ids: vec![0], owner: owner.into() }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn owner_verification_is_rejected_by_older_helpers_before_driver_access() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "command", content = "arguments", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum PreCheckRequest {
+            AtomicNotify { monitors: Vec<VddMonitor> },
+            LegacyOnlyReplace { remove_ids: Vec<u32>, monitors: Vec<VddMonitor> },
+            LegacyOnlyRemove { ids: Vec<u32> },
+            OwnedReserve { id: u32, owner: String },
+            OwnedCreate { monitors: Vec<VddMonitor>, owner: String },
+            OwnedReplace { monitors: Vec<VddMonitor>, owner: String },
+            OwnedRelease { ids: Vec<u32>, owner: String },
+            State,
+        }
+        for owner in [None, Some("0123456789abcdef0123456789abcdef")] {
+            let request = Request::VerifyOwner { id: 0, owner: owner.map(str::to_owned) };
+            assert!(request.validate().is_ok());
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["command"], "VerifyOwner");
+            assert!(serde_json::from_value::<PreCheckRequest>(encoded.clone()).is_err());
+            assert!(serde_json::from_value::<Request>(encoded).is_ok());
+        }
+        assert!(Request::VerifyOwner { id: 4, owner: None }.validate().is_err());
+        for owner in ["", "0123456789abcdef0123456789abcdeg", "not-a-token"] {
+            assert!(Request::VerifyOwner { id: 0, owner: Some(owner.into()) }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn owner_verification_broker_transport_failure_remains_a_read_only_error() {
+        let pid = std::process::id();
+        for malformed in [false, true] {
+            let name = new_pipe_name(pid).unwrap();
+            let mut server = create_server(&name).unwrap();
+            let helper = std::thread::spawn(move || {
+                let parent = open_process(pid).unwrap();
+                let mut pipe = connect_client(&name, pid, &parent).unwrap();
+                let payload = receive_frame(&mut pipe, Some(Instant::now() + IO_TIMEOUT),
+                    &parent, MAX_REQUEST_FRAME).unwrap();
+                assert!(matches!(serde_json::from_slice::<Request>(&payload).unwrap(),
+                    Request::VerifyOwner { id: 0, owner: Some(_) }));
+                if malformed {
+                    send_frame(&mut pipe, b"invalid-json", Instant::now() + IO_TIMEOUT,
+                        &parent, MAX_RESPONSE_FRAME).unwrap();
+                }
+            });
+            let peer = open_process(pid).unwrap();
+            accept_verified(&mut server, pid, &peer).unwrap();
+            let mut session = Session::Connected(Broker { pipe: server, process: peer });
+            let request = Request::VerifyOwner { id: 0,
+                owner: Some("0123456789abcdef0123456789abcdef".into()) };
+            let error = exchange_request(&mut session, &request).unwrap_err();
+            assert!(matches!(VddError::from_broker(error), VddError::Io(_)),
+                "read-only failures must not be classified as an unknown mutation outcome");
+            assert!(matches!(session, Session::Failed(_)));
+            assert!(exchange_request(&mut session, &request).is_err(),
+                "a lost helper must not be restarted to replay verification");
+            helper.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn old_and_ordinary_broker_errors_remain_other_errors() {
+        let old_reply: Reply = serde_json::from_str(
+            r#"{"legacy":null,"monitors":null,"error":"ordinary failure"}"#
+        ).unwrap();
+        assert_eq!(old_reply.into_result().unwrap_err().kind(), io::ErrorKind::Other);
+        let ordinary = Reply::driver_failure(io::Error::other("ordinary failure").into());
+        assert_eq!(ordinary.into_result().unwrap_err().kind(), io::ErrorKind::Other);
     }
 
     #[test]
@@ -1224,19 +1721,24 @@ mod tests {
             let parent = open_process(pid).unwrap();
             let mut pipe = connect_client(&name, pid, &parent).unwrap();
             let bytes =
-                receive_frame(&mut pipe, Some(Instant::now() + IO_TIMEOUT), &parent).unwrap();
+                receive_frame(&mut pipe, Some(Instant::now() + IO_TIMEOUT), &parent, MAX_REQUEST_FRAME).unwrap();
             let request: Request = serde_json::from_slice(&bytes).unwrap();
             assert!(matches!(request, Request::State));
             let reply = Reply {
                 legacy: Some(true),
                 monitors: None,
+                removal: None,
                 error: None,
+                unsupported: false,
+                outcome_unknown: None,
+                error_kind: None,
             };
             send_frame(
                 &mut pipe,
                 &serde_json::to_vec(&reply).unwrap(),
                 Instant::now() + IO_TIMEOUT,
                 &parent,
+                MAX_RESPONSE_FRAME,
             )
             .unwrap();
         });
@@ -1247,14 +1749,88 @@ mod tests {
             &serde_json::to_vec(&Request::State).unwrap(),
             Instant::now() + IO_TIMEOUT,
             &peer,
+            MAX_REQUEST_FRAME,
         )
         .unwrap();
-        let bytes = receive_frame(&mut server, Some(Instant::now() + IO_TIMEOUT), &peer).unwrap();
+        let bytes = receive_frame(&mut server, Some(Instant::now() + IO_TIMEOUT), &peer, MAX_RESPONSE_FRAME).unwrap();
         assert_eq!(
             serde_json::from_slice::<Reply>(&bytes).unwrap().legacy,
             Some(true)
         );
         client.join().unwrap();
+    }
+
+    #[test]
+    fn response_size_broker_transports_maximum_legal_state() {
+        let pid = std::process::id();
+        let name = new_pipe_name(pid).unwrap();
+        let mut server = create_server(&name).unwrap();
+        let monitors = crate::vdd::maximum_test_state();
+        let expected = monitors.clone();
+        let client = std::thread::spawn(move || {
+            let parent = open_process(pid).unwrap();
+            let mut pipe = connect_client(&name, pid, &parent).unwrap();
+            let request = receive_frame(&mut pipe, Some(Instant::now() + IO_TIMEOUT), &parent, MAX_REQUEST_FRAME).unwrap();
+            assert!(matches!(serde_json::from_slice::<Request>(&request).unwrap(), Request::State));
+            let reply = Reply {
+                legacy: Some(false), monitors: Some(monitors), removal: None,
+                error: None, unsupported: false, outcome_unknown: None, error_kind: None,
+            };
+            let payload = serde_json::to_vec(&reply).unwrap();
+            assert!(payload.len() > 128 * 1024);
+            assert!(payload.len() <= MAX_RESPONSE_FRAME);
+            println!("maximum legal broker Reply: {} bytes; request/response caps: {MAX_REQUEST_FRAME}/{MAX_RESPONSE_FRAME}", payload.len());
+            send_frame(&mut pipe, &payload, Instant::now() + IO_TIMEOUT, &parent, MAX_RESPONSE_FRAME)
+        });
+        let process = open_process(pid).unwrap();
+        accept_verified(&mut server, pid, &process).unwrap();
+        let result = Broker { pipe: server, process }.request(&Request::State);
+        let sent = client.join().unwrap();
+        assert!(sent.is_ok(), "broker must send a legal large State: sent={sent:?}, reply={result:?}");
+        assert_eq!(result.unwrap().monitors, Some(expected));
+    }
+
+    #[test]
+    fn response_size_broker_preserves_request_limit_and_rejects_oversized_sends() {
+        assert_eq!(MAX_REQUEST_FRAME, 128 * 1024);
+        let name = new_pipe_name(std::process::id()).unwrap();
+        let mut pipe = create_server(&name).unwrap();
+        let process = open_process(std::process::id()).unwrap();
+        for maximum in [MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME] {
+            let error = send_frame(&mut pipe, &vec![b' '; maximum + 1],
+                Instant::now() + IO_TIMEOUT, &process, maximum).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn response_size_broker_rejects_invalid_headers_before_reading_payload() {
+        for (maximum, length) in [
+            (MAX_REQUEST_FRAME, MAX_REQUEST_FRAME as u32 + 1),
+            (MAX_RESPONSE_FRAME, MAX_RESPONSE_FRAME as u32 + 1),
+            (MAX_RESPONSE_FRAME, u32::MAX),
+            (MAX_RESPONSE_FRAME, 0),
+        ] {
+            let pid = std::process::id();
+            let name = new_pipe_name(pid).unwrap();
+            let mut server = create_server(&name).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let client = std::thread::spawn(move || {
+                let parent = open_process(pid).unwrap();
+                let mut pipe = connect_client(&name, pid, &parent).unwrap();
+                pipe.write_all(&length.to_le_bytes()).unwrap();
+                // Keep the pipe open but never send a body. Rejecting the header
+                // must finish before a normal body read could time out.
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            let peer = open_process(pid).unwrap();
+            accept_verified(&mut server, pid, &peer).unwrap();
+            let error = receive_frame(&mut server, Some(Instant::now() + IO_TIMEOUT), &peer, maximum)
+                .unwrap_err();
+            done_tx.send(()).unwrap();
+            client.join().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
@@ -1267,7 +1843,7 @@ mod tests {
             let process = open_process(pid).unwrap();
             let mut rejected = connect_client(&name, pid, &process).unwrap();
             let error =
-                receive_frame(&mut rejected, Some(Instant::now() + timeout), &process).unwrap_err();
+                receive_frame(&mut rejected, Some(Instant::now() + timeout), &process, MAX_REQUEST_FRAME).unwrap_err();
             assert_ne!(error.kind(), io::ErrorKind::TimedOut);
             drop(rejected);
 
@@ -1277,9 +1853,10 @@ mod tests {
                 b"accepted",
                 Instant::now() + timeout,
                 &process,
+                MAX_REQUEST_FRAME,
             )
             .unwrap();
-            receive_frame(&mut accepted, Some(Instant::now() + timeout), &process).unwrap();
+            receive_frame(&mut accepted, Some(Instant::now() + timeout), &process, MAX_RESPONSE_FRAME).unwrap();
         });
         let attempts = std::cell::Cell::new(0);
         accept_peer(
@@ -1299,9 +1876,9 @@ mod tests {
         assert_eq!(attempts.get(), 2);
         let process = open_process(pid).unwrap();
         let received =
-            receive_frame(&mut server, Some(Instant::now() + timeout), &process).unwrap();
+            receive_frame(&mut server, Some(Instant::now() + timeout), &process, MAX_REQUEST_FRAME).unwrap();
         assert_eq!(received, b"accepted");
-        send_frame(&mut server, b"ack", Instant::now() + timeout, &process).unwrap();
+        send_frame(&mut server, b"ack", Instant::now() + timeout, &process, MAX_RESPONSE_FRAME).unwrap();
         client.join().unwrap();
     }
 }

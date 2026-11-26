@@ -43,6 +43,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'driver-package-consistency.ps1')
 if (-not $Exe) { $Exe = Join-Path $repoRoot 'target\release\snug.exe' }
 if (-not $DistDir) { $DistDir = Join-Path $repoRoot 'dist' }
 
@@ -193,8 +194,14 @@ if ($exeInfo.Length -gt $MaxBytes) {
 Head '== 内嵌驱动 =='
 $driverDir = Join-Path $repoRoot 'driver'
 $driverZipName = 'virtual-desktop-driver-installer-x64.zip'
-$fetchScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fetch-driver.ps1') -Raw
-$driverHashMatch = [regex]::Match($fetchScript, '(?m)^\$ExpectedSha256\s*=\s*''([0-9A-Fa-f]{64})''')
+$driverZipPath = Join-Path $driverDir $driverZipName
+$driverPackageIssues = @(Get-DriverPackageConsistencyIssues -RepositoryRoot $repoRoot -ArchivePath $driverZipPath -CheckProtocolSource)
+if ($driverPackageIssues.Count -eq 0) {
+    Pass '驱动源码、最低协议版本、归档内容、安装脚本与 source.lock.json 一致'
+} else {
+    foreach ($issue in $driverPackageIssues) { Fail "驱动包一致性：$issue" }
+}
+$driverLock = Get-Content -LiteralPath (Join-Path $driverDir 'source.lock.json') -Raw | ConvertFrom-Json
 foreach ($name in @($driverZipName, 'Install-SnugDriver.ps1')) {
     $source = Join-Path $driverDir $name
     if (-not (Test-Path -LiteralPath $source)) {
@@ -204,10 +211,10 @@ foreach ($name in @($driverZipName, 'Install-SnugDriver.ps1')) {
     $sourceBytes = [System.IO.File]::ReadAllBytes($source)
     if ($name -eq $driverZipName) {
         $driverHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-        if ($driverHashMatch.Success -and $driverHash -eq $driverHashMatch.Groups[1].Value) {
-            Pass '驱动安装包 SHA-256 与 fetch-driver.ps1 固定的官方哈希一致'
+        if ($driverHash -eq $driverLock.releasePackage.archiveSha256) {
+            Pass '驱动安装包 SHA-256 与 source.lock.json 一致'
         } else {
-            Fail '驱动安装包与 fetch-driver.ps1 的官方 SHA-256 不符，或固定哈希无法读取'
+            Fail '驱动安装包与 source.lock.json 的 SHA-256 不符'
         }
     } elseif ($sourceBytes.Length -ge 3 -and $sourceBytes[0] -eq 0xEF -and $sourceBytes[1] -eq 0xBB -and $sourceBytes[2] -eq 0xBF) {
         Pass '内嵌安装脚本的比对源是 UTF-8 with BOM'

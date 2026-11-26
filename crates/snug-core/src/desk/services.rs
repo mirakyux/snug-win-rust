@@ -126,7 +126,8 @@ pub trait PhoneDisplays: Send + Sync {
     /// 把已有手机屏改成新的比例。
     fn reshape(&self, display_id: u32, fit: ScreenFit) -> bool;
     fn fit_of(&self, display_id: u32) -> Option<ScreenFit>;
-    /// 撤掉手机屏，返回它是否已经下线。
+    /// 撤掉手机屏，返回桌面输出是否已经下线、可以开始新的会话。
+    /// 平台可以继续保留未获驱动确认的归属记录，并避免复用这些编号。
     fn retire(&self, display_id: u32) -> bool;
     fn is_online(&self, display_id: u32) -> bool;
     fn width_of(&self, display_id: u32) -> Option<i32>;
@@ -137,6 +138,14 @@ pub trait PhoneDisplays: Send + Sync {
     fn main_area(&self) -> Option<Rect>;
     fn other_displays(&self) -> Vec<OtherDisplay>;
     fn set_mode(&self, display_id: u32, mode: DisplayModeInfo, permanently: bool);
+}
+
+/// Relative input cannot always prove whether the application consumed every step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomOutcome {
+    Applied,
+    NotApplied,
+    Uncertain,
 }
 
 /// 窗口控制（对应 C# `IWindowControl`）。
@@ -150,6 +159,9 @@ pub trait WindowControl: Send + Sync {
     fn set_minimized(&self, window: WindowKey, on: bool);
     fn focus(&self, window: WindowKey);
     fn zoom(&self, window: WindowKey, steps: i32) -> bool;
+    fn zoom_outcome(&self, window: WindowKey, steps: i32) -> ZoomOutcome {
+        if self.zoom(window, steps) { ZoomOutcome::Applied } else { ZoomOutcome::Uncertain }
+    }
     fn shown_windows(&self, pid: i32) -> Vec<WindowInfo>;
     /// 正在弹"要不要保存"之类询问的窗口。
     fn asking_window(&self, pid: i32) -> Option<WindowInfo>;

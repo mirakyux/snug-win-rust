@@ -104,6 +104,16 @@ pub trait UiaNode {
     /// 运行时 ID，用来防环；拿不到就返回空（C# 里 `GetRuntimeId()` 返回 null 时同样处理）。
     fn runtime_id(&self) -> Vec<i32>;
     fn children(&self) -> Vec<Box<dyn UiaNode>>;
+    /// 快照逐个访问子节点；返回 false 后停止调用后续子节点回调。
+    /// 默认适配器会先调用 `children()`，为旧实现保留源码兼容；由于它会预收集子节点，
+    /// 需要限制 provider 枚举或临时引用的实现应覆盖此方法。`ComElement` 使用惰性覆盖。
+    fn visit_children(&self, visitor: &mut dyn FnMut(&dyn UiaNode) -> bool) {
+        for child in self.children() {
+            if !visitor(child.as_ref()) {
+                break;
+            }
+        }
+    }
     /// 触发这个元素（只有实现了 InvokePattern 的菜单项会返回 `true`）。
     fn invoke(&self) -> bool {
         false
@@ -160,22 +170,16 @@ pub fn snapshot(
     }
 
     let mut children = Vec::new();
-    let mut aborted = false;
-    for child in root.children() {
-        match snapshot(child.as_ref(), depth + 1, budget, path) {
-            Some(snapshot) => children.push(snapshot),
-            None => {
-                if budget.aborted {
-                    aborted = true;
-                    break;
-                }
-            }
+    root.visit_children(&mut |child| {
+        if let Some(snapshot) = snapshot(child, depth + 1, budget, path) {
+            children.push(snapshot);
         }
-    }
+        !budget.aborted
+    });
     if !runtime_key.is_empty() {
         path.remove(&runtime_key);
     }
-    if aborted {
+    if budget.aborted {
         return None;
     }
 
@@ -352,6 +356,22 @@ impl UiaNode for ComElement {
         children
     }
 
+    fn visit_children(&self, visitor: &mut dyn FnMut(&dyn UiaNode) -> bool) {
+        let Ok(mut current) = (unsafe { self.walker.GetFirstChildElement(&self.element) }) else {
+            return;
+        };
+        loop {
+            let child = ComElement { element: current, walker: self.walker.clone() };
+            if !visitor(&child) {
+                return;
+            }
+            match unsafe { self.walker.GetNextSiblingElement(&child.element) } {
+                Ok(next) => current = next,
+                Err(_) => return,
+            }
+        }
+    }
+
     fn invoke(&self) -> bool {
         unsafe {
             self.element
@@ -388,7 +408,7 @@ impl Uia {
             // RPC_E_CHANGED_MODE only means this thread already chose a different apartment.
             // CoCreateInstance may still work there; preserve the old behavior, but never
             // balance an initialization reference that this call did not acquire.
-            let com = status.is_ok().then_some(ComInitialization);
+            let com = status.is_ok().then(|| ComInitialization);
             let created = (|| {
                 let automation: IUIAutomation =
                     CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
@@ -482,6 +502,87 @@ mod tests {
 
     use super::*;
 
+    // A broken STA constructor can tear down the process's main STA while another
+    // test creates UIA. Keep the two real-COM regression probes independent.
+    static COM_APARTMENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn current_apartment() -> windows::core::Result<(
+        windows::Win32::System::Com::APTTYPE,
+        windows::Win32::System::Com::APTTYPEQUALIFIER,
+    )> {
+        use windows::Win32::System::Com::{APTTYPE, APTTYPEQUALIFIER, CoGetApartmentType};
+
+        let mut kind = APTTYPE::default();
+        let mut qualifier = APTTYPEQUALIFIER::default();
+        unsafe { CoGetApartmentType(&mut kind, &mut qualifier)? };
+        Ok((kind, qualifier))
+    }
+
+    #[test]
+    fn uia_new_preserves_caller_sta() {
+        use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
+
+        let _serial = COM_APARTMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::thread::spawn(|| unsafe {
+            assert_eq!(CoInitializeEx(None, COINIT_APARTMENTTHREADED).0, 0);
+            let before = current_apartment().expect("caller initialized STA");
+            let uia = Uia::new();
+            eprintln!("STA production Uia::new: {:?}", uia.as_ref().map(|_| ()));
+            let during = current_apartment();
+            drop(uia);
+            let after = current_apartment();
+            // The broken constructor can release the caller's only reference. Clean up
+            // before asserting, and avoid another CoUninitialize in that failure case.
+            if after.as_ref().is_ok_and(|kind| *kind == before) {
+                CoUninitialize();
+            }
+            assert_eq!(during.expect("Uia::new must preserve caller STA"), before);
+            assert_eq!(after.expect("Uia drop must preserve caller STA"), before);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn uia_new_balances_s_false_without_releasing_caller_mta() {
+        use windows::Win32::System::Com::{
+            APTTYPE_MTA, APTTYPEQUALIFIER_NONE, COINIT_APARTMENTTHREADED,
+        };
+
+        let _serial = COM_APARTMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::thread::spawn(|| unsafe {
+            assert_eq!(CoInitializeEx(None, COINIT_MULTITHREADED).0, 0);
+            let uia = Uia::new(); // Same apartment: the production initializer gets S_FALSE.
+            eprintln!("MTA production Uia::new: {:?}", uia.as_ref().map(|_| ()));
+            let during = current_apartment();
+            drop(uia);
+            let after = current_apartment();
+            if after.is_ok() {
+                CoUninitialize(); // Release exactly the caller's original reference.
+            }
+            // A leaked S_FALSE reference would reject switching this thread to STA.
+            let reinitialize = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if reinitialize.is_ok() {
+                CoUninitialize();
+            }
+            assert_eq!(
+                during.expect("Uia::new must preserve caller MTA"),
+                (APTTYPE_MTA, APTTYPEQUALIFIER_NONE)
+            );
+            assert_eq!(
+                after.expect("Uia drop must preserve caller MTA"),
+                (APTTYPE_MTA, APTTYPEQUALIFIER_NONE)
+            );
+            assert_eq!(reinitialize.0, 0, "Uia must balance its S_FALSE reference");
+        })
+        .join()
+        .unwrap();
+    }
+
     #[derive(Clone)]
     struct FakeNode {
         control_type: i32,
@@ -573,6 +674,22 @@ mod tests {
             self.invoked.set(true);
             true
         }
+
+    }
+
+    #[test]
+    fn default_visit_children_stops_after_false() {
+        // FakeNode intentionally implements only the pre-existing trait methods.
+        let root = FakeNode::new(0, "root").with_children(vec![
+            FakeNode::text("first"),
+            FakeNode::text("second"),
+        ]);
+        let mut visited = Vec::new();
+        root.visit_children(&mut |child| {
+            visited.push(child.name());
+            false
+        });
+        assert_eq!(visited, ["first"]);
     }
 
     #[test]
@@ -772,6 +889,139 @@ mod tests {
         let snapshot = snapshot(&tree, 0, &mut budget, &mut path).expect("根节点");
         assert_eq!(snapshot, UuElement::other_node(Vec::new()), "撞上同一个运行时 ID 就剪掉");
         assert!(!budget.aborted);
+    }
+
+    #[derive(Default)]
+    struct EnumerationStats {
+        fetched: Cell<usize>,
+        calls: Cell<usize>,
+        live: Cell<usize>,
+        peak: Cell<usize>,
+    }
+
+    /// Models First/Next calls without allocating the provider's sibling list.
+    /// None repeats the same logical sibling forever, with no runtime ID.
+    struct EnumeratedNode {
+        width: Option<usize>,
+        first_child_width: usize,
+        own_calls: Cell<usize>,
+        stats: Rc<EnumerationStats>,
+    }
+
+    impl EnumeratedNode {
+        fn new(width: Option<usize>, stats: Rc<EnumerationStats>) -> Self {
+            let live = stats.live.get() + 1;
+            stats.live.set(live);
+            stats.peak.set(stats.peak.get().max(live));
+            Self { width, first_child_width: 0, own_calls: Cell::new(0), stats }
+        }
+
+        fn child(&self, index: usize) -> Option<Self> {
+            self.own_calls.set(self.own_calls.get() + 1);
+            self.stats.calls.set(self.stats.calls.get() + 1);
+            if self.width.is_some_and(|width| index >= width) {
+                return None;
+            }
+            // Keep a regressed endless-provider test from hanging the test runner.
+            assert!(index < 100_001, "sibling enumeration did not stop");
+            self.stats.fetched.set(self.stats.fetched.get() + 1);
+            Some(Self::new(Some(if index == 0 { self.first_child_width } else { 0 }),
+                self.stats.clone()))
+        }
+    }
+
+    impl Drop for EnumeratedNode {
+        fn drop(&mut self) {
+            self.stats.live.set(self.stats.live.get() - 1);
+        }
+    }
+
+    impl UiaNode for EnumeratedNode {
+        fn control_type(&self) -> i32 { 0 }
+        fn name(&self) -> String { String::new() }
+        fn automation_id(&self) -> String { String::new() }
+        fn bounding_rect(&self) -> Option<Rect> { None }
+        fn runtime_id(&self) -> Vec<i32> { Vec::new() }
+        fn children(&self) -> Vec<Box<dyn UiaNode>> {
+            (0..)
+                .map_while(|index| self.child(index))
+                .map(|child| Box::new(child) as Box<dyn UiaNode>)
+                .collect()
+        }
+        fn visit_children(&self, visitor: &mut dyn FnMut(&dyn UiaNode) -> bool) {
+            for index in 0.. {
+                let Some(child) = self.child(index) else { break };
+                if !visitor(&child) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_bounds_wide_sibling_enumeration_and_releases_nodes() {
+        let stats = Rc::new(EnumerationStats::default());
+        let root = EnumeratedNode::new(Some(100_000), stats.clone());
+        let mut budget = SnapshotBudget::default();
+        assert!(snapshot(&root, 0, &mut budget, &mut HashSet::new()).is_none());
+        assert!(budget.aborted);
+        assert!(stats.fetched.get() <= MAX_UIA_NODES + 1,
+            "fetched {} siblings before checking the budget", stats.fetched.get());
+        assert!(stats.calls.get() <= 2 * MAX_UIA_NODES + 1);
+        assert!(stats.peak.get() <= MAX_UIA_DEPTH + 1);
+        assert_eq!(stats.live.get(), 1, "only the caller's root may remain");
+        drop(root);
+        assert_eq!(stats.live.get(), 0);
+    }
+
+    #[test]
+    fn snapshot_bounds_endlessly_repeated_siblings_without_runtime_ids() {
+        let stats = Rc::new(EnumerationStats::default());
+        let root = EnumeratedNode::new(None, stats.clone());
+        assert_eq!(read_controllers(&[Box::new(root)]), ControllerTable::unreadable());
+        assert!(stats.fetched.get() <= MAX_UIA_NODES + 1);
+        assert!(stats.calls.get() <= 2 * MAX_UIA_NODES + 1);
+        assert_eq!(stats.live.get(), 0);
+    }
+
+    #[test]
+    fn snapshot_node_budget_includes_root_and_accepts_exact_limit() {
+        for total in [MAX_UIA_NODES - 1, MAX_UIA_NODES, MAX_UIA_NODES + 1] {
+            let stats = Rc::new(EnumerationStats::default());
+            let root = EnumeratedNode::new(Some(total - 1), stats.clone());
+            let mut budget = SnapshotBudget::default();
+            let tree = snapshot(&root, 0, &mut budget, &mut HashSet::new());
+            assert_eq!(tree.is_some(), total <= MAX_UIA_NODES, "total={total}");
+            assert_eq!(budget.aborted, total > MAX_UIA_NODES, "total={total}");
+            assert_eq!(budget.nodes, total);
+            assert!(stats.calls.get() <= 2 * MAX_UIA_NODES + 1);
+        }
+    }
+
+    #[test]
+    fn snapshot_budget_is_shared_across_windows() {
+        // A valid first table must not survive an incomplete later window.
+        // Each window individually fits; resetting the budget would accept the table.
+        let windows: Vec<Box<dyn UiaNode>> = vec![
+            Box::new(controlled_window()),
+            Box::new(EnumeratedNode::new(
+                Some(MAX_UIA_NODES - 2), Rc::new(EnumerationStats::default()),
+            )),
+        ];
+        assert_eq!(read_controllers(&windows), ControllerTable::unreadable());
+    }
+
+    #[test]
+    fn snapshot_abort_stops_ancestor_sibling_enumeration() {
+        let stats = Rc::new(EnumerationStats::default());
+        let mut root = EnumeratedNode::new(Some(2), stats.clone());
+        root.first_child_width = 100_000;
+        let mut budget = SnapshotBudget::default();
+        assert!(snapshot(&root, 0, &mut budget, &mut HashSet::new()).is_none());
+        assert!(budget.aborted);
+        assert_eq!(root.own_calls.get(), 1, "must not fetch the root's second child");
+        assert!(stats.calls.get() <= 2 * MAX_UIA_NODES + 1);
+        assert_eq!(stats.live.get(), 1);
     }
 
     #[test]

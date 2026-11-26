@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/snug-core", "crates/snug-win", "crates/snug-app"]
+exclude = ["vendor/virtual-display-rs"]
 
 [workspace.package]
 # 唯一版本来源：crate 版本 = exe 资源里的 FileVersion/ProductVersion

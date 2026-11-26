@@ -87,6 +87,12 @@ function Assert-RustSha256 {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$consistencyScript = Join-Path $PSScriptRoot 'driver-package-consistency.ps1'
+. $consistencyScript
+$driverPackageIssues = @(Get-DriverPackageConsistencyIssues -RepositoryRoot $repoRoot -CheckProtocolSource)
+if ($driverPackageIssues.Count -gt 0) {
+    throw "发布驱动与当前源码不一致，拒绝打包：`n - $($driverPackageIssues -join "`n - ")"
+}
 if (-not $Exe) { $Exe = Join-Path $repoRoot 'target\release\snug.exe' }
 if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'dist' }
 

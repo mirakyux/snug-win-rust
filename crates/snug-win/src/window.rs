@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use snug_core::desk::services::ZoomOutcome;
 use snug_core::desk::{WindowControl, WindowLook};
 use snug_core::{Rect, WindowInfo, WindowKey};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
@@ -308,6 +309,17 @@ pub fn zoom_step_keys(steps: i32) -> Vec<u16> {
     vec![key; steps.unsigned_abs() as usize]
 }
 
+/// `SendInput` 只确认进入输入流的事件数，不确认应用已处理快捷键。
+fn input_outcome(sent: u32, expected: usize) -> ZoomOutcome {
+    if sent == 0 {
+        ZoomOutcome::NotApplied
+    } else if sent as usize == expected {
+        ZoomOutcome::Applied
+    } else {
+        ZoomOutcome::Uncertain
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 平台接口
 // ---------------------------------------------------------------------------
@@ -342,6 +354,11 @@ pub trait WindowApi: Send + Sync {
     fn post_close(&self, handle: u64) -> bool;
     /// 发一次 Ctrl(+Shift)+某键（C# `SendKeystroke`）。
     fn send_ctrl_key(&self, virtual_key: u16, with_shift: bool);
+    /// 旧平台接口没有结果确认，执行后必须保守保留不确定状态。
+    fn send_ctrl_key_outcome(&self, virtual_key: u16, with_shift: bool) -> ZoomOutcome {
+        self.send_ctrl_key(virtual_key, with_shift);
+        ZoomOutcome::Uncertain
+    }
     fn window_at_point(&self, point: snug_core::Point) -> Option<u64>;
     fn root_of(&self, handle: u64) -> Option<u64>;
     /// 窗口所在显示器的矩形（C# `IsLikelyFullScreen` 里的 `GetMonitorInfoW`）。
@@ -548,23 +565,36 @@ impl<A: WindowApi> WindowControl for Windows<A> {
     }
 
     fn zoom(&self, window: WindowKey, steps: i32) -> bool {
+        self.zoom_outcome(window, steps) == ZoomOutcome::Applied
+    }
+
+    fn zoom_outcome(&self, window: WindowKey, steps: i32) -> ZoomOutcome {
         if steps == 0 {
-            return true;
+            return ZoomOutcome::Applied;
         }
         if !self.exists(window) {
-            return false;
+            return ZoomOutcome::NotApplied;
         }
         self.focus(window);
         sleep_for(self.timings.focus_settle);
+        let mut sent_any_step = false;
         for key in zoom_step_keys(steps) {
             // focus 是尽力请求；被系统拒绝或中途切换应用时，不能向其它窗口发 Ctrl 键。
-            if !self.api.is_foreground(window.handle) {
-                return false;
+            if !self.exists(window) || !self.api.is_foreground(window.handle) {
+                return if sent_any_step { ZoomOutcome::Uncertain } else { ZoomOutcome::NotApplied };
             }
-            self.api.send_ctrl_key(key, false);
+            match self.api.send_ctrl_key_outcome(key, false) {
+                ZoomOutcome::Applied => sent_any_step = true,
+                ZoomOutcome::NotApplied if !sent_any_step => return ZoomOutcome::NotApplied,
+                ZoomOutcome::NotApplied | ZoomOutcome::Uncertain => return ZoomOutcome::Uncertain,
+            }
             sleep_for(self.timings.zoom_step);
+            // 输入注入与前台归属检查不是原子操作，最后一步也要检测已知的焦点变化。
+            if !self.exists(window) || !self.api.is_foreground(window.handle) {
+                return ZoomOutcome::Uncertain;
+            }
         }
-        true
+        ZoomOutcome::Applied
     }
 
     fn shown_windows(&self, pid: i32) -> Vec<WindowInfo> {
@@ -976,6 +1006,10 @@ impl WindowApi for WinDesktop {
     }
 
     fn send_ctrl_key(&self, virtual_key: u16, with_shift: bool) {
+        let _ = self.send_ctrl_key_outcome(virtual_key, with_shift);
+    }
+
+    fn send_ctrl_key_outcome(&self, virtual_key: u16, with_shift: bool) -> ZoomOutcome {
         let mut inputs = Vec::with_capacity(6);
         inputs.push(Self::key_input(VK_CONTROL.0, true));
         if with_shift {
@@ -987,9 +1021,9 @@ impl WindowApi for WinDesktop {
             inputs.push(Self::key_input(VK_SHIFT.0, false));
         }
         inputs.push(Self::key_input(VK_CONTROL.0, false));
-        unsafe {
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        // 部分事件可能已经触发缩放，不能重发、反向补偿或报告完全未执行。
+        input_outcome(sent, inputs.len())
     }
 
     fn window_at_point(&self, point: snug_core::Point) -> Option<u64> {
@@ -1401,6 +1435,7 @@ mod tests {
         focuses: Vec<u64>,
         closes: Vec<u64>,
         keys: Vec<(u16, bool)>,
+        key_outcomes: std::collections::VecDeque<ZoomOutcome>,
         foreground: Option<u64>,
         deny_focus: bool,
         lose_focus_after_keys: Option<usize>,
@@ -1498,11 +1533,16 @@ mod tests {
         }
 
         fn send_ctrl_key(&self, virtual_key: u16, with_shift: bool) {
+            let _ = self.send_ctrl_key_outcome(virtual_key, with_shift);
+        }
+
+        fn send_ctrl_key_outcome(&self, virtual_key: u16, with_shift: bool) -> ZoomOutcome {
             let mut state = self.0.lock().unwrap();
             state.keys.push((virtual_key, with_shift));
             if state.lose_focus_after_keys.is_some_and(|count| state.keys.len() >= count) {
                 state.foreground = None;
             }
+            state.key_outcomes.pop_front().unwrap_or(ZoomOutcome::Applied)
         }
 
         fn window_at_point(&self, _point: snug_core::Point) -> Option<u64> {
@@ -1681,6 +1721,96 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.focuses, vec![0x10], "do not keep forcing focus back");
         assert_eq!(state.keys, vec![(VK_OEM_PLUS.0, false)]);
+    }
+
+    #[test]
+    fn zero_zoom_steps_are_applied_without_focusing_or_sending_keys() {
+        let (service, state) = make(vec![]);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 0), ZoomOutcome::Applied);
+        let state = state.lock().unwrap();
+        assert!(state.focuses.is_empty());
+        assert!(state.keys.is_empty());
+    }
+
+    #[test]
+    fn missing_zoom_target_is_not_applied() {
+        let (service, state) = make(vec![]);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 1), ZoomOutcome::NotApplied);
+        let state = state.lock().unwrap();
+        assert!(state.focuses.is_empty());
+        assert!(state.keys.is_empty());
+    }
+
+    #[test]
+    fn denied_zoom_focus_is_not_applied() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().deny_focus = true;
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 2), ZoomOutcome::NotApplied);
+        assert!(state.lock().unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn zoom_focus_loss_after_an_applied_step_is_uncertain() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().lose_focus_after_keys = Some(1);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 3), ZoomOutcome::Uncertain);
+        assert_eq!(state.lock().unwrap().keys.len(), 1);
+    }
+
+    #[test]
+    fn zoom_focus_loss_after_the_last_step_is_still_uncertain() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().lose_focus_after_keys = Some(1);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 1), ZoomOutcome::Uncertain);
+        assert_eq!(state.lock().unwrap().keys.len(), 1);
+    }
+
+    #[test]
+    fn rejected_first_zoom_step_is_not_applied() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().key_outcomes.push_back(ZoomOutcome::NotApplied);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 3), ZoomOutcome::NotApplied);
+        assert_eq!(state.lock().unwrap().keys.len(), 1, "stop after the rejected input batch");
+    }
+
+    #[test]
+    fn partially_injected_first_zoom_step_is_uncertain() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().key_outcomes.push_back(ZoomOutcome::Uncertain);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 3), ZoomOutcome::Uncertain);
+        assert_eq!(state.lock().unwrap().keys.len(), 1, "never replay a partial input batch");
+    }
+
+    #[test]
+    fn bool_zoom_does_not_report_partial_input_as_success() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().key_outcomes.push_back(ZoomOutcome::Uncertain);
+        assert!(!service.zoom(WindowKey::new(100, 0x10), 1));
+        assert_eq!(state.lock().unwrap().keys.len(), 1);
+    }
+
+    #[test]
+    fn rejected_zoom_step_after_an_applied_step_is_uncertain() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        state.lock().unwrap().key_outcomes.extend([ZoomOutcome::Applied, ZoomOutcome::NotApplied]);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), 3), ZoomOutcome::Uncertain);
+        assert_eq!(state.lock().unwrap().keys.len(), 2);
+    }
+
+    #[test]
+    fn complete_zoom_input_is_applied() {
+        let (service, state) = make(vec![fake_window(0x10, 100, Rect::new(0.0, 0.0, 540.0, 960.0))]);
+        assert_eq!(service.zoom_outcome(WindowKey::new(100, 0x10), -2), ZoomOutcome::Applied);
+        assert_eq!(state.lock().unwrap().keys, vec![(VK_OEM_MINUS.0, false); 2]);
+    }
+
+    #[test]
+    fn input_event_counts_preserve_partial_injection_uncertainty() {
+        assert_eq!(input_outcome(0, 4), ZoomOutcome::NotApplied);
+        assert_eq!(input_outcome(1, 4), ZoomOutcome::Uncertain);
+        assert_eq!(input_outcome(3, 4), ZoomOutcome::Uncertain);
+        assert_eq!(input_outcome(4, 4), ZoomOutcome::Applied);
+        assert_eq!(input_outcome(5, 4), ZoomOutcome::Uncertain);
     }
 
     #[test]

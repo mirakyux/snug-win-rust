@@ -34,11 +34,12 @@ use crate::windows::{AppInfo, DisplayModeInfo, OtherDisplay, RunningApp, WindowI
 use crate::zoom::{self, ZoomBook, ZoomScope};
 
 use super::lane::SerialLane;
+use super::zoom_operation::{ZoomOperation, ZoomResult, ZoomSource};
 use super::model::{
     DeskGone, DeskNotice, DeskState, DeskWork, DeskWorkKind, PhoneScreenPhase, PlacedWindow,
 };
 use super::services::{
-    AppControl, CancelToken, PhoneDisplays, SystemTimeline, Timeline, WindowControl, WindowLook,
+    AppControl, CancelToken, PhoneDisplays, SystemTimeline, Timeline, WindowControl, WindowLook, ZoomOutcome,
 };
 
 /// C# `PhoneScreenSpec.MinimumLifetime`：手机屏建出来至少存在 2.5 秒，
@@ -193,10 +194,13 @@ struct Replaced {
 /// C# 的 `_zoomBook` / `_leftBehind` 是所有 `PhoneDesk` 共用的**同一个对象**；
 /// Rust 版把值放进 `Arc<Mutex<_>>`，这样各屏看到的是同一份记忆，不会互相覆盖文件。
 pub(crate) struct SharedDeskBooks {
+    zoom_operation: JsonFileStore<ZoomOperation>,
     pub(crate) zoom_book: Arc<Mutex<ZoomBook>>,
     pub(crate) zoom_file: Arc<JsonFileStore<ZoomBook>>,
     pub(crate) left_behind: Arc<Mutex<LeftBehindBook>>,
     pub(crate) left_behind_file: Arc<JsonFileStore<LeftBehindBook>>,
+    left_behind_loaded: AtomicBool,
+    restore_guards: Mutex<RestoreGuards>,
     /// 每个 App 上次铺满用的屏宽，键是 `"<比例>|<app_id>"`。
     ///
     /// 存盘是为了**跨进程**也省掉换档阶梯：真机上 QQ 第一次要从 540 一档档试到 850，
@@ -207,26 +211,80 @@ pub(crate) struct SharedDeskBooks {
 }
 
 impl SharedDeskBooks {
-    /// 从数据目录读一次（读坏的文件已被隔离）。
+    /// 从数据目录读取；共享恢复账本暂时读不到时保留重试状态。
     pub(crate) fn load(paths: &Paths) -> Self {
         let zoom_file = Arc::new(JsonFileStore::<ZoomBook>::new(paths.zoom_book_file()));
         let zoom_book = Arc::new(Mutex::new(zoom_file.load_or_quarantine().unwrap_or_default()));
         let left_behind_file =
             Arc::new(JsonFileStore::<LeftBehindBook>::new(paths.left_behind_file()));
-        let left_behind =
-            Arc::new(Mutex::new(left_behind_file.load_or_quarantine().unwrap_or_default()));
+        let loaded_left_behind = left_behind_file.try_load_or_quarantine();
+        let left_behind_loaded = AtomicBool::new(loaded_left_behind.is_ok());
+        let left_behind = Arc::new(Mutex::new(loaded_left_behind.ok().flatten().unwrap_or_default()));
         let learned_widths_file =
             Arc::new(JsonFileStore::<HashMap<String, i32>>::new(paths.learned_widths_file()));
         let learned_widths =
             Arc::new(Mutex::new(learned_widths_file.load_or_quarantine().unwrap_or_default()));
         Self {
+            zoom_operation: JsonFileStore::new(paths.data_dir().join("zoom-operation.json")),
             zoom_book,
             zoom_file,
             left_behind,
             left_behind_file,
+            left_behind_loaded,
+            restore_guards: Mutex::new(RestoreGuards::default()),
             learned_widths,
             learned_widths_file,
         }
+    }
+
+    /// A temporary read failure must not turn existing shared debts into an empty book.
+    fn ensure_left_behind_loaded(&self) -> bool {
+        if self.left_behind_loaded.load(Ordering::SeqCst) {
+            return true;
+        }
+        let mut book = self.left_behind.lock().expect("left_behind");
+        match self.left_behind_file.try_load_or_quarantine() {
+            Ok(loaded) => {
+                *book = loaded.unwrap_or_default();
+                self.left_behind_loaded.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Snapshot collected by the shared lane before a desk can consume shared debts.
+#[derive(Clone, Default)]
+struct RestoreGuards {
+    pending: HashMap<String, Vec<PhoneRecord>>,
+    placed: HashSet<WindowKey>,
+    unreadable: HashSet<String>,
+    scan_failed: bool,
+    zoom_pending: bool,
+}
+
+impl RestoreGuards {
+    fn blocked(&self) -> bool {
+        self.scan_failed || self.zoom_pending || !self.unreadable.is_empty()
+    }
+
+    fn protects(&self, record: &PhoneRecord) -> bool {
+        self.pending.values().flatten().any(|pending| pending == record)
+    }
+
+    fn prune(&self, book: &mut LeftBehindBook, now: i64) {
+        let (protected, mut entries): (Vec<_>, Vec<_>) = std::mem::take(&mut book.entries)
+            .into_iter().partition(|entry| self.protects(&entry.record));
+        entries.retain(|entry| now - entry.since_ms <= crate::left_behind::KEEP_MILLIS);
+        entries.sort_by_key(|entry| entry.since_ms);
+        let limit = crate::left_behind::LIMIT.saturating_sub(protected.len());
+        if entries.len() > limit {
+            entries.drain(0..entries.len() - limit);
+        }
+        entries.extend(protected);
+        entries.sort_by_key(|entry| entry.since_ms);
+        book.entries = entries;
     }
 }
 
@@ -266,6 +324,7 @@ struct DeskShared {
 pub(crate) struct DeskHub {
     desks: HashMap<String, DeskCore>,
     retired: Vec<DeskCore>,
+    restore_scan_failed: bool,
 }
 
 impl DeskHub {
@@ -275,11 +334,54 @@ impl DeskHub {
     }
 
     pub(crate) fn core_mut(&mut self, id: &str) -> Option<&mut DeskCore> {
+        self.refresh_restore_guards();
         self.desks.get_mut(&Self::key(id))
     }
 
-    pub(crate) fn insert(&mut self, core: DeskCore) {
+    fn refresh_restore_guards(&mut self) {
+        for core in self.desks.values_mut().chain(&mut self.retired) {
+            if matches!(core.shared.books.zoom_operation.try_load_strict(),
+                Ok(Some(operation)) if operation.result != ZoomResult::Pending) {
+                core.zoom_operation_blocked();
+            }
+        }
+        let mut guards = RestoreGuards {
+            scan_failed: self.restore_scan_failed,
+            ..RestoreGuards::default()
+        };
+        for core in self.desks.values().chain(&self.retired) {
+            guards.zoom_pending |= !matches!(core.shared.books.zoom_operation.try_load_strict(), Ok(None));
+            guards.scan_failed |= !core.shared.books.ensure_left_behind_loaded();
+            let id = Self::key(core.screen_id());
+            match core.shared.ledger.try_pending() {
+                Ok(Some(record)) => guards.pending.entry(id.clone()).or_default().push(record),
+                Ok(None) => {}
+                Err(_) => { guards.unreadable.insert(id.clone()); }
+            }
+            if let Some(record) = &core.record_rewrite {
+                guards.pending.entry(id).or_default().push(record.clone());
+            }
+            if let Some(placement) = &core.placement {
+                guards.placed.insert(placement.window.key);
+            }
+        }
+        for core in self.desks.values().chain(&self.retired) {
+            *core.shared.books.restore_guards.lock().expect("restore guards") = guards.clone();
+        }
+    }
+
+    pub(crate) fn set_restore_scan_failed(&mut self, failed: bool) {
+        self.restore_scan_failed = failed;
+        self.refresh_restore_guards();
+    }
+
+    pub(crate) fn insert(&mut self, mut core: DeskCore) {
         let key = Self::key(core.screen_id());
+        for previous in &mut self.retired {
+            if Self::key(previous.screen_id()) == key && previous.record_rewrite.is_some() {
+                core.record_rewrite = previous.record_rewrite.take();
+            }
+        }
         self.desks.insert(key, core);
     }
 
@@ -287,17 +389,25 @@ impl DeskHub {
         if let Some(core) = self.desks.remove(&Self::key(id)) {
             // 愿望已消失，但下线确认可能比删除命令晚。保留善后状态，不能随句柄一起丢掉。
             core.shared.remote.store(false, Ordering::SeqCst);
-            if core.retiring.is_some() || core.persist_owed {
+            if core.retiring.is_some() || core.persist_owed || core.has_pending_record() {
                 self.retired.push(core);
             }
         }
     }
 
     pub(crate) fn settle_retired(&mut self) {
+        self.refresh_restore_guards();
+        let active: HashSet<_> = self.desks.keys().cloned().collect();
         self.retired.retain_mut(|core| {
             core.settle_displays();
-            core.retiring.is_some() || core.persist_owed
+            core.flush_record_rewrite();
+            let restoring = !active.contains(&Self::key(core.screen_id()));
+            if restoring {
+                let _ = core.put_back_leftover();
+            }
+            core.retiring.is_some() || core.persist_owed || (restoring && core.has_pending_record())
         });
+        self.refresh_restore_guards();
     }
 
     pub(crate) fn ids(&self) -> Vec<String> {
@@ -309,19 +419,91 @@ impl DeskHub {
         self.retired.clear();
     }
 
-    /// 跨屏转移：除 `except` 之外，哪块屏正铺着这个窗口就把它摘下来。
-    pub(crate) fn detach_for_transfer(
-        &mut self,
-        except: &str,
-        window: WindowKey,
-    ) -> Option<PhoneRecord> {
-        let except = Self::key(except);
+    fn confirm_manual_zoom_reset(&mut self) {
+        let Some(books) = self.desks.values().next().or_else(|| self.retired.first())
+            .map(|core| Arc::clone(&core.shared.books)) else { return; };
+        let Ok(Some(operation)) = books.zoom_operation.try_load_strict() else { return; };
+        if operation.result != ZoomResult::Pending { return; }
+        let record = operation.resolved_record();
+        let saved = match &operation.source {
+            ZoomSource::Screen(id) => {
+                let key = Self::key(id);
+                let core = self.desks.get_mut(&key).or_else(|| self.retired.iter_mut()
+                    .find(|core| Self::key(core.screen_id()) == key));
+                core.is_some_and(|core| {
+                    matches!(core.shared.ledger.try_pending_strict(), Ok(Some(current)) if operation.matches(&current))
+                        && core.persist_zoom_record(&operation, &record)
+                })
+            }
+            ZoomSource::Shared => self.desks.values_mut().next().or_else(|| self.retired.first_mut())
+                .is_some_and(|core| core.persist_zoom_record(&operation, &record)),
+        };
+        if !saved || books.zoom_operation.try_delete().is_err() { return; }
+        for core in self.desks.values_mut().chain(&mut self.retired) {
+            if let Some(placement) = &mut core.placement {
+                if operation.matches(&placement.record) { placement.record = record.clone(); }
+            }
+            core.set_state(core.state().with_notice(None));
+            core.set_placement(core.placement.clone());
+        }
+        self.refresh_restore_guards();
+    }
+
+    /// Prepare while the source is durable, then atomically hand its ledger to the target.
+    pub(crate) fn pull_with_transfer(&mut self, target: &str, window: WindowInfo) {
+        self.refresh_restore_guards();
+        let target = Self::key(target);
+        if !self.desks.contains_key(&target) {
+            return;
+        }
         let source = self
             .desks
             .iter()
-            .find(|(id, core)| **id != except && core.placed_window_key() == Some(window))
-            .map(|(id, _)| id.clone())?;
-        self.desks.get_mut(&source)?.detach_placement_for_transfer()
+            .find(|(id, core)| **id != target && core.placed_window_key() == Some(window.key))
+            .map(|(id, _)| id.clone());
+        let Some(source) = source else {
+            self.desks.get_mut(&target).expect("target desk").pull_with(window, None);
+            return;
+        };
+        if self.desks.get_mut(&target).expect("target desk").zoom_operation_blocked() {
+            return;
+        }
+        let core = self.desks.get_mut(&source).expect("source desk");
+        // This source is being moved, so a failed handoff's shared copy must
+        // be withdrawn while its authoritative ledger still remains in place.
+        if core.zoom_operation_blocked() || !core.flush_record_rewrite() || !core.reclaim_shared_source() {
+            core.set_state(core.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return;
+        }
+        let source_shared = Arc::clone(&core.shared);
+        let record = core.placement.as_ref().expect("source placement").record.clone();
+        let core = self.desks.get_mut(&target).expect("target desk");
+        core.begin(DeskWork::with_label(DeskWorkKind::Placing, window.label()));
+        let Some(id) = core.ready_display(&format!("放 {}", window.label())) else {
+            core.set_state(core.state().with_work(None).with_notice(Some(DeskNotice::ScreenNotReady)));
+            return;
+        };
+        let Some(look) = core.prepare_placement(&window, true) else {
+            core.set_state(core.state().with_work(None));
+            return;
+        };
+        let prepared = (id, look);
+        if let Err(error) = source_shared.ledger.try_transfer_to(&core.shared.ledger) {
+            core.set_state(core.state().with_work(None).with_notice(Some(DeskNotice::RecordUnwritable)));
+            let core = self.desks.get_mut(&source).expect("source desk");
+            core.error(format!("还原记录移交失败，保留来源等待重试：{error}"));
+            core.set_state(core.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return;
+        }
+        let core = self.desks.get_mut(&source).expect("source desk");
+        core.publish_pending_record(None);
+        core.detach_placement_for_transfer().expect("prepared source placement");
+        self.refresh_restore_guards();
+        let core = self.desks.get_mut(&target).expect("target desk");
+        // The target now owns the only durable debt. Never recreate the source,
+        // even if fill fails or restoring the window must be retried later.
+        core.place_prepared(window, true, Some(record), Some(prepared));
+        core.set_state(core.state().with_work(None));
     }
 }
 
@@ -429,6 +611,8 @@ pub(crate) struct DeskCore {
     settling: bool,
     failures: usize,
     placement: Option<Placement>,
+    /// A failed zoom must restore its debt even when the compensating write is locked.
+    record_rewrite: Option<PhoneRecord>,
     recheck_generation: u64,
     verifying: bool,
     checking_returns: bool,
@@ -544,6 +728,7 @@ impl Desk {
                 settling: false,
                 failures: 0,
                 placement: None,
+                record_rewrite: None,
                 recheck_generation: 0,
                 verifying: false,
                 checking_returns: false,
@@ -852,7 +1037,7 @@ impl Desk {
     /// 对应 C# `Recover`：启动时把上次没还回去的窗口还回去。
     pub fn recover(&self) {
         self.inner.slot.run(|core: &mut DeskCore| {
-            core.put_back_leftover();
+            let _ = core.put_back_leftover();
         });
     }
 
@@ -941,6 +1126,11 @@ impl Desk {
             }
             core.set_state(core.state().with_notice(None));
         });
+    }
+
+    /// The user has manually restored the affected application's zoom to its original level.
+    pub fn confirm_manual_zoom_reset(&self) {
+        self.inner.slot.lane.run(|hub: &mut DeskHub| hub.confirm_manual_zoom_reset());
     }
 
     /// 对应 C# `ShowList`：回到 App 资源库。
@@ -1143,7 +1333,14 @@ impl DeskCore {
     }
 
     /// 对应 C# `State` 的 setter：内容没变就不触发 `StateChanged`。
-    fn set_state(&self, next: DeskState) {
+    fn set_state(&self, mut next: DeskState) {
+        match self.shared.books.zoom_operation.try_load_strict() {
+            Ok(Some(operation)) if operation.result == ZoomResult::Pending => {
+                next.notice = Some(DeskNotice::ZoomUncertain { app: operation.before.app });
+            }
+            Ok(Some(_)) | Err(_) => next.notice = Some(DeskNotice::RecordUnwritable),
+            Ok(None) => {}
+        }
         let refresh;
         {
             let mut current = self.shared.state.lock().expect("desk state");
@@ -1425,6 +1622,7 @@ impl DeskCore {
 
     /// 对应 C# `SettleDisplays` 里那段排进队列的善后逻辑。
     fn settle_displays(&mut self) {
+        self.flush_record_rewrite();
         if self.settling || (self.retiring.is_none() && !self.persist_owed) {
             return;
         }
@@ -1447,7 +1645,8 @@ impl DeskCore {
                     return;
                 }
             } else if !self.shared.displays.retire(retiring.id) {
-                // 下线可能发生在上次轮询超时后；让平台完成本地映射和持久归属销账。
+                // 下线可能发生在上次轮询超时后；让平台完成本地映射收尾。
+                // 尚未确认的驱动归属可以由平台保留，不应阻塞桌面会话重入。
                 return;
             }
             self.retiring = None;
@@ -1848,6 +2047,7 @@ impl DeskCore {
 
     /// 对应 C# `RefillAsync`：窗口被挪走 / 屏宽变了，重新铺满。
     fn refill(&mut self, reason: &str) {
+        if self.zoom_operation_blocked() { return; }
         let (Some(display), Some(placement)) = (self.display, self.placement.clone()) else {
             return;
         };
@@ -1878,6 +2078,15 @@ impl DeskCore {
 
     fn apply_requested_fit(&mut self) {
         let state = self.state();
+        if state.screen_phase == PhoneScreenPhase::Failed
+            && self.display.is_none()
+            && self.wanted()
+            && !state.dismissed
+        {
+            self.cancel_retry();
+            self.reconcile();
+            return;
+        }
         if state.screen_phase != PhoneScreenPhase::Ready {
             return;
         }
@@ -1893,9 +2102,19 @@ impl DeskCore {
 
     /// 对应 C# `ReshapeAsync`：换屏幕比例。
     fn reshape(&mut self, id: u32) {
+        if self.zoom_operation_blocked() { return; }
         let fit = self.fit();
         if !self.shared.displays.reshape(id, fit.clone()) {
             self.warn(format!("手机屏 #{id} 没能换成新比例（{fit}），下次加屏时按新的建"));
+            if !self.shared.displays.is_online(id) {
+                // Legacy Remove -> Add and its rollback can both fail. Retire the
+                // old binding before rebuilding, retaining any pending cleanup.
+                self.remove_screen();
+                self.set_state(self.state().with_screen_phase(PhoneScreenPhase::Failed));
+                if self.wanted() && !self.state().dismissed {
+                    self.schedule_retry();
+                }
+            }
             self.set_state(self.state().with_notice(Some(DeskNotice::ReshapeFailed)));
             return;
         }
@@ -1971,56 +2190,93 @@ impl DeskCore {
     }
 
     /// 对应 C# `Pull`：入队前的 Begin + PlaceAsync + 清 work。
-    pub(crate) fn pull_with(&mut self, window: WindowInfo, transfer: Option<PhoneRecord>) {
+    pub(crate) fn pull_with(&mut self, window: WindowInfo, transfer: Option<PhoneRecord>) -> bool {
         self.begin(DeskWork::with_label(DeskWorkKind::Placing, window.label()));
-        self.place(window, true, transfer);
+        let accepted = self.place(window, true, transfer);
         self.set_state(self.state().with_work(None));
+        accepted
     }
 
-    /// 对应 C# `PlaceAsync`：把窗口放上手机屏（`zoom = false` 用于"询问窗口"）。
-    ///
-    /// `transfer` 非空表示这个窗口是从别的屏转移过来的：沿用当时的原始还原坐标
-    /// （C# 的 `transferredRecord with { Window = window.Key }`）。
-    fn place(&mut self, window: WindowInfo, zoom: bool, transfer: Option<PhoneRecord>) {
-        let started = self.now();
-        let Some(id) = self.ready_display(&format!("放 {}", window.label())) else {
-            self.set_state(self.state().with_notice(Some(DeskNotice::ScreenNotReady)));
-            return;
-        };
-
-        if self.placement.as_ref().map(|placement| placement.window.key) == Some(window.key) {
-            // 同一个窗口再点一次 = "回到它"，不是重新铺。留一行日志，
-            // 否则真机上"点了没反应"分不清是这条还是根本没进来。
-            self.log(format!("{} 已经铺在手机上，回到它", window.label()));
-            self.reveal();
-            return;
+    /// Prepare before transferring a ledger; every failure still leaves its source durable.
+    fn prepare_placement(&mut self, window: &WindowInfo, transferring: bool) -> Option<WindowLook> {
+        if self.zoom_operation_blocked() {
+            return None;
         }
-        if self.reach(&window).is_none() {
-            return;
+        let guards = self.restore_guards();
+        if guards.blocked() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return None;
         }
+        if !transferring && guards.placed.contains(&window.key) {
+            return None;
+        }
+        self.reach(window)?;
 
-        if let Some(current) = self.placement.clone() {
-            if !self.return_to_original(&current, true) {
-                self.warn(format!(
-                    "{} 放不回去，先不换成 {}",
-                    current.window.label(),
-                    window.label()
-                ));
+        if let Some(current) = self.placement.clone()
+            && !self.return_to_original(&current, true)
+        {
+            self.warn(format!(
+                "{} 放不回去，先不换成 {}",
+                current.window.label(),
+                window.label()
+            ));
+            if self.state().notice != Some(DeskNotice::RecordUnwritable) {
                 let app = current.window.app_name.clone();
                 self.set_state(self.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })));
-                return;
             }
+            return None;
         }
 
-        if let Some(stuck) = self.put_back_leftover() {
+        let leftover = match self.put_back_leftover() {
+            Ok(leftover) => leftover,
+            Err(()) => return None,
+        };
+        if let Some(stuck) = leftover {
             self.warn(format!("{} 还放不回去，先不放 {}", stuck.label, window.label()));
-            let app = stuck.app.clone();
-            self.set_state(self.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })));
-            return;
+            if self.state().notice != Some(DeskNotice::RecordUnwritable) {
+                let app = stuck.app.clone();
+                self.set_state(self.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })));
+            }
+            return None;
         }
 
-        let Some(look) = self.reach(&window) else {
-            return;
+        self.reach(window)
+    }
+
+    /// 对应 C# `PlaceAsync`；跨屏转移沿用来源的原始还原坐标。
+    fn place(&mut self, window: WindowInfo, zoom: bool, transfer: Option<PhoneRecord>) -> bool {
+        self.place_prepared(window, zoom, transfer, None)
+    }
+
+    /// A prepared transfer already owns the on-disk debt and must not repay it as leftover.
+    fn place_prepared(
+        &mut self,
+        window: WindowInfo,
+        zoom: bool,
+        transfer: Option<PhoneRecord>,
+        prepared: Option<(u32, WindowLook)>,
+    ) -> bool {
+        let started = self.now();
+        if self.zoom_operation_blocked() {
+            return false;
+        }
+        let persisted = prepared.is_some();
+        let (id, look) = if let Some(prepared) = prepared {
+            prepared
+        } else {
+            let Some(id) = self.ready_display(&format!("放 {}", window.label())) else {
+                self.set_state(self.state().with_notice(Some(DeskNotice::ScreenNotReady)));
+                return false;
+            };
+            if self.placement.as_ref().map(|placement| placement.window.key) == Some(window.key) {
+                self.log(format!("{} 已经铺在手机上，回到它", window.label()));
+                self.reveal();
+                return true;
+            }
+            let Some(look) = self.prepare_placement(&window, transfer.is_some()) else {
+                return false;
+            };
+            (id, look)
         };
 
         let known: HashSet<WindowKey> = self
@@ -2032,11 +2288,23 @@ impl DeskCore {
             .filter(|key| *key != window.key)
             .collect();
 
+        // Returning the previous source may have settled its handoff in this action.
+        let guards = self.restore_guards();
         let (owed_index, record) = {
             let book = self.left_behind();
             // 跨屏转移时不查 left-behind：记录直接沿用来源屏的。
             let owed_index =
                 if transfer.is_some() { None } else { book.match_window(&window, look.frame) };
+            if owed_index.is_some_and(|index| guards.protects(&book.entries[index].record)) {
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                return false;
+            }
+            if owed_index.is_some_and(|index| {
+                let entry = &book.entries[index];
+                entry.scope() == Some(ZoomScope::App) && entry.record.zoom != 0
+            }) {
+                return false;
+            }
             let record = match transfer {
                 Some(mut record) => {
                     record.window = window.key;
@@ -2070,9 +2338,9 @@ impl DeskCore {
             known,
             asking: !zoom,
         };
-        if !self.write_record(&next.record) {
+        if !persisted && !self.write_record(&next.record) {
             self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
-            return;
+            return false;
         }
         if let Some(index) = owed_index {
             self.log(format!("{} 带着手机屏上的样子回来了，接着放", window.label()));
@@ -2099,7 +2367,7 @@ impl DeskCore {
             self.put_back(&mut record, true);
             self.match_width();
             self.set_state(self.state().with_notice(Some(notice)));
-            return;
+            return true;
         };
 
         self.set_placement(Some(next.clone()));
@@ -2117,11 +2385,12 @@ impl DeskCore {
             self.zoom_book().steps_for(window.app_id.as_deref(), self.default_zoom())
                 - next.record.zoom;
         if !zoom || steps == 0 {
-            return;
+            return true;
         }
         self.set_state(self.state().with_work(Some(DeskWork::new(DeskWorkKind::Zooming))));
         self.sleep(SETTLE_DELAY);
         self.change_zoom(steps);
+        true
     }
 
     fn put_back_placement(&mut self) {
@@ -2129,7 +2398,9 @@ impl DeskCore {
             return;
         };
         self.begin(DeskWork::new(DeskWorkKind::PuttingBack));
-        if !self.return_to_original(&placement, true) {
+        if !self.return_to_original(&placement, true)
+            && self.state().notice != Some(DeskNotice::RecordUnwritable)
+        {
             let app = placement.window.app_name;
             self.set_state(self.state().with_notice(Some(DeskNotice::WindowUnresponsive { app })));
         }
@@ -2152,15 +2423,22 @@ impl DeskCore {
     }
 
     /// 对应 C# `PutBackAsync`：撤字号、挪回原位、恢复最大化 / 最小化。
-    /// 返回 `Some(record)` 表示"窗口还在但放不回去"。
+    /// 返回 `Some(record)` 表示还原或记录结算未完成，保留重试。
     fn put_back(&mut self, record: &mut PhoneRecord, restoring_state: bool) -> Option<PhoneRecord> {
+        if self.zoom_operation_blocked() { return Some(record.clone()); }
+        if !self.flush_record_rewrite() || !self.reclaim_shared_source() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return Some(record.clone());
+        }
         let zoom = record.zoom;
         if zoom != 0 {
-            if !self.shared.windows.zoom(record.window, -zoom) {
-                return self.stuck_or_gone(record, "缩不回字号");
-            }
-            record.zoom = 0;
-            self.write_record(record);
+            // Reserve the repayment before changing the window, just as change_zoom
+            // records its intended delta first. A locked source must not repay twice.
+            let mut after = record.clone();
+            after.zoom = 0;
+            if !self.execute_zoom(ZoomSource::Screen(self.screen_id().into()), record, &after,
+                record.window, -zoom) { return Some(record.clone()); }
+            *record = after;
         }
         if self.shared.windows.move_window(record.window, record.original).is_none() {
             return self.stuck_or_gone(record, "挪不动");
@@ -2172,23 +2450,35 @@ impl DeskCore {
         } else if restoring_state && record.was_minimized {
             self.shared.windows.set_minimized(record.window, true);
         }
-        self.settle_record();
+        if !self.settle_record() {
+            return Some(record.clone());
+        }
         self.log(format!("{} 已放回原位", record.label));
         None
     }
 
     /// 对应 C# `PutBackLeftoverAsync`：上次崩溃 / 退出留下的还原记录。
-    fn put_back_leftover(&mut self) -> Option<PhoneRecord> {
-        if self.placement.is_some() {
-            return None;
+    fn put_back_leftover(&mut self) -> Result<Option<PhoneRecord>, ()> {
+        if self.zoom_operation_blocked() { return Err(()); }
+        if !self.flush_record_rewrite() {
+            return Err(());
         }
-        let Some(record) = self.shared.ledger.pending() else {
-            return None;
+        if self.placement.is_some() {
+            return Ok(None);
+        }
+        let record = match self.shared.ledger.try_pending() {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                self.error(format!("还原记录读取失败，保留原文件并暂不放置窗口：{error}"));
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                return Err(());
+            }
         };
         if !self.shared.windows.exists(record.window) {
             self.log(format!("还原记录里的 {} 已经不在了，等它回来再还", record.label));
-            self.leave_behind(&record);
-            return None;
+            let leftover = self.leave_behind(&record);
+            return if self.zoom_operation_blocked() { Err(()) } else { Ok(leftover) };
         }
         self.log(format!(
             "{} 上次没放回去，现在放回 {}",
@@ -2196,7 +2486,7 @@ impl DeskCore {
             record.original.short()
         ));
         let mut record = record;
-        self.put_back(&mut record, true)
+        Ok(self.put_back(&mut record, true))
     }
 
     /// 对应 C# `StuckOrGoneAsync`。
@@ -2209,20 +2499,69 @@ impl DeskCore {
             return Some(record.clone());
         }
         self.log(format!("{} 已经关了，等它回来再还", record.label));
-        self.leave_behind(record);
-        None
+        self.leave_behind(record)
     }
 
     /// 对应 C# `LeaveBehindAsync`：窗口已经不在了，把"回来的样子"记下来。
-    fn leave_behind(&mut self, record: &PhoneRecord) {
-        let mut record = record.clone();
+    fn leave_behind(&mut self, record: &PhoneRecord) -> Option<PhoneRecord> {
+        if self.zoom_operation_blocked() { return Some(record.clone()); }
+        if !self.flush_record_rewrite() {
+            return Some(record.clone());
+        }
+        let guards = self.restore_guards();
+        if guards.blocked() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return Some(record.clone());
+        }
+        let now = now_ms();
+        let saved = {
+            let mut book = self.left_behind();
+            let mut next = book.clone();
+            guards.prune(&mut next, now);
+            if !next.entries.iter().any(|entry| entry.record == *record) {
+                // Reserve a slot for the handoff even if old entries have future
+                // timestamps, so pruning cannot discard the sole destination.
+                if record.filled.is_some() && next.entries.len() == crate::left_behind::LIMIT {
+                    let Some(index) = next.entries.iter().position(|entry| !guards.protects(&entry.record)) else {
+                        self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                        return Some(record.clone());
+                    };
+                    next.entries.remove(index);
+                }
+                next.add(LeftBehindEntry::new(record.clone(), now));
+            }
+            match self.shared.books.left_behind_file.save(&next) {
+                Ok(()) => {
+                    *book = next;
+                    true
+                }
+                Err(error) => {
+                    self.error(format!("left-behind.json 保存失败，保留还原记录：{error}"));
+                    false
+                }
+            }
+        };
+        if !saved {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return Some(record.clone());
+        }
+        if !self.settle_record() {
+            return Some(record.clone());
+        }
+        // A failed handoff must not repay app-wide zoom and then retry from the
+        // unchanged source record. Transfer the debt before changing the app.
         if record.zoom != 0 {
             match zoom::scope_of(record.app_id.as_deref()) {
                 Some(ZoomScope::App) => {
                     if !self.shared.apps.is_running(record.window.pid)
-                        || self.repay_app_zoom(&record)
+                        || self.repay_app_zoom(record)
                     {
-                        record.zoom = 0;
+                        let mut book = self.left_behind();
+                        if let Some(entry) = book.entries.iter_mut().find(|entry| entry.record == *record) {
+                            entry.record.zoom = 0;
+                        }
+                        drop(book);
+                        self.save_left_behind();
                     }
                 }
                 Some(ZoomScope::Workspace) => {
@@ -2235,18 +2574,11 @@ impl DeskCore {
                 _ => {}
             }
         }
-        let now = now_ms();
-        {
-            let mut book = self.left_behind();
-            book.add(LeftBehindEntry::new(record, now));
-            book.prune(now);
-        }
-        self.save_left_behind();
-        self.settle_record();
+        None
     }
 
     /// 对应 C# `RepayAppZoomAsync`：把字号还给同一进程里的另一个窗口。
-    fn repay_app_zoom(&self, record: &PhoneRecord) -> bool {
+    fn repay_app_zoom(&mut self, record: &PhoneRecord) -> bool {
         let Some(other) = self
             .shared
             .windows
@@ -2256,11 +2588,14 @@ impl DeskCore {
         else {
             return false;
         };
-        self.shared.windows.zoom(other.key, -record.zoom)
+        let mut after = record.clone();
+        after.zoom = 0;
+        self.execute_zoom(ZoomSource::Shared, record, &after, other.key, -record.zoom)
     }
 
     /// 对应 C# `ChangeZoomAsync`。
     fn change_zoom(&mut self, delta: i32) -> bool {
+        if self.zoom_operation_blocked() { return false; }
         let Some(placement) = self.placement.clone() else {
             return false;
         };
@@ -2271,15 +2606,10 @@ impl DeskCore {
             return false;
         }
 
+        let original = placement.record.clone();
         placement.record.zoom = target;
-        if !self.write_record(&placement.record) {
-            placement.record.zoom = before;
-            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
-            return false;
-        }
-        if !self.shared.windows.zoom(placement.window.key, target - before) {
-            placement.record.zoom = before;
-            self.write_record(&placement.record);
+        if !self.execute_zoom(ZoomSource::Screen(self.screen_id().into()), &original,
+            &placement.record, placement.window.key, target - before) {
             let notice = self.unreachable(&placement.window);
             self.set_state(self.state().with_notice(Some(notice)));
             return false;
@@ -2314,10 +2644,120 @@ impl DeskCore {
         self.set_state(self.state().with_placed(placed).with_close_button(close_button));
     }
 
+    fn persist_zoom_record(&mut self, operation: &ZoomOperation, record: &PhoneRecord) -> bool {
+        match &operation.source {
+            ZoomSource::Screen(id) if id.eq_ignore_ascii_case(self.screen_id()) => {
+                if !matches!(self.shared.ledger.try_pending_strict(), Ok(Some(current)) if operation.matches(&current)) {
+                    return false;
+                }
+                if self.shared.ledger.record(record).is_err() { return false; }
+                self.publish_pending_record(Some(record));
+                true
+            }
+            ZoomSource::Screen(_) => false,
+            ZoomSource::Shared => {
+                if !self.shared.books.ensure_left_behind_loaded() { return false; }
+                let mut book = self.left_behind();
+                let Some(index) = book.entries.iter().position(|entry| operation.matches(&entry.record)) else {
+                    return false;
+                };
+                let mut next = book.clone();
+                next.entries[index].record = record.clone();
+                if self.shared.books.left_behind_file.save(&next).is_err() { return false; }
+                *book = next;
+                true
+            }
+        }
+    }
+
+    /// Known zero/full input can finish persistence; unknown relative input must never replay.
+    fn zoom_operation_blocked(&mut self) -> bool {
+        let loaded = self.shared.books.zoom_operation.try_load_strict();
+        match loaded {
+            Ok(None) => false,
+            Ok(Some(operation)) if operation.result != ZoomResult::Pending => {
+                let record = if operation.result == ZoomResult::Applied {
+                    &operation.after
+                } else { &operation.before };
+                if self.persist_zoom_record(&operation, record)
+                    && self.shared.books.zoom_operation.try_delete().is_ok()
+                {
+                    self.record_rewrite = None;
+                    if let Some(placement) = &mut self.placement {
+                        if operation.matches(&placement.record) { placement.record = record.clone(); }
+                    }
+                    self.shared.books.restore_guards.lock().expect("restore guards").zoom_pending = false;
+                    if matches!(self.state().notice, Some(DeskNotice::ZoomUncertain { .. } | DeskNotice::RecordUnwritable)) {
+                        self.set_state(self.state().with_notice(None));
+                    }
+                    self.set_placement(self.placement.clone());
+                    return false;
+                }
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                true
+            }
+            Ok(Some(operation)) => {
+                self.set_state(self.state().with_notice(Some(DeskNotice::ZoomUncertain {
+                    app: operation.before.app,
+                })));
+                true
+            }
+            Err(error) => {
+                self.error(format!("字号操作记录读取失败，暂停自动操作：{error}"));
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                true
+            }
+        }
+    }
+
+    fn execute_zoom(&mut self, source: ZoomSource, before: &PhoneRecord, after: &PhoneRecord,
+        target: WindowKey, steps: i32) -> bool
+    {
+        if self.zoom_operation_blocked() { return false; }
+        // Reclaim shared duplicates before recording an intent against the sole source.
+        if matches!(source, ZoomSource::Screen(_))
+            && (!self.flush_record_rewrite() || !self.reclaim_shared_source()) { return false; }
+        let mut operation = ZoomOperation { source, before: before.clone(), after: after.clone(),
+            target, result: ZoomResult::Pending };
+        if self.shared.books.zoom_operation.save(&operation).is_err() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return false;
+        }
+        self.shared.books.restore_guards.lock().expect("restore guards").zoom_pending = true;
+        if !self.persist_zoom_record(&operation, after) {
+            // Nothing was sent. Persist this fact before allowing any recovery retry.
+            operation.result = ZoomResult::NotApplied;
+            let _ = self.shared.books.zoom_operation.save(&operation);
+            self.zoom_operation_blocked();
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return false;
+        }
+        operation.result = match self.shared.windows.zoom_outcome(target, steps) {
+            ZoomOutcome::Applied => ZoomResult::Applied,
+            ZoomOutcome::NotApplied => ZoomResult::NotApplied,
+            ZoomOutcome::Uncertain => {
+                self.zoom_operation_blocked();
+                return false;
+            }
+        };
+        if self.shared.books.zoom_operation.save(&operation).is_err() {
+            self.zoom_operation_blocked();
+            return false;
+        }
+        let applied = operation.result == ZoomResult::Applied;
+        !self.zoom_operation_blocked() && applied
+    }
+
     /// 对应 C# `WriteRecord`。
-    fn write_record(&self, record: &PhoneRecord) -> bool {
+    fn write_record(&mut self, record: &PhoneRecord) -> bool {
+        if !self.flush_record_rewrite() || !self.reclaim_shared_source() {
+            return false;
+        }
         match self.shared.ledger.record(record) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.publish_pending_record(Some(record));
+                true
+            }
             Err(error) => {
                 self.error(format!("还原记录写不进去：{error}"));
                 false
@@ -2325,9 +2765,90 @@ impl DeskCore {
         }
     }
 
+    fn flush_record_rewrite(&mut self) -> bool {
+        let Some(record) = self.record_rewrite.as_ref() else {
+            return true;
+        };
+        if !self.reclaim_shared_source() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return false;
+        }
+        if let Err(error) = self.shared.ledger.record(record) {
+            self.error(format!("还原记录回滚尚未写回，保留原字号等待重试：{error}"));
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return false;
+        }
+        self.publish_pending_record(Some(record));
+        self.record_rewrite = None;
+        true
+    }
+
+    /// Reclaim a failed handoff before mutating the authoritative source debt.
+    /// The source remains intact if removing its shared duplicate cannot persist.
+    fn reclaim_shared_source(&self) -> bool {
+        if !self.shared.books.ensure_left_behind_loaded() {
+            self.error("共享还原记录读取失败，保留来源等待重试");
+            return false;
+        }
+        let record = match self.shared.ledger.try_pending() {
+            Ok(Some(record)) => record,
+            Ok(None) => return true,
+            Err(error) => {
+                self.error(format!("还原记录读取失败，暂不更新来源：{error}"));
+                return false;
+            }
+        };
+        let mut book = self.left_behind();
+        if !book.entries.iter().any(|entry| entry.record == record) {
+            return true;
+        }
+        let mut next = book.clone();
+        next.entries.retain(|entry| entry.record != record);
+        match self.shared.books.left_behind_file.save(&next) {
+            Ok(()) => { *book = next; true }
+            Err(error) => {
+                self.error(format!("共享还原记录无法撤回，保留来源等待重试：{error}"));
+                false
+            }
+        }
+    }
+
+    fn has_pending_record(&self) -> bool {
+        self.record_rewrite.is_some()
+            || self.shared.ledger.try_pending().map(|record| record.is_some()).unwrap_or(true)
+    }
+
+    fn restore_guards(&self) -> RestoreGuards {
+        self.shared.books.restore_guards.lock().expect("restore guards").clone()
+    }
+
+    fn publish_pending_record(&self, record: Option<&PhoneRecord>) {
+        let mut guards = self.shared.books.restore_guards.lock().expect("restore guards");
+        let id = DeskHub::key(self.screen_id());
+        guards.unreadable.remove(&id);
+        if let Some(record) = record {
+            guards.pending.insert(id, vec![record.clone()]);
+        } else {
+            guards.pending.remove(&id);
+        }
+    }
+
     /// 对应 C# `SettleRecord`。
-    fn settle_record(&self) {
-        self.shared.ledger.settle();
+    fn settle_record(&mut self) -> bool {
+        if !self.flush_record_rewrite() {
+            return false;
+        }
+        match self.shared.ledger.try_settle() {
+            Ok(()) => {
+                self.publish_pending_record(None);
+                true
+            }
+            Err(error) => {
+                self.error(format!("还原记录无法结算，保留记录等待重试：{error}"));
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                false
+            }
+        }
     }
 
     /// 对应 C# `SaveLeftBehind`。
@@ -2354,6 +2875,14 @@ impl DeskCore {
         self.verifying = true;
         if let Some(placement) = self.placement.clone() {
             if !self.shared.windows.exists(placement.window.key) {
+                if let Some(record) = self.leave_behind(&placement.record) {
+                    let mut pending = placement;
+                    pending.record = record;
+                    self.set_placement(Some(pending));
+                    self.set_state(self.state().with_list_visible(true));
+                    self.verifying = false;
+                    return;
+                }
                 self.log(format!(
                     "手机屏上的 {} 在外部关闭，回到 App 资源库",
                     placement.window.label()
@@ -2367,7 +2896,6 @@ impl DeskCore {
                     known,
                     until: self.now() + REPLACE_WAIT,
                 });
-                self.leave_behind(&placement.record);
                 self.match_width();
             } else if !self.state().list_visible
                 && !self.shared.windows.is_shown(placement.window.key)
@@ -2731,10 +3259,27 @@ impl DeskCore {
 
     /// 对应 C# `TakeBackReturnedAsync`。
     fn take_back_returned(&mut self) {
+        if self.zoom_operation_blocked() { return; }
+        if !self.flush_record_rewrite() {
+            return;
+        }
+        let pending = match self.shared.ledger.try_pending() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.error(format!("还原记录读取失败，暂不处理自动归还：{error}"));
+                self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+                return;
+            }
+        };
+        let guards = self.restore_guards();
+        if guards.blocked() {
+            self.set_state(self.state().with_notice(Some(DeskNotice::RecordUnwritable)));
+            return;
+        }
         let pruned = {
             let mut book = self.left_behind();
             let count = book.entries.len();
-            book.prune(now_ms());
+            guards.prune(&mut book, now_ms());
             book.entries.len() != count
         };
         // 原先只清内存，重启后过期项又会从磁盘加载；有效记录不重写。
@@ -2742,12 +3287,14 @@ impl DeskCore {
             self.save_left_behind();
         }
         self.repay_app_wide_zoom();
+        if self.zoom_operation_blocked() { return; }
 
-        let mut skip: HashSet<WindowKey> = HashSet::new();
+        let mut skip = guards.placed.clone();
+        skip.extend(guards.pending.values().flatten().map(|record| record.window));
         if let Some(placement) = &self.placement {
             skip.insert(placement.window.key);
         }
-        if let Some(pending) = self.shared.ledger.pending() {
+        if let Some(pending) = pending {
             skip.insert(pending.window);
         }
 
@@ -2785,6 +3332,9 @@ impl DeskCore {
                     let Some(index) = self.left_behind().match_window(&window, frame) else {
                         continue;
                     };
+                    if guards.protects(&self.left_behind().entries[index].record) {
+                        continue;
+                    }
                     self.take_back(index, window, frame);
                     return;
                 }
@@ -2794,6 +3344,10 @@ impl DeskCore {
 
     /// 对应 C# `TakeBackAsync`。
     fn take_back(&mut self, index: usize, window: WindowInfo, frame: Rect) {
+        if self.zoom_operation_blocked() { return; }
+        let entry = self.left_behind().entries[index].clone();
+        // App-wide debt must be repaid before returned_as drops its zoom value.
+        if entry.scope() == Some(ZoomScope::App) && entry.record.zoom != 0 { return; }
         if self.wanted() && self.placement.is_none() {
             if let Some(display) = self.display
                 && self
@@ -2808,13 +3362,12 @@ impl DeskCore {
             }
         }
 
-        let owed = self.left_behind().entries[index].returned_as(window.key);
+        let owed = entry.returned_as(window.key);
         if owed.zoom != 0 {
-            if !self.shared.windows.zoom(window.key, -owed.zoom) {
-                return;
-            }
-            self.left_behind().entries[index].record.zoom = 0;
-            self.save_left_behind();
+            let before = entry.record;
+            let mut after = before.clone();
+            after.zoom = 0;
+            if !self.execute_zoom(ZoomSource::Shared, &before, &after, window.key, -owed.zoom) { return; }
         }
         if self.shared.windows.move_window(window.key, owed.original).is_none() {
             return;
@@ -2830,11 +3383,15 @@ impl DeskCore {
 
     /// 对应 C# `RepayAppWideZoomAsync`。
     fn repay_app_wide_zoom(&mut self) {
+        let guards = self.restore_guards();
         let mut changed = false;
         let count = self.left_behind().entries.len();
         for index in 0..count {
+            if self.zoom_operation_blocked() { break; }
             let entry = self.left_behind().entries[index].clone();
-            if entry.scope() != Some(ZoomScope::App) || entry.record.zoom == 0 {
+            if entry.scope() != Some(ZoomScope::App) || entry.record.zoom == 0
+                || guards.protects(&entry.record)
+            {
                 continue;
             }
             if self.shared.apps.is_running(entry.record.window.pid)
@@ -2853,6 +3410,9 @@ impl DeskCore {
 
     /// 对应 C# `DetachPlacementForTransfer`：摘出还原记录、清摆放状态、回到资源库。
     pub(crate) fn detach_placement_for_transfer(&mut self) -> Option<PhoneRecord> {
+        if !self.flush_record_rewrite() {
+            return None;
+        }
         let placement = self.placement.as_ref()?;
         let transferred = placement.record.clone();
         self.set_placement(None);
@@ -3747,6 +4307,911 @@ mod tests {
         assert!(ledger.pending().is_none(), "还原后记录应删除");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_restore_record_blocks_placement_and_can_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let key = WindowKey::new(88, 0x200);
+        let original = Rect::new(50.0, 60.0, 800.0, 600.0);
+        let filled = Rect::new(2560.0, 0.0, 1080.0, 1800.0);
+        harness.windows.insert(key, filled);
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        let record = PhoneRecord {
+            window: key,
+            app: "Notepad".into(),
+            label: "old".into(),
+            original,
+            ..PhoneRecord::default()
+        };
+        ledger.record(&record).expect("source record");
+        let saved = std::fs::read(&path).expect("original bytes");
+        // Deny new readers while allowing an atomic writer to replace the file.
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x2 | 0x4)
+            .open(&path)
+            .expect("lock reads");
+        assert_eq!(std::fs::read(&path).unwrap_err().raw_os_error(), Some(32));
+
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.frame_of(key), Some(filled));
+
+        let next = WindowKey::new(123, 0x456);
+        let next_frame = Rect::new(1.0, 2.0, 600.0, 500.0);
+        harness.windows.insert(next, next_frame);
+        harness.desk.pull(window(next, Some("notepad.exe"), "next"));
+        harness.desk.idle();
+
+        drop(guard);
+        assert_eq!(std::fs::read(&path).expect("source after unlock"), saved,
+            "暂时无法读取不能被当作没有记录，新窗口不能覆盖源文件");
+        assert!(harness.desk.state().placed.is_none());
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+        assert_eq!(harness.windows.frame_of(next), Some(next_frame));
+
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+        assert!(ledger.pending().is_none());
+
+        harness.desk.pull(window(next, Some("notepad.exe"), "next"));
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().placed.as_ref().map(|placed| placed.window.key), Some(next));
+        assert_eq!(ledger.pending().expect("new record").window, next);
+    }
+
+    #[test]
+    fn failed_left_behind_handoff_preserves_the_source_record_and_can_retry() {
+        let harness = Harness::new();
+        let record = left_behind_entry(now_ms()).record;
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("source record");
+        let destination = harness.paths.left_behind_file();
+        std::fs::create_dir(&destination).expect("block destination");
+
+        harness.desk.recover();
+        harness.desk.idle();
+
+        assert_eq!(ledger.pending(), Some(record.clone()), "迁移失败不能删除唯一的磁盘记录");
+        assert_eq!(harness.desk.left_behind_len(), 0, "未保存的迁移不能进入内存账本");
+
+        std::fs::remove_dir(&destination).expect("unblock destination");
+        harness.desk.recover();
+        harness.desk.idle();
+
+        assert!(ledger.pending().is_none(), "目标写入成功后才结算源记录");
+        let saved = harness.desk.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+        assert_eq!(saved.entries.len(), 1, "重试不产生重复记录");
+        assert_eq!(saved.entries[0].record, record);
+    }
+
+    #[test]
+    fn handoff_replaces_an_expired_identical_target_and_survives_the_book_limit() {
+        for at_capacity in [false, true] {
+            let harness = Harness::new();
+            let now = now_ms();
+            let mut record = left_behind_entry(now).record;
+            record.window = WindowKey::new(456, 0x1);
+            let mut entries = vec![LeftBehindEntry::new(
+                record.clone(), now - crate::left_behind::KEEP_MILLIS - 60_000,
+            )];
+            if at_capacity {
+                for index in 0..crate::left_behind::LIMIT {
+                    let mut other = record.clone();
+                    other.window = WindowKey::new(index as i32 + 1, 0x2);
+                    // Future timestamps must not evict the record whose source is
+                    // about to be settled; the current handoff needs a durable slot.
+                    entries.push(LeftBehindEntry::new(other, now + 60_000));
+                }
+            }
+            seed_left_behind(&harness, entries);
+            let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+            ledger.record(&record).expect("source record");
+
+            harness.desk.recover();
+            harness.desk.idle();
+
+            assert!(ledger.pending().is_none());
+            let saved = harness.desk.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+            assert_eq!(saved.entries.iter().filter(|entry| entry.record == record).count(), 1);
+            assert_eq!(saved.entries.len(), if at_capacity { crate::left_behind::LIMIT } else { 1 });
+        }
+    }
+
+    #[test]
+    fn failed_left_behind_handoff_prevents_overwriting_the_pending_record() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let record = left_behind_entry(now_ms()).record;
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("source record");
+        std::fs::create_dir(harness.paths.left_behind_file()).expect("block destination");
+        let key = WindowKey::new(123, 0x456);
+        harness.windows.insert(key, Rect::new(1.0, 2.0, 600.0, 500.0));
+
+        harness.desk.pull(window(key, Some("notepad.exe"), "next"));
+        harness.desk.idle();
+
+        assert_eq!(ledger.pending(), Some(record), "新窗口不能覆盖未迁移的还原记录");
+        assert!(harness.desk.state().placed.is_none());
+    }
+
+    #[test]
+    fn failed_left_behind_handoff_does_not_repay_app_zoom_before_retry() {
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let other = WindowKey::new(456, 0x2);
+        harness.windows.insert_window(window(other, Some("zed.exe"), "other"), Rect::new(1.0, 2.0, 600.0, 500.0));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("source record");
+        let destination = harness.paths.left_behind_file();
+        std::fs::create_dir(&destination).expect("block destination");
+
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "迁移失败不能重复偿还字号");
+        assert_eq!(ledger.pending(), Some(record));
+
+        std::fs::remove_dir(&destination).expect("unblock destination");
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        let saved = harness.desk.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+        assert_eq!(saved.entries.len(), 1);
+        assert_eq!(saved.entries[0].record.zoom, 0);
+        assert!(ledger.pending().is_none());
+    }
+
+    #[test]
+    fn partial_leftover_zoom_blocks_placement_before_shared_source_is_consumed() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let returned = WindowKey::new(456, 0x2);
+        let frame = record.filled.unwrap();
+        harness.windows.insert_window(window(returned, Some("zed.exe"), "returned"), frame);
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).unwrap();
+        harness.windows.set_zoom_uncertain(true);
+
+        harness.desk.pull(window(returned, Some("zed.exe"), "returned"));
+        harness.desk.idle();
+
+        let books = &harness.desk.inner.shared.books;
+        let operation = books.zoom_operation.try_load_strict().unwrap().unwrap();
+        let saved = books.left_behind_file.try_load_strict().unwrap().unwrap();
+        assert_eq!(saved.entries.len(), 1, "the same placement call cannot consume a newly pending source");
+        assert!(operation.matches(&saved.entries[0].record));
+        assert!(ledger.pending().is_none(), "new placement cannot begin while leftover input is uncertain");
+        assert_eq!(harness.windows.frame_of(returned), Some(frame));
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.idle();
+        assert!(books.zoom_operation.try_load_strict().unwrap().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), -1);
+    }
+
+    #[test]
+    fn explicit_placement_keeps_unrepaid_app_zoom_source() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let returned = WindowKey::new(456, 0x2);
+        let frame = record.filled.unwrap();
+        harness.windows.insert_window(window(returned, Some("zed.exe"), "returned"), frame);
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(record.clone(), now_ms())]);
+        harness.apps.set_pids("zed.exe", vec![returned.pid]);
+        harness.windows.set_zoom_ok(false);
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        harness.desk.pull(window(returned, Some("zed.exe"), "returned"));
+        harness.desk.idle();
+
+        let saved = harness.desk.inner.shared.books.left_behind_file.try_load_strict().unwrap().unwrap();
+        assert_eq!(saved.entries.len(), 1, "explicit placement must retain the shared debt source");
+        assert_eq!(saved.entries[0].record, record, "returned_as cannot drop unrepaid app-wide debt");
+        assert!(harness.desk.state().placed.is_none());
+        assert_eq!(harness.windows.frame_of(returned), Some(frame));
+        harness.windows.set_zoom_ok(true);
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "normal return scanning retries the debt once");
+        harness.desk.pull(window(returned, Some("zed.exe"), "returned"));
+        harness.desk.idle();
+        assert_eq!(harness.desk.placed_window_key(), Some(returned), "placement can resume after app-wide repayment");
+    }
+
+    #[test]
+    fn failed_left_behind_handoff_keeps_vanished_placement_for_retry() {
+        let harness = Harness::new();
+        let key = WindowKey::new(70, 0x700);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 800.0, 600.0));
+        ready_screen(&harness);
+        harness.desk.pull(window(key, Some("notepad.exe"), "notes"));
+        harness.desk.idle();
+        harness.windows.remove(key);
+        let destination = harness.paths.left_behind_file();
+        std::fs::create_dir(&destination).expect("block destination");
+
+        harness.desk.verify_placement();
+        harness.desk.idle();
+        assert!(harness.paths.phone_record_file().is_file());
+        assert!(harness.desk.state().placed.is_some());
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+
+        std::fs::remove_dir(&destination).expect("unblock destination");
+        harness.desk.verify_placement();
+        harness.desk.idle();
+        assert!(harness.desk.state().placed.is_none());
+        assert!(!harness.paths.phone_record_file().exists());
+        assert_eq!(harness.desk.left_behind_len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deny_delete_does_not_duplicate_handoff_or_zoom() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let other = WindowKey::new(456, 0x2);
+        harness.windows.insert_window(
+            window(other, Some("zed.exe"), "other"),
+            Rect::new(1.0, 2.0, 600.0, 500.0),
+        );
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).expect("source record");
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .expect("deny delete");
+        assert_eq!(std::fs::remove_file(&path).unwrap_err().raw_os_error(), Some(32));
+
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.recover();
+        harness.desk.idle();
+
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "源记录未结算时不能偿还字号");
+        assert_eq!(ledger.pending(), Some(record.clone()));
+        let saved = harness.desk.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+        assert_eq!(saved.entries.len(), 1, "重试交接不能追加相同记录");
+        assert_eq!(saved.entries[0].record, record);
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+
+        drop(guard);
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "解锁后只偿还一次");
+        assert!(ledger.pending().is_none());
+        let saved = harness.desk.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+        assert_eq!(saved.entries.len(), 1);
+        assert_eq!(saved.entries[0].record.zoom, 0);
+    }
+
+    #[test]
+    fn reloaded_unsettled_handoff_blocks_automatic_consumption_until_recovered() {
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let other = WindowKey::new(456, 0x2);
+        harness.windows.insert_window(
+            window(other, Some("zed.exe"), "other"),
+            Rect::new(1.0, 2.0, 600.0, 500.0),
+        );
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("source record");
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(record.clone(), now_ms())]);
+        let reloaded = Desk::new(
+            harness.displays.clone(),
+            harness.windows.clone(),
+            harness.apps.clone(),
+            &harness.paths,
+            DeskOptions::default(),
+        );
+
+        reloaded.check_returns();
+        reloaded.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "重载后也必须先完成源交接");
+        assert_eq!(reloaded.left_behind_len(), 1);
+        assert_eq!(ledger.pending(), Some(record));
+
+        reloaded.recover();
+        reloaded.check_returns();
+        reloaded.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(ledger.pending().is_none());
+        let saved = reloaded.inner.shared.books.left_behind_file.load_or_quarantine().expect("saved");
+        assert_eq!(saved.entries.len(), 1);
+        assert_eq!(saved.entries[0].record.zoom, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_source_blocks_automatic_zoom_repayment() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.app_id = Some("zed.exe".into());
+        record.zoom = 2;
+        let other = WindowKey::new(456, 0x2);
+        harness.windows.insert_window(
+            window(other, Some("zed.exe"), "other"),
+            Rect::new(1.0, 2.0, 600.0, 500.0),
+        );
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(record, now_ms())]);
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&PhoneRecord::default()).expect("unrelated source record");
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x2 | 0x4)
+            .open(&path)
+            .expect("deny read");
+        assert_eq!(std::fs::read(&path).unwrap_err().raw_os_error(), Some(32));
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+
+        drop(guard);
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(ledger.pending().is_some(), "无关正常记录不能阻止自动偿还");
+    }
+
+    #[test]
+    fn unrelated_pending_record_does_not_block_returned_window() {
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.original = Rect::new(100.0, 200.0, 800.0, 600.0);
+        let returned = WindowKey::new(789, 0x2);
+        harness.windows.insert_window(
+            window(returned, Some("Code.exe"), "returned"),
+            record.filled.expect("filled"),
+        );
+        harness.apps.set_pids("Code.exe", vec![returned.pid]);
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(record.clone(), now_ms())]);
+        let pending = PhoneRecord { window: WindowKey::new(11, 0x3), ..PhoneRecord::default() };
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&pending).expect("unrelated source record");
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+
+        assert_eq!(harness.desk.left_behind_len(), 0);
+        assert_eq!(harness.windows.frame_of(returned), Some(record.original));
+        assert_eq!(ledger.pending(), Some(pending));
+    }
+
+    #[test]
+    fn unsettled_handoff_blocks_returned_window_until_recovered() {
+        let harness = Harness::new();
+        let mut record = left_behind_entry(now_ms()).record;
+        record.window = WindowKey::new(456, 0x1);
+        record.original = Rect::new(100.0, 200.0, 800.0, 600.0);
+        let filled = record.filled.expect("filled");
+        let returned = WindowKey::new(789, 0x2);
+        harness.windows.insert_window(window(returned, Some("Code.exe"), "returned"), filled);
+        harness.apps.set_pids("Code.exe", vec![returned.pid]);
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(record.clone(), now_ms())]);
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("unsettled source record");
+
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.desk.left_behind_len(), 1);
+        assert_eq!(harness.windows.frame_of(returned), Some(filled));
+        assert_eq!(ledger.pending(), Some(record.clone()));
+
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.desk.left_behind_len(), 0);
+        assert_eq!(harness.windows.frame_of(returned), Some(record.original));
+        assert!(ledger.pending().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deny_delete_keeps_a_restored_live_placement_pending() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let key = WindowKey::new(456, 0x1);
+        let original = Rect::new(100.0, 200.0, 800.0, 600.0);
+        harness.windows.insert(key, original);
+        harness.desk.pull(window(key, Some("notepad.exe"), "notes"));
+        harness.desk.idle();
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        assert_eq!(ledger.pending().expect("pending record").zoom, 0);
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .expect("deny delete");
+
+        harness.desk.put_back();
+        harness.desk.idle();
+        assert!(harness.desk.state().placed.is_some(), "删源失败不能清掉重试状态");
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+        assert!(ledger.pending().is_some());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+
+        drop(guard);
+        harness.desk.put_back();
+        harness.desk.idle();
+        assert!(harness.desk.state().placed.is_none());
+        assert!(ledger.pending().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deny_delete_does_not_repeat_live_window_zoom_repayment() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        let record = PhoneRecord {
+            window: WindowKey::new(456, 0x1),
+            original: Rect::new(100.0, 200.0, 800.0, 600.0),
+            zoom: 2,
+            ..PhoneRecord::default()
+        };
+        harness.windows.insert(record.window, Rect::new(1.0, 2.0, 540.0, 950.0));
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).expect("source record");
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .expect("deny delete and replacement");
+
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "记录不可更新时不得先偿还字号");
+        assert_eq!(ledger.pending(), Some(record.clone()));
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+
+        drop(guard);
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert_eq!(harness.windows.frame_of(record.window), Some(record.original));
+        assert!(ledger.pending().is_none());
+    }
+
+    #[test]
+    fn failed_zoom_repayment_preserves_the_debt_for_retry() {
+        let harness = Harness::new();
+        let record = PhoneRecord {
+            window: WindowKey::new(456, 0x1),
+            original: Rect::new(100.0, 200.0, 800.0, 600.0),
+            zoom: 2,
+            ..PhoneRecord::default()
+        };
+        harness.windows.insert(record.window, Rect::new(1.0, 2.0, 540.0, 950.0));
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(harness.paths.phone_record_file());
+        ledger.record(&record).expect("source record");
+        harness.windows.set_zoom_ok(false);
+
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending(), Some(record.clone()));
+
+        harness.windows.set_zoom_ok(true);
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2);
+        assert!(ledger.pending().is_none());
+    }
+
+    #[test]
+    fn zoom_intent_is_durable_before_native_input() {
+        let harness = Harness::new();
+        let record = PhoneRecord { window: WindowKey::new(456, 1), zoom: 2,
+            original: Rect::new(100.0, 200.0, 800.0, 600.0), ..PhoneRecord::default() };
+        harness.windows.insert(record.window, record.original);
+        RestoreRecordStore::new(harness.paths.phone_record_file()).record(&record).unwrap();
+        let path = harness.paths.data_dir().join("zoom-operation.json");
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_input = observed.clone();
+        harness.windows.on_zoom(move |_, _| {
+            observed_input.store(std::fs::read(&path).is_ok(), Ordering::SeqCst);
+        });
+        harness.desk.recover();
+        harness.desk.idle();
+        assert!(observed.load(Ordering::SeqCst), "native input needs a durable recovery intent");
+    }
+
+    #[test]
+    fn malformed_zoom_intent_blocks_recovery_without_quarantining() {
+        let harness = Harness::new();
+        let record = PhoneRecord { window: WindowKey::new(456, 1), zoom: 2,
+            original: Rect::new(100.0, 200.0, 800.0, 600.0), ..PhoneRecord::default() };
+        harness.windows.insert(record.window, record.original);
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        ledger.record(&record).unwrap();
+        let path = harness.paths.data_dir().join("zoom-operation.json");
+        std::fs::write(&path, b"{interrupted").unwrap();
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending(), Some(record));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{interrupted");
+    }
+
+    #[test]
+    fn partial_zoom_requires_explicit_manual_resolution_and_is_never_replayed() {
+        let harness = Harness::new();
+        let record = PhoneRecord { window: WindowKey::new(456, 1), app: "Editor".into(), zoom: 2,
+            original: Rect::new(100.0, 200.0, 800.0, 600.0), ..PhoneRecord::default() };
+        harness.windows.insert(record.window, record.original);
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        ledger.record(&record).unwrap();
+        harness.windows.set_zoom_uncertain(true);
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -1);
+        let journal = &harness.desk.inner.shared.books.zoom_operation;
+        assert_eq!(journal.try_load_strict().unwrap().unwrap().result, ZoomResult::Pending);
+        harness.windows.set_zoom_uncertain(false);
+        harness.desk.dismiss_notice();
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -1);
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::ZoomUncertain { app: "Editor".into() }));
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.idle();
+        assert!(journal.try_load_strict().unwrap().is_none());
+        assert_eq!(ledger.pending().unwrap().zoom, 0);
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -1, "confirmation sends no keys");
+        assert!(ledger.pending().is_none());
+    }
+
+    #[test]
+    fn uncertain_zoom_keeps_source_intact_during_refill() {
+        let harness = Harness::new();
+        let key = WindowKey::new(458, 0x458);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 800.0, 600.0));
+        ready_screen(&harness);
+        harness.desk.pull(window(key, Some("Code.exe"), "refill.rs"));
+        harness.desk.idle();
+        harness.windows.set_zoom_uncertain(true);
+        harness.desk.zoom(1);
+        harness.desk.idle();
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        let pending: PhoneRecord = ledger.pending().unwrap();
+        let journal = &harness.desk.inner.shared.books.zoom_operation;
+        assert_eq!(journal.try_load_strict().unwrap().unwrap().result, ZoomResult::Pending);
+
+        let moved = Rect::new(100.0, 100.0, 900.0, 700.0);
+        harness.windows.insert(key, moved);
+        harness.windows.set_min_logical_width(700.0);
+        let moves = harness.windows.move_calls().len();
+        harness.desk.inner.slot.run(|core: &mut DeskCore| core.refill("主动恢复布局"));
+        harness.desk.idle();
+
+        assert_eq!(ledger.pending(), Some(pending), "refill cannot overwrite a pending zoom source");
+        assert_eq!(harness.windows.move_calls().len(), moves);
+        assert_eq!(harness.windows.frame_of(key), Some(moved));
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.idle();
+        assert!(journal.try_load_strict().unwrap().is_none(), "the preserved source must still be confirmable");
+        assert_eq!(ledger.pending().unwrap().zoom, 0);
+        assert_eq!(harness.windows.zoom_delta_total(), 3, "confirmation cannot send more keys");
+    }
+
+    #[test]
+    fn uncertain_zoom_keeps_source_intact_during_reshape() {
+        let harness = Harness::new();
+        let key = WindowKey::new(459, 0x459);
+        harness.windows.insert(key, Rect::new(100.0, 100.0, 800.0, 600.0));
+        ready_screen(&harness);
+        harness.desk.pull(window(key, Some("Code.exe"), "reshape.rs"));
+        harness.desk.idle();
+        harness.windows.set_zoom_uncertain(true);
+        harness.desk.zoom(1);
+        harness.desk.idle();
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        let pending: PhoneRecord = ledger.pending().unwrap();
+        let journal = &harness.desk.inner.shared.books.zoom_operation;
+        let frame = harness.windows.frame_of(key);
+        let reshapes = harness.displays.reshape_calls();
+
+        let fit = ScreenFit::new(1.2);
+        harness.desk.set_fit(fit.clone());
+        harness.desk.idle();
+
+        assert_eq!(ledger.pending(), Some(pending), "layout changes cannot replace a pending zoom source");
+        assert_eq!(harness.displays.reshape_calls(), reshapes);
+        assert_eq!(harness.windows.frame_of(key), frame);
+        harness.windows.set_zoom_uncertain(false);
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.retry_resolution();
+        harness.desk.idle();
+        assert!(journal.try_load_strict().unwrap().is_none());
+        assert_eq!(harness.displays.fit_of(1001), Some(fit), "explicit Apply can resume after confirmation");
+        assert_eq!(harness.windows.zoom_delta_total(), 3, "confirmation and layout retry send no keys");
+    }
+
+    #[test]
+    fn crash_left_zoom_intent_preserves_source_and_refuses_mismatched_confirmation() {
+        let harness = Harness::new();
+        let before = PhoneRecord { window: WindowKey::new(456, 1), app: "Editor".into(), zoom: 2,
+            ..PhoneRecord::default() };
+        let mut after = before.clone();
+        after.zoom = 0;
+        let operation = ZoomOperation { source: ZoomSource::Screen(harness.desk.inner.shared.screen_id.clone()),
+            before: before.clone(), after, target: before.window, result: ZoomResult::Pending };
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        let unrelated = PhoneRecord { zoom: 4, ..before.clone() };
+        ledger.record(&unrelated).unwrap();
+        let journal = &harness.desk.inner.shared.books.zoom_operation;
+        journal.save(&operation).unwrap();
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending(), Some(unrelated));
+        assert!(journal.try_load_strict().unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_zoom_crash_confirmation_keeps_restore_geometry_and_other_debts() {
+        let harness = Harness::new();
+        let before = PhoneRecord { window: WindowKey::new(456, 1), app: "Editor".into(), zoom: 2,
+            original: Rect::new(10.0, 20.0, 800.0, 600.0), filled: Some(Rect::new(0.0, 0.0, 540.0, 950.0)),
+            ..PhoneRecord::default() };
+        let other = PhoneRecord { window: WindowKey::new(457, 2), zoom: 4, ..before.clone() };
+        seed_left_behind(&harness, vec![LeftBehindEntry::new(before.clone(), now_ms()), LeftBehindEntry::new(other.clone(), now_ms())]);
+        let mut after = before.clone(); after.zoom = 0;
+        let operation = ZoomOperation { source: ZoomSource::Shared, before: before.clone(), after: after.clone(),
+            target: WindowKey::new(456, 3), result: ZoomResult::Pending };
+        let books = &harness.desk.inner.shared.books;
+        books.zoom_operation.save(&operation).unwrap();
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.idle();
+        let saved = books.left_behind_file.try_load_strict().unwrap().unwrap();
+        assert_eq!(saved.entries[0].record, after);
+        assert_eq!(saved.entries[1].record, other);
+        assert!(books.zoom_operation.try_load_strict().unwrap().is_none());
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_zoom_confirmation_retries_after_locked_journal_delete_without_more_input() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let harness = Harness::new();
+        let before = PhoneRecord { window: WindowKey::new(456, 1), zoom: 2, ..PhoneRecord::default() };
+        let mut after = before.clone(); after.zoom = 0;
+        let operation = ZoomOperation { source: ZoomSource::Screen(harness.desk.inner.shared.screen_id.clone()),
+            before: before.clone(), after: after.clone(), target: before.window, result: ZoomResult::Pending };
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        ledger.record(&before).unwrap();
+        let journal = &harness.desk.inner.shared.books.zoom_operation;
+        journal.save(&operation).unwrap();
+        let guard = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(journal.path()).unwrap();
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(ledger.pending(), Some(after.clone()));
+        assert!(journal.try_load_strict().unwrap().is_some());
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        drop(guard);
+        harness.desk.confirm_manual_zoom_reset();
+        harness.desk.idle();
+        assert!(journal.try_load_strict().unwrap().is_none());
+        assert_eq!(ledger.pending(), Some(after));
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+    }
+
+    #[test]
+    fn zoom_intent_write_failure_prevents_native_input_and_preserves_debt() {
+        let harness = Harness::new();
+        let before = PhoneRecord { window: WindowKey::new(456, 1), zoom: 2, ..PhoneRecord::default() };
+        harness.windows.insert(before.window, Rect::new(1.0, 2.0, 800.0, 600.0));
+        let ledger = RestoreRecordStore::new(harness.paths.phone_record_file());
+        ledger.record(&before).unwrap();
+        std::fs::create_dir(harness.desk.inner.shared.books.zoom_operation.path()).unwrap();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending(), Some(before));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_zoom_and_locked_rollback_keep_recovery_debt() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        let record = PhoneRecord {
+            window: WindowKey::new(456, 0x1),
+            original: Rect::new(100.0, 200.0, 800.0, 600.0),
+            zoom: 2,
+            ..PhoneRecord::default()
+        };
+        harness.windows.insert(record.window, Rect::new(1.0, 2.0, 540.0, 950.0));
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).expect("source record");
+        let guard = Arc::new(Mutex::new(None));
+        let lock = Arc::clone(&guard);
+        harness.windows.on_zoom(move |_, _| {
+            let mut held = lock.lock().expect("lock slot");
+            if held.is_none() {
+                *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                    .open(&path).expect("lock after reservation"));
+            }
+        });
+        harness.windows.set_zoom_ok(false);
+
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.check_returns();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0);
+        assert_eq!(ledger.pending().expect("reserved source").zoom, 0);
+        assert_eq!(harness.desk.state().notice, Some(DeskNotice::RecordUnwritable));
+
+        guard.lock().expect("lock slot").take();
+        harness.windows.on_zoom(|_, _| {});
+        harness.windows.set_zoom_ok(true);
+        harness.desk.recover();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "回滚落盘失败不能丢掉待偿还字号");
+        assert!(ledger.pending().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_placement_flushes_failed_zoom_rollback_before_replacing_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let record = PhoneRecord {
+            window: WindowKey::new(456, 0x1),
+            original: Rect::new(100.0, 200.0, 800.0, 600.0),
+            zoom: 2,
+            ..PhoneRecord::default()
+        };
+        harness.windows.insert(record.window, Rect::new(1.0, 2.0, 540.0, 950.0));
+        let next = WindowKey::new(457, 0x2);
+        harness.windows.insert(next, Rect::new(30.0, 40.0, 800.0, 600.0));
+        let path = harness.paths.phone_record_file();
+        let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+        ledger.record(&record).expect("source record");
+        let guard = Arc::new(Mutex::new(None));
+        let lock = Arc::clone(&guard);
+        harness.windows.on_zoom(move |_, _| {
+            let mut held = lock.lock().expect("lock slot");
+            if held.is_none() {
+                *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                    .open(&path).expect("lock after reservation"));
+            }
+        });
+        harness.windows.set_zoom_ok(false);
+        harness.desk.recover();
+        harness.desk.pull(window(next, Some("Code.exe"), "next"));
+        harness.desk.idle();
+        assert!(harness.desk.state().placed.is_none(), "回滚记录未写回时不能换新窗口");
+        assert_eq!(ledger.pending().expect("reserved source").window, record.window);
+
+        guard.lock().expect("lock slot").take();
+        harness.windows.on_zoom(|_, _| {});
+        harness.windows.set_zoom_ok(true);
+        harness.desk.check_returns();
+        harness.desk.pull(window(next, Some("Code.exe"), "next"));
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), 0, "先偿还旧债 2 级，再放大新窗口 2 级");
+        assert_eq!(ledger.pending().expect("new source").window, next);
+        harness.desk.put_back();
+        harness.desk.recover();
+        harness.desk.idle();
+        assert_eq!(harness.windows.zoom_delta_total(), -2, "旧影子不能带进新窗口");
+        assert!(ledger.pending().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_zoom_rollback_cannot_overwrite_newer_debt_after_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for repayment in [false, true] {
+            let harness = Harness::new();
+            ready_screen(&harness);
+            let key = WindowKey::new(456, 0x1);
+            harness.windows.insert(key, Rect::new(100.0, 200.0, 800.0, 600.0));
+            harness.desk.pull(window(key, Some("Code.exe"), "live debt"));
+            harness.desk.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 2);
+            let path = harness.paths.phone_record_file();
+            let ledger = RestoreRecordStore::<PhoneRecord>::new(&path);
+            let guard = Arc::new(Mutex::new(None));
+            let lock = Arc::clone(&guard);
+            harness.windows.on_zoom(move |_, _| {
+                let mut held = lock.lock().expect("lock slot");
+                if held.is_none() {
+                    *held = Some(std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+                        .open(&path).expect("lock after reservation"));
+                }
+            });
+            harness.windows.set_zoom_ok(false);
+            if repayment {
+                harness.desk.put_back();
+            } else {
+                harness.desk.zoom(1);
+            }
+            harness.desk.idle();
+            assert_eq!(ledger.pending().expect("reserved debt").zoom, if repayment { 0 } else { 3 });
+            harness.desk.zoom(1);
+            harness.desk.check_returns();
+            harness.desk.put_back();
+            harness.desk.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 2, "锁内不得继续改变字号");
+            assert_eq!(harness.desk.state().placed.expect("retain live placement").zoom, 2);
+
+            guard.lock().expect("lock slot").take();
+            harness.windows.on_zoom(|_, _| {});
+            harness.windows.set_zoom_ok(true);
+            harness.desk.zoom(1);
+            harness.desk.idle();
+            assert_eq!(ledger.pending().expect("newer debt").zoom, 3);
+            harness.desk.put_back();
+            harness.desk.recover();
+            harness.desk.idle();
+            assert_eq!(harness.windows.zoom_delta_total(), 0);
+            assert!(ledger.pending().is_none(), "成功结算后不能复活旧回滚记录");
+        }
+    }
+
     #[test]
     fn pulling_the_placed_window_again_just_reveals_it() {
         let harness = Harness::new();
@@ -3846,6 +5311,49 @@ mod tests {
         harness.desk.idle();
         assert_eq!(harness.displays.reshape_calls(), 2);
         assert_eq!(harness.desk.state().notice, Some(DeskNotice::Reshaped));
+        assert_eq!(harness.displays.fit_of(1001), Some(requested));
+    }
+
+    #[test]
+    fn offline_reshape_failure_restores_window_and_rebuilds_screen() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        let key = WindowKey::new(991, 0xa991);
+        let original = Rect::new(100.0, 100.0, 800.0, 600.0);
+        harness.windows.insert(key, original);
+        harness.desk.pull(window(key, Some("Code.exe"), "offline reshape"));
+        harness.desk.idle();
+
+        harness.displays.bring_offline();
+        let requested = ScreenFit::new(1.2);
+        harness.desk.set_fit(requested.clone());
+        harness.desk.idle();
+
+        assert_eq!(harness.displays.retire_calls(), 1);
+        assert_eq!(harness.displays.create_calls(), 2);
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
+        assert_eq!(harness.displays.fit_of(1001), Some(requested));
+        assert!(harness.desk.state().placed.is_none());
+        assert_eq!(harness.windows.frame_of(key), Some(original));
+    }
+
+    #[test]
+    fn offline_reshape_failure_can_apply_again_after_backoff_exhaustion() {
+        let harness = Harness::new();
+        ready_screen(&harness);
+        harness.displays.bring_offline();
+        harness.displays.fail_creates(3);
+        let requested = ScreenFit::new(1.2);
+        harness.desk.set_fit(requested.clone());
+        harness.desk.idle();
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Failed);
+        assert!(harness.desk.state().display_id.is_none());
+        assert_eq!(harness.displays.create_calls(), 4);
+
+        harness.desk.retry_resolution();
+        harness.desk.idle();
+        assert_eq!(harness.displays.create_calls(), 5);
+        assert_eq!(harness.desk.state().screen_phase, PhoneScreenPhase::Ready);
         assert_eq!(harness.displays.fit_of(1001), Some(requested));
     }
 

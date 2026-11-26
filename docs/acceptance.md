@@ -160,7 +160,35 @@ pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe -Rel
 | 退出后再启动 | 日志里**不会**出现"清理残留手机屏"（没有残留）；如果出现过，说明上次没撤干净 |
 | 强杀进程后重启 | 日志 `已按归属记录清理残留手机屏：#N`，只清自己建的，不动 C# 版建的屏 |
 
-## 9. 正式更新源
+## 9. 手机面板跳转、虚拟屏消失与长稳
+
+以下为待执行场景。每个场景使用独立运行编号；稳定会话试验期间不得并行退出、重启或重建 Snug，以免把受控生命周期动作误判为面板故障。
+
+| 场景 | 操作 | 通过条件 |
+| --- | --- | --- |
+| 稳定会话中的面板导航 | UU 保持连接，手机屏已就绪；在同一 Snug 进程中交替打开普通 App、返回资源库、切换窗口并返回。每个动作单独打时间标记，至少往返 10 轮。 | 只发生预期的页面切换；Snug PID/start time、当前虚拟屏身份和分辨率保持不变。不得意外退回 App 页、落回主屏或重新启动 Snug。 |
+| 面板意外跳回 App 页 | 在上述稳定会话中复现用户报告的跳页。出现时停止操作并保留现场，不先退出、重连或重建。 | 故障本身记录为失败；取得跳转前后页面、屏幕可见状态和进程/显示证据后，才执行单独恢复步骤。不得把随后重启后的默认 App 页算作跳转复现或恢复通过。 |
+| 虚拟屏意外消失与恢复 | 稳定显示手机画面时持续观察 Windows 显示列表、Snug 诊断、owner 状态与 CCD。若屏幕消失，记录精确时间和手机画面；之后仅通过产品提供的重试/恢复入口，或在独立运行中重启 Snug，验证恢复。 | 稳定观察期间无未请求的撤屏；发生异常时，恢复后只出现一块本次 owner 拥有的屏，分辨率/刷新率符合配置，物理屏拓扑不变，手机画面及点击恢复。不得用全局 `RemoveAll` 清理。 |
+| 连续长稳 | 先确认进程、驱动、模式、DPI 与手机连接稳定，再连续运行至少 30 分钟。固定二进制、配置和 DPI；每 5 分钟检查画面、点击和滚动，资源采样间隔不超过 30 秒。 | 30 分钟内无意外进程重启、面板跳页、虚拟屏丢失、输入失效或未解释错误；手机检查点均通过。记录 private bytes、working set、CPU 的峰值和时间斜率。未预先定义资源上限或观测到持续增长时，只报告观测值，不据此宣称内存平台或长期稳定。 |
+| 正常退出和重启 | UU 会话中通过托盘正常退出；等待进程树结束并检查显示拓扑。随后用同一配置重新启动，单独观察建屏与手机画面恢复。 | 30 秒内本次进程树全部退出；只撤销本次 owner 的虚拟屏，物理屏快照与基线一致。重启后只建一块目标屏，无重复屏、孤儿屏或意外清理其他 owner 屏幕。 |
+| 强杀和残留恢复 | 使用隔离测试账户/目录启动单一 Snug 实例，记录其 PID/start time 与 owner 标识；仅强制结束该实例进程树。重新启动后观察残留清理及建屏。 | 强杀后确认整棵进程树退出；重启只清理归属记录能确认属于该实例的残留，再创建单一目标屏。物理拓扑恢复基线，无其他客户端屏幕被移除。若 owner 或进程身份不确定，必须停止自动清理并记录阻断。 |
+| 可控异常和恢复 | 在隔离实例中选一种可恢复故障（例如取消授权、临时断开驱动管道或请求一个被明确拒绝的模式），一次只注入一种；保留故障现场后，通过设置页的重试入口恢复。 | 故障期间显示具体失败状态，不报告建屏成功，不写入无归属模式；清理凭据保留。故障解除后重试成功且只存在一块目标屏，显示配置正确，异常前后物理拓扑一致。记录注入条件及移除条件。 |
+
+截至 2026-11-26 的现有证据只供定位，不替代以上通过条件：`target/expanded-acceptance-20261126/phone-interaction-20261126.json` 记录了用户报告的屏幕/面板消失，但该时段与受控退出及重建重叠，原因未确定；`target/expanded-acceptance-20261126/panel-disappearance-review.md` 要求在不退出、不重启的稳定会话中隔离复现。`target/expanded-acceptance-20261126/real-app-r4-safe/r4-r2-resource-review.md` 的 app soak 为 903 秒（175 个样本，约 15 分钟），private bytes 从约 173 MiB 增至 280 MiB，末 300 秒斜率为 +3.612 MiB/min。因此该次运行没有达到本节 30 分钟门槛，也没有证明内存平台或泄漏根因。同一轮 `runs/integrated-real-app-r4-r2/result.json` 记录 `normalExitPassed`、`crashRestartPassed`、`rollbackPassed`、`desktopPassed` 均为 true，属于该次受控应用退出/崩溃恢复证据；它不证明 Windows 重启持久性，也不替代本节新增的场景矩阵。
+
+每次按以下字段记录。完整 owner token 不得写入证据；`ownerFingerprint` 仅保存其不可逆摘要。
+
+| 字段组 | 记录字段 |
+| --- | --- |
+| 运行身份 | `runId`、`scenario`、`startedAtUtc`、`endedAtUtc`、时区、单调时钟起止值、`durationSeconds`、执行人、`result`（通过/失败/未复现/受阻） |
+| 软件与环境 | `appVersion`、`exeSha256`、`driverVersion`、`driverInf`、签名状态、`loadedModuleSha256`、Windows 版本、GPU、手机型号、UU 版本及连接方式 |
+| 显示与进程 | 模式、DPI、脱敏配置摘要、Snug PID/start time、进程树退出状态、`ownerFingerprint`、显示器标识、驱动 State、Windows 显示枚举及 CCD 前后快照 |
+| 操作与恢复 | 每个动作的时间戳、预期/实际页面和结果、异常注入/解除条件、恢复方式、`recoveryDurationSeconds`、错误信息、最终物理桌面核验 |
+| 稳定性与证据 | `sampleIntervalSeconds`、`sampleCount`、private bytes、working set、CPU 的峰值与时间斜率；日志、手机录像/截图、证据文件清单及各文件 SHA-256 |
+
+记录“未复现”时仍填写实际观察时长和有效样本数；缺少必要样本、设备/二进制身份或前后快照时标为受阻，不计作通过。
+
+## 10. 正式更新源
 
 | 操作 | 期望 |
 | --- | --- |
@@ -172,3 +200,15 @@ pwsh -File scripts\preflight.ps1 -Exe target\release-check\release\snug.exe -Rel
 - **多屏不是同时 4 块**：同一时刻只建当前选中那块（见 `multi-screen.md`）。
 - **计划任务/开机自启**不在本轮范围。
 - 托盘右键菜单的实际点选没法用脚本验证（DPI 虚拟化导致 SendInput 偏坐标），只能手点。
+
+## 2026-11-26 横屏建屏实机失败（合入阻断）
+
+北京时间 2026-11-26 17:00 左右，直接创建控制 `landscape-create-real-root-r1` 以失败状态结束。新驱动 `0.4.0.12`、`ROOT\\DISPLAY\\0001` / `oem72.inf` 已成功装入；测试 owner 创建目标后，驱动 mode list 为 `1920×1080@60`。事件日志中约 0.46 至 15.40 秒的 26 次桌面枚举快照都仍显示该虚拟桌面为 `1080×1920@60`。但验收 harness 随后报告 `Harness exited or timed out before target hold`，正式 CCD 样本数为 0；因此本次没有完成 CCD hold 验证，不能把这些桌面枚举读数描述为 CCD 采样通过或失败。应用与手机交互均未启动（`applicationStarted: false`）。
+
+失败前的诊断快照 `diagnostic-0002-after-create.json` 显示目标时序已为 `1920×1080@60`，CCD source mode 及桌面 bounds 仍为 `1080×1920`，路径旋转为 identity。尺寸不一致不是旋转造成；现有证据将阻塞收敛定位在 Windows 源模式/桌面未采用目标时序，具体驱动或系统原因仍未确定。
+
+失败结果见 `target/expanded-acceptance-20261126/landscape-create-control-r1/runs/landscape-create-real-root-r1/result.json` 与 `runs/landscape-create-real-root-r1/mode-1920-1080-60/events.jsonl`。owner 清理成功，候选驱动回滚到 `0.4.0.1` / `oem17.inf`，进程树退出，原有物理桌面精确核验通过。以上恢复通过不改变横屏功能验收失败的结论。
+
+当前 V2 owned 路径为避免可复用显示身份上的竞态，只进行驱动 owner 保护的模式表更新并等待 Windows 实际模式读回，不执行 GDI/CCD 原生回退。独立代码审查确认，将原生桌面写入简单插回会留下 owner 检查与系统写入之间的竞态；现有 Windows 写入接口不接受 Snug owner 条件。结合本次多次桌面读数仍为竖屏以及 harness 未完成正式 hold，横屏应用级分辨率创建/应用仍未验收通过；不能把早先仅覆盖标准与 phone 模式的 v12 Smoke 通过记录外推到此场景。
+
+**当前合入判定：阻断。**须先有可证明不会写入物理屏或其他 owner 显示器的桌面模式切换方案，并完成并发/身份复用回归和本机横屏实测；不得仅以扩大超时或恢复无保护的原生写入关闭失败。稳定 UU 导航、异常恢复及 30 分钟手机交互场景仍按第 9 节待验收；本次实机未启动应用且当前电脑没有可操作的 UU 窗口，不能记作通过。

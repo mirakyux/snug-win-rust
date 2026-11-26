@@ -134,6 +134,7 @@ pub enum SettingsAction {
     InstallDriver,
     RetryDriverConnection,
     RetryResolution(String),
+    RetrySaveConfig,
     /// 打开 GitHub 仓库主页（C# `OnOpenRepo`）。
     OpenRepository,
     /// 以管理员身份重启（C# `OnRestartElevated`）。
@@ -501,6 +502,7 @@ pub struct SettingsWindow {
     baseline: Option<AppConfig>,
     /// 最近一次改动的提示，换页/关窗后清空。
     last_hint: Option<&'static str>,
+    config_save_error: Option<String>,
     new_screen_kind: snug_core::DeviceKind,
     new_screen_name: String,
     new_screen_resolution: ResolutionDraft,
@@ -533,6 +535,7 @@ impl SettingsWindow {
             actions: Vec::new(),
             baseline: None,
             last_hint: None,
+            config_save_error: None,
             new_screen_kind: snug_core::DeviceKind::Phone,
             new_screen_name: String::new(),
             new_screen_resolution: ResolutionDraft::from_resolution(ScreenResolution::DEFAULT),
@@ -597,6 +600,7 @@ impl SettingsWindow {
     pub fn sync_runtime_from(&mut self, source: &Self) {
         self.status = source.status.clone();
         self.update = source.update.clone();
+        self.config_save_error.clone_from(&source.config_save_error);
         if self.needs_logs() && self.logs != source.logs {
             self.logs.clone_from(&source.logs);
         }
@@ -637,6 +641,10 @@ impl SettingsWindow {
 
     pub fn set_update_state(&mut self, update: UpdateUiState) {
         self.update = update;
+    }
+
+    pub fn set_config_save_error(&mut self, error: Option<String>) {
+        self.config_save_error = error;
     }
 
     pub fn set_logs(&mut self, logs: impl Into<String>) {
@@ -818,13 +826,33 @@ impl SettingsWindow {
     /// 一页的公共收尾：影响提示 + 自动化都关掉的提醒。
     fn page_footer(&mut self, ui: &mut egui::Ui, cfg: &AppConfig) {
         let palette = crate::theme::palette(ui.visuals().dark_mode);
-        if let Some(hint) = self.last_hint {
+        if self.config_save_error.is_some() {
+            self.show_config_save_error(ui);
+        } else if let Some(hint) = self.last_hint {
             ui.add_space(10.0);
             ui.label(egui::RichText::new(hint).small().color(palette.accent));
         }
         if let Some(hint) = self.status.autostart.and_then(|enabled| both_off_hint(cfg, enabled)) {
             ui.add_space(6.0);
             ui.label(egui::RichText::new(hint).small().color(palette.warn));
+        }
+    }
+
+    fn show_config_save_error(&mut self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.config_save_error {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "配置保存失败：{error}。当前设置尚未保存，退出或重启后可能丢失。"
+                    ))
+                    .color(ui.visuals().error_fg_color),
+                )
+                .wrap(),
+            );
+            if ui.button("重试保存").clicked() {
+                self.actions.push(SettingsAction::RetrySaveConfig);
+            }
         }
     }
 
@@ -1635,6 +1663,108 @@ impl SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn config_save_errors_survive_close_and_sync_between_windows() {
+        let mut source = SettingsWindow::new();
+        let mut other = SettingsWindow::new();
+        source.set_config_save_error(Some("磁盘只读".into()));
+        other.sync_runtime_from(&source);
+        other.close();
+        other.open();
+        assert_eq!(other.config_save_error.as_deref(), Some("磁盘只读"));
+        source.set_config_save_error(None);
+        other.sync_runtime_from(&source);
+        assert!(other.config_save_error.is_none());
+    }
+
+    #[test]
+    fn config_save_error_retry_is_visible_on_both_surfaces_and_preserves_drafts() {
+        for desktop in [false, true] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx, false);
+            let mut window = SettingsWindow::new();
+            window.select_tab(SettingsTab::Home);
+            window.open();
+            window.last_hint = change_hint(ChangeImpact::Screens);
+            window.set_config_save_error(Some("磁盘只读".into()));
+            let mut cfg = standard().sanitize();
+            let before = cfg.clone();
+            let id = cfg.effective_screens()[0].id.clone();
+            window.resolution_drafts.insert(
+                id.clone(),
+                ResolutionDraft::from_resolution(ScreenResolution {
+                    width: 800,
+                    height: 600,
+                }),
+            );
+            let mut frame = |window: &mut SettingsWindow, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(if desktop { 720.0 } else { 400.0 }, 1800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        if desktop {
+                            window.show_desktop(ctx, &mut cfg);
+                        } else {
+                            window.show(ctx, &mut cfg);
+                        }
+                    },
+                )
+            };
+            let mut output = frame(&mut window, Vec::new());
+            for _ in 0..2 {
+                output = frame(&mut window, Vec::new());
+            }
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text().contains("配置保存失败：磁盘只读"))));
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text().contains("设置已保存"))));
+            let target = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "重试保存" => {
+                        Some(drawn_bounds(&shape.shape).center())
+                    }
+                    _ => None,
+                })
+                .expect("save retry must be visible");
+            for pressed in [true, false] {
+                frame(
+                    &mut window,
+                    vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(window.take_actions(), vec![SettingsAction::RetrySaveConfig]);
+            window.set_config_save_error(None);
+            let output = frame(&mut window, Vec::new());
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text().contains("配置保存失败")
+                    || text.galley.text() == "重试保存")));
+            assert_eq!(cfg, before);
+            assert_eq!(
+                window.resolution_drafts[&id].resolution(),
+                Some(ScreenResolution {
+                    width: 800,
+                    height: 600
+                })
+            );
+        }
+    }
 
     #[test]
     fn committed_screen_edits_refresh_the_other_views_draft() {

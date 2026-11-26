@@ -1,7 +1,8 @@
 //! virtual-display-rs 的命名管道客户端，移植自 C# 版 `SnugWin.Windows.Display.VirtualDisplayIpcClient`。
 //!
 //! 两套协议并存：
-//! - **v2（master）**：双向管道，JSON 帧以 `0x04`(EOT) 结尾，指令为 `Notify` / `Remove` / `RemoveAll` / `State`；
+//! - **v2**：双向管道，JSON 帧以 `0x04`(EOT) 结尾；手机屏以 owner token
+//!   预留、创建、更新和删除；没有 token 的旧版替换/删除拒绝发送，查询使用 `State`；
 //! - **v0.3.x**：驱动只开 `PIPE_ACCESS_INBOUND`，所以客户端只能写（`PipeDirection.Out`），
 //!   指令为 `Add` / `Remove` / `RemoveAll`，并且不带帧尾。
 //!
@@ -10,15 +11,32 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use windows::Win32::Foundation::{ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, ReadFile, WriteFile};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 pub const DEFAULT_PIPE_NAME: &str = "virtualdisplaydriver";
 /// v2 帧结束符。
 pub const EOT: u8 = 0x04;
+const PIPE_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const V2_OWNER_REQUIRED: &str =
+    "V2 虚拟屏的修改和移除需要归属令牌；旧版归属记录需手动核对处理";
+
+// Driver contract: 16 monitors, 256 modes each, dimensions <= 16384, four
+// refresh rates <= 240, and 256 UTF-8 bytes per name. JSON may escape each name
+// byte as six bytes (\u0001). Include commas plus 1 KiB for the State/Changed
+// or broker Reply envelope; this bounds each response, not all queued events.
+const MAX_MODE_JSON_BYTES: usize =
+    br#"{"width":16384,"height":16384,"refresh_rates":[120,144,165,240]}"#.len();
+const MAX_MONITOR_JSON_BYTES: usize = br#"{"id":15,"name":"","enabled":false,"modes":[]}"#.len()
+    + 256 * 6 + 256 * MAX_MODE_JSON_BYTES + 255;
+pub(crate) const MAX_STATE_RESPONSE_BYTES: usize = 16 * (MAX_MONITOR_JSON_BYTES + 1) + 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VddMode {
@@ -58,6 +76,11 @@ pub fn serialize_notify(monitors: &[VddMonitor]) -> String {
         notify: &'a [VddMonitor],
     }
     serde_json::to_string(&Frame { notify: monitors }).unwrap_or_else(|_| "{\"Notify\":[]}".into())
+}
+
+/// Atomic, acknowledged V2 extension. Never fall back to the destructive Notify command.
+fn serialize_update(monitors: &[VddMonitor], replacing: bool) -> String {
+    serde_json::json!({ "SnugUpdate": { "monitors": monitors, "replacing": replacing } }).to_string()
 }
 
 /// `{"Add":[...]}`（v0.3.x 协议，刷新率只取第一个，缺省 60）。
@@ -208,9 +231,29 @@ pub enum VddError {
     },
     #[error("管道读写失败：{0}")]
     Io(#[from] std::io::Error),
+    /// A mutation was sent, but its acknowledgement could not establish the result.
+    /// This is neither confirmation of ownership nor permission to replay the write.
+    #[error("驱动写入结果未知，未收到可信确认：{source}")]
+    OutcomeUnknown {
+        #[source]
+        source: std::io::Error,
+    },
     /// 内部不变量被破坏（公开方法都会先 `ensure()`，正常路径不会出现）。
     #[error("管道尚未连接")]
     NotConnected,
+}
+
+impl VddError {
+    pub(crate) fn from_broker(error: std::io::Error) -> Self {
+        if error.get_ref().is_some_and(|source| {
+            matches!(source.downcast_ref::<Self>(), Some(Self::OutcomeUnknown { .. }))
+        }) {
+            // Only the broker's explicit marker survives this conversion as an unknown outcome.
+            *error.into_inner().unwrap().downcast::<Self>().unwrap()
+        } else {
+            Self::Io(error)
+        }
+    }
 }
 
 /// 协议探测结果。
@@ -220,6 +263,17 @@ pub enum VddProtocol {
     V2,
     /// 只写、无帧尾（v0.3.x）。
     Legacy,
+}
+
+/// How much the driver protocol can confirm after a Remove request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoveDisposition {
+    /// The driver confirmed the requested removal; desktop detachment can lag.
+    Confirmed,
+    /// The supplied token owns none of the requested IDs; foreign screens stay intact.
+    NotOwned,
+    /// The legacy write succeeded, but driver state cannot be queried.
+    SubmittedOnly,
 }
 
 struct Connection {
@@ -249,19 +303,92 @@ trait PipeHandle: Read + Write + Send {
 
 struct PipeFile(std::fs::File);
 
+impl PipeFile {
+    fn transfer(
+        &self,
+        deadline: Instant,
+        start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> windows::core::Result<()>,
+    ) -> std::io::Result<usize> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "驱动管道 I/O 超时"));
+        }
+        let event = unsafe { CreateEventW(None, true, false, None) }.map_err(pipe_io_error)?;
+        let _event = unsafe { OwnedHandle::from_raw_handle(event.0) };
+        let mut overlapped = OVERLAPPED { hEvent: event, ..Default::default() };
+        let pipe = HANDLE(self.0.as_raw_handle());
+        match start(pipe, &mut overlapped) {
+            Ok(()) => {}
+            Err(error) if error.code() == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let milliseconds = remaining.as_millis().max(1).min(u128::from(u32::MAX - 1)) as u32;
+                let wait = unsafe { WaitForSingleObject(event, milliseconds) };
+                if wait != WAIT_OBJECT_0 {
+                    let error = if wait == WAIT_TIMEOUT {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "驱动管道 I/O 超时")
+                    } else {
+                        std::io::Error::last_os_error()
+                    };
+                    // Cancellation is asynchronous. Drain even an ERROR_NOT_FOUND race before
+                    // the buffer, OVERLAPPED or event can leave this scope.
+                    unsafe {
+                        let _ = CancelIoEx(pipe, Some(&overlapped));
+                        let mut transferred = 0;
+                        let _ = GetOverlappedResult(pipe, &overlapped, &mut transferred, true);
+                    }
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(pipe_io_error(error)),
+        }
+        let mut transferred = 0;
+        unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, false) }
+            .map_err(pipe_io_error)?;
+        Ok(transferred as usize)
+    }
+
+    fn write_until(&self, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
+        let length = buf.len().min(u32::MAX as usize);
+        self.transfer(deadline, |pipe, overlapped| unsafe {
+            WriteFile(pipe, Some(&buf[..length]), None, Some(overlapped))
+        })
+    }
+}
+
+fn pipe_io_error(error: windows::core::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error((error.code().0 as u32 & 0xffff) as i32)
+}
+
 impl Read for PipeFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        if buf.is_empty() { return Ok(0); }
+        let length = buf.len().min(u32::MAX as usize);
+        self.transfer(Instant::now() + PIPE_IO_TIMEOUT, |pipe, overlapped| unsafe {
+            ReadFile(pipe, Some(&mut buf[..length]), None, Some(overlapped))
+        })
     }
 }
 
 impl Write for PipeFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        if buf.is_empty() { return Ok(0); }
+        self.write_until(buf, Instant::now() + PIPE_IO_TIMEOUT)
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        let deadline = Instant::now() + PIPE_IO_TIMEOUT;
+        while !buf.is_empty() {
+            let written = self.write_until(buf, deadline)?;
+            if written == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "驱动管道未写入数据"));
+            }
+            buf = &buf[written..];
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        // Named pipes are unbuffered here. FlushFileBuffers could wait for the peer forever.
+        Ok(())
     }
 }
 
@@ -391,7 +518,7 @@ impl VddClient {
         self.protocol().ok_or(VddError::NotConnected)
     }
 
-    /// Create monitors while preserving existing V2 entries, including disabled monitors.
+    /// Create monitors atomically without replacing existing V2 entries, including disabled ones.
     pub fn notify(&mut self, monitors: &[VddMonitor]) -> Result<(), VddError> {
         if self.needs_broker() {
             return self
@@ -402,11 +529,138 @@ impl VddClient {
         }
         match self.ensure()? {
             VddProtocol::V2 => self.update_v2_monitors(monitors, false),
-            VddProtocol::Legacy => self.write_legacy_retry(&serialize_legacy_add(monitors)),
+            VddProtocol::Legacy => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy driver mutations are disabled without an ownership token",
+            ).into()),
         }
     }
 
-    /// 先删再加（v0.3.x 需要；v2 直接用 Notify 覆盖）。
+    /// Reserve a vacant V2 ID for a persisted owner token without changing topology.
+    /// Legacy drivers return false without sending a reservation command.
+    pub fn reserve_owned(&mut self, id: u32, owner: &str) -> Result<bool, VddError> {
+        if self.needs_broker() {
+            let reply = self.broker(crate::vdd_broker::Request::ReserveOwned {
+                id, owner: owner.into(),
+            })?;
+            return reply.legacy.map(|legacy| !legacy).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "VDD broker 未返回预留协议").into()
+            });
+        }
+        if self.ensure()? == VddProtocol::Legacy {
+            return Ok(false);
+        }
+        let json = serde_json::json!({ "SnugReserve": { "owner": owner, "id": id } }).to_string();
+        self.owned_command("SnugReserve", owner, &json, false)?;
+        Ok(true)
+    }
+
+    /// Check current ownership without renewing a reservation or changing topology.
+    /// Tokenless bindings are only compatible with the legacy protocol.
+    pub fn verify_owner(&mut self, id: u32, owner: Option<&str>) -> Result<(), VddError> {
+        if owner.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Tokenless display ownership cannot authorize mutations",
+            ).into());
+        }
+        if self.needs_broker() {
+            let reply = self.broker(crate::vdd_broker::Request::VerifyOwner {
+                id, owner: owner.map(str::to_owned),
+            })?;
+            if reply.legacy == Some(owner.is_none()) {
+                return Ok(());
+            }
+            self.broker_protocol = None;
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "驱动权限代理未确认绑定对应的归属协议").into());
+        }
+        let owner = owner.expect("tokenless ownership is rejected above");
+        self.require_owned_protocol()?;
+        let json = serde_json::json!({ "SnugCheck": { "owner": owner, "id": id } }).to_string();
+        self.owned_command("SnugCheck", owner, &json, false)
+    }
+
+    /// Create only through a matching V2 reservation; never downgrade to an unguarded Add.
+    pub fn create_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<(), VddError> {
+        if self.needs_broker() {
+            return self.broker(crate::vdd_broker::Request::CreateOwned {
+                monitors: monitors.to_vec(), owner: owner.into(),
+            }).map(|_| ());
+        }
+        self.require_owned_protocol()?;
+        let json = serde_json::json!({ "SnugCreate": { "owner": owner, "monitors": monitors } }).to_string();
+        self.owned_command("SnugCreate", owner, &json, true)
+    }
+
+    /// Update modes without dropping the V2 ownership reservation.
+    pub fn replace_owned(&mut self, monitors: &[VddMonitor], owner: &str) -> Result<(), VddError> {
+        if self.needs_broker() {
+            return self.broker(crate::vdd_broker::Request::ReplaceOwned {
+                monitors: monitors.to_vec(), owner: owner.into(),
+            }).map(|_| ());
+        }
+        self.require_owned_protocol()?;
+        let json = serde_json::json!({ "SnugReplace": { "owner": owner, "monitors": monitors } }).to_string();
+        self.owned_command("SnugReplace", owner, &json, true)
+    }
+
+    /// Idempotently release only displays and reservations matching the persisted token.
+    pub fn remove_owned(&mut self, ids: &[u32], owner: &str) -> Result<RemoveDisposition, VddError> {
+        if self.needs_broker() {
+            let reply = self.broker(crate::vdd_broker::Request::RemoveOwned {
+                ids: ids.to_vec(), owner: owner.into(),
+            })?;
+            return remove_disposition(reply);
+        }
+        self.require_owned_protocol()?;
+        let json = serde_json::json!({ "SnugRelease": { "owner": owner, "ids": ids } }).to_string();
+        match self.owned_command("SnugRelease", owner, &json, true) {
+            Ok(()) => Ok(RemoveDisposition::Confirmed),
+            // Transport and untrusted replies are OutcomeUnknown; only a matching
+            // owner acknowledgement can produce this ordinary NotFound error.
+            Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(RemoveDisposition::NotOwned)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_owned_protocol(&mut self) -> Result<(), VddError> {
+        if self.ensure()? == VddProtocol::V2 { Ok(()) } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "驱动协议已变化，无法安全操作带归属凭据的虚拟屏").into())
+        }
+    }
+
+    fn owned_command(&mut self, command: &str, owner: &str, json: &str, mutating: bool) -> Result<(), VddError> {
+        use std::io::{Error, ErrorKind};
+        let reply = self.write_framed(json).and_then(|()| self.read_v2_reply(command));
+        let result = match reply {
+            Ok(reply) if reply.get("owner").and_then(serde_json::Value::as_str) == Some(owner) => {
+                match reply.get("result").and_then(serde_json::Value::as_str) {
+                    Some("Applied") => return Ok(()),
+                    Some("AlreadyExists") => return Err(Error::new(ErrorKind::AlreadyExists, "虚拟屏编号已被占用").into()),
+                    Some("NotFound") => return Err(Error::new(ErrorKind::NotFound, "虚拟屏预留凭据不存在").into()),
+                    Some("InvalidData") => return Err(Error::new(ErrorKind::InvalidInput, "驱动拒绝了无效的归属操作").into()),
+                    Some("ApplyFailed") => return Err(Error::other("驱动未能应用虚拟屏操作").into()),
+                    _ => Error::new(ErrorKind::InvalidData, "无效的驱动归属操作应答"),
+                }
+            }
+            Ok(_) => Error::new(ErrorKind::InvalidData, "驱动应答的归属凭据不匹配"),
+            Err(VddError::Io(source)) => source,
+            Err(error) => Error::other(error),
+        };
+        self.connection = None;
+        if mutating {
+            Err(VddError::OutcomeUnknown { source: result })
+        } else {
+            Err(Error::new(ErrorKind::Unsupported,
+                format!("驱动未确认归属操作，需要支持 {command} 的 V2 驱动：{result}")).into())
+        }
+    }
+
+    /// Legacy 先删再加；V2 必须通过 `replace_owned` 验证归属，不能沿用旧编号。
     pub fn replace_legacy(
         &mut self,
         remove_ids: &[u32],
@@ -421,40 +675,39 @@ impl VddClient {
                 .map(|_| ());
         }
         match self.ensure()? {
-            VddProtocol::V2 => self.update_v2_monitors(add_monitors, true),
-            VddProtocol::Legacy => {
-                self.write_legacy_retry(&serialize_remove(remove_ids))?;
-                std::thread::sleep(Duration::from_millis(120));
-                self.write_legacy_retry(&serialize_legacy_add(add_monitors))
-            }
+            VddProtocol::V2 => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported, V2_OWNER_REQUIRED,
+            ).into()),
+            VddProtocol::Legacy => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy replacement is disabled without an ownership token",
+            ).into()),
         }
     }
 
-    pub fn remove(&mut self, ids: &[u32]) -> Result<(), VddError> {
+    /// 无令牌的旧版删除仅适用于 Legacy；V2 必须使用 `remove_owned`。
+    pub fn remove(&mut self, ids: &[u32]) -> Result<RemoveDisposition, VddError> {
         if self.needs_broker() {
-            return self
-                .broker(crate::vdd_broker::Request::Remove { ids: ids.to_vec() })
-                .map(|_| ());
+            let reply = self
+                .broker(crate::vdd_broker::Request::Remove { ids: ids.to_vec() })?;
+            return remove_disposition(reply);
         }
-        let json = serialize_remove(ids);
         match self.ensure()? {
-            VddProtocol::V2 => self.write_framed(&json),
-            VddProtocol::Legacy => self.write_legacy_retry(&json),
+            VddProtocol::V2 => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported, V2_OWNER_REQUIRED,
+            ).into()),
+            VddProtocol::Legacy => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Legacy removal is disabled without an ownership token",
+            ).into()),
         }
     }
 
     pub fn remove_all(&mut self) -> Result<(), VddError> {
-        if self.use_broker {
-            return Err(VddError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "VDD broker does not allow removing displays without explicit owned IDs",
-            )));
-        }
-        let json = serialize_remove_all();
-        match self.ensure()? {
-            VddProtocol::V2 => self.write_framed(&json),
-            VddProtocol::Legacy => self.write_legacy_retry(&json),
-        }
+        Err(VddError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Removing all displays without explicit ownership is disabled",
+        )))
     }
 
     /// 请求当前状态（仅 v2 支持应答）。
@@ -505,34 +758,50 @@ impl VddClient {
         updates: &[VddMonitor],
         replacing: bool,
     ) -> Result<(), VddError> {
-        let Some(mut state) = self.state()? else {
-            return Err(VddError::Io(std::io::Error::other(
-                "未取得虚拟屏列表，未写入全量状态",
-            )));
-        };
-        if !replacing
-            && updates
-                .iter()
-                .any(|update| state.iter().any(|monitor| monitor.id == update.id))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "虚拟屏编号已被占用",
-            )
-            .into());
+        use std::io::{Error, ErrorKind};
+        // A State snapshot followed by Notify can delete a concurrent client's display.
+        // The driver must check IDs and merge under its own state lock, then acknowledge.
+        self.write_framed(&serialize_update(updates, replacing))?;
+        let reply = self.read_v2_reply("SnugUpdate");
+        if reply.is_err() {
+            self.connection = None;
         }
-        merge_monitors(&mut state, updates);
-        self.write_framed(&serialize_notify(&state))
+        match reply {
+            Ok(serde_json::Value::String(result)) => match result.as_str() {
+                "Applied" => Ok(()),
+                "AlreadyExists" => Err(Error::new(ErrorKind::AlreadyExists, "虚拟屏编号已被占用").into()),
+                "NotFound" => Err(Error::new(ErrorKind::NotFound, "待更新的虚拟屏已不存在").into()),
+                "InvalidData" => Err(Error::new(ErrorKind::InvalidInput, "驱动拒绝了无效的虚拟屏更新").into()),
+                "ApplyFailed" => Err(Error::other("驱动未能应用虚拟屏模式；保留实际状态供恢复").into()),
+                _ => {
+                    self.connection = None;
+                    Err(VddError::OutcomeUnknown {
+                        source: Error::new(ErrorKind::InvalidData, "无法识别驱动的原子更新应答"),
+                    })
+                },
+            },
+            Ok(_) => {
+                self.connection = None;
+                Err(VddError::OutcomeUnknown {
+                    source: Error::new(ErrorKind::InvalidData, "无效的驱动原子更新应答"),
+                })
+            },
+            Err(VddError::Io(source)) => Err(VddError::OutcomeUnknown { source }),
+            Err(error) => Err(VddError::OutcomeUnknown { source: Error::other(error) }),
+        }
     }
 
     fn read_v2_state(&mut self) -> Result<Vec<VddMonitor>, VddError> {
+        serde_json::from_value(self.read_v2_reply("State")?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
+    }
+
+    fn read_v2_reply(&mut self, key: &str) -> Result<serde_json::Value, VddError> {
         use std::io::{Error, ErrorKind};
-        const MAX_BYTES: usize = 128 * 1024;
         let deadline = Instant::now() + Duration::from_secs(3);
         let pipe = &mut self.connection.as_mut().ok_or(VddError::NotConnected)?.pipe;
         let mut frame = Vec::new();
         let mut chunk = [0u8; 4096];
-        let mut received = 0;
         loop {
             if Instant::now() >= deadline {
                 return Err(Error::new(ErrorKind::TimedOut, "读取驱动状态超时").into());
@@ -544,21 +813,19 @@ impl VddClient {
             if read == 0 {
                 return Err(Error::new(ErrorKind::BrokenPipe, "驱动未返回完整状态").into());
             }
-            received += read;
-            if received > MAX_BYTES {
-                return Err(Error::new(ErrorKind::InvalidData, "驱动状态超过大小限制").into());
-            }
             for &byte in &chunk[..read] {
                 if byte != EOT {
+                    if frame.len() >= MAX_STATE_RESPONSE_BYTES {
+                        return Err(Error::new(ErrorKind::InvalidData, "驱动状态超过大小限制").into());
+                    }
                     frame.push(byte);
                     continue;
                 }
                 if let Ok(text) = std::str::from_utf8(&frame)
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-                    && let Some(state) = value.get("State")
+                    && let Some(reply) = value.get(key)
                 {
-                    return serde_json::from_value(state.clone())
-                        .map_err(|error| Error::new(ErrorKind::InvalidData, error).into());
+                    return Ok(reply.clone());
                 }
                 frame.clear();
             }
@@ -573,7 +840,7 @@ impl VddClient {
             Ok(reply) => reply,
             Err(error) => {
                 self.broker_protocol = None;
-                return Err(error.into());
+                return Err(VddError::from_broker(error));
             }
         };
         self.broker_protocol = reply.legacy.map(|legacy| {
@@ -605,10 +872,6 @@ impl VddClient {
         self.write_bytes(&frame(json))
     }
 
-    fn write_raw(&mut self, json: &str) -> Result<(), VddError> {
-        self.write_bytes(json.as_bytes())
-    }
-
     /// 写一段字节；写失败就把连接丢掉（下次 `ensure()` 重新连）。
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), VddError> {
         let Some(connection) = self.connection.as_mut() else {
@@ -624,35 +887,10 @@ impl VddClient {
         }
     }
 
-    /// legacy 通道：写失败 → 丢弃 → 重连 → 重写一次（C# `SendLegacyOneShotAsync`）。
-    ///
-    /// 重连会重新探测协议；真机上仍是 v0.3.x，所以还是 raw 写。若断线期间驱动换成了
-    /// v2 实现，则改按 EOT 帧写，避免把裸 JSON 塞进双向协议。
-    fn write_legacy_retry(&mut self, json: &str) -> Result<(), VddError> {
-        match self.write_raw(json) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.connection = None;
-                match self.ensure()? {
-                    VddProtocol::Legacy => self.write_raw(json),
-                    VddProtocol::V2 => match serde_json::from_str::<serde_json::Value>(json) {
-                        Ok(value) if value.get("Add").is_none() => self.write_framed(json),
-                        _ => Err(std::io::Error::other("驱动协议已变化，请重新执行建屏").into()),
-                    },
-                }
-            }
-        }
-    }
 }
 
-fn merge_monitors(state: &mut Vec<VddMonitor>, updates: &[VddMonitor]) {
-    for update in updates {
-        if let Some(monitor) = state.iter_mut().find(|monitor| monitor.id == update.id) {
-            *monitor = update.clone();
-        } else {
-            state.push(update.clone());
-        }
-    }
+fn remove_disposition(reply: crate::vdd_broker::Reply) -> Result<RemoveDisposition, VddError> {
+    reply.removal.ok_or_else(|| std::io::Error::other("VDD broker 未返回移除确认状态").into())
 }
 
 /// 先试双向（v2），"拒绝访问"则退回只写（v0.3.x）；管道忙时重试。
@@ -666,6 +904,7 @@ fn connect(name: &str) -> Result<Connection, VddError> {
         match OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED.0)
             .security_qos_flags(0x0001_0000)
             .open(&path)
         {
@@ -680,6 +919,7 @@ fn connect(name: &str) -> Result<Connection, VddError> {
                     // 驱动只开 INBOUND 时，双向打开会被拒；退回只写。
                     match OpenOptions::new()
                         .write(true)
+                        .custom_flags(FILE_FLAG_OVERLAPPED.0)
                         .security_qos_flags(0x0001_0000)
                         .open(&path)
                     {
@@ -712,6 +952,20 @@ fn connect(name: &str) -> Result<Connection, VddError> {
         name: name.to_string(),
         source: first_error.unwrap_or_else(|| std::io::Error::other("管道不可用")),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn maximum_test_state() -> Vec<VddMonitor> {
+    (0..16).map(|id| VddMonitor {
+        id,
+        name: Some("\u{1}".repeat(256)),
+        enabled: false,
+        modes: (0..256).map(|index| VddMode {
+            width: 10000 + index,
+            height: 16384,
+            refresh_rates: vec![120, 144, 165, 240],
+        }).collect(),
+    }).collect()
 }
 
 #[cfg(test)]
@@ -852,7 +1106,10 @@ mod tests {
 
     impl PipeServer {
         fn create(name: &str) -> Self {
-            const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+            Self::create_with_access(name, 3)
+        }
+
+        fn create_with_access(name: &str, access: u32) -> Self {
             unsafe extern "system" {
                 fn CreateNamedPipeW(
                     lp_name: *const u16,
@@ -868,7 +1125,7 @@ mod tests {
             let mut wide: Vec<u16> = format!(r"\\.\pipe\{name}").encode_utf16().collect();
             wide.push(0);
             let handle = unsafe {
-                CreateNamedPipeW(wide.as_ptr(), PIPE_ACCESS_DUPLEX, 0, 1, 4096, 4096, 0, std::ptr::null_mut())
+                CreateNamedPipeW(wide.as_ptr(), access, 0, 1, 4096, 4096, 0, std::ptr::null_mut())
             };
             assert_ne!(
                 handle as isize, -1,
@@ -876,6 +1133,27 @@ mod tests {
                 std::io::Error::last_os_error()
             );
             Self(handle)
+        }
+
+        fn accept(self) -> std::fs::File {
+            use std::os::windows::io::FromRawHandle;
+            unsafe extern "system" {
+                fn ConnectNamedPipe(pipe: RawHandle, overlapped: *mut core::ffi::c_void) -> i32;
+            }
+            let connected = unsafe { ConnectNamedPipe(self.0, std::ptr::null_mut()) };
+            if connected == 0 {
+                // A client can connect and close before this test thread calls
+                // ConnectNamedPipe. Windows reports ERROR_NO_DATA (232) for
+                // that race, while ERROR_PIPE_CONNECTED (535) means it is
+                // still connected and ready for the test read.
+                let code = std::io::Error::last_os_error().raw_os_error();
+                assert!(
+                    matches!(code, Some(232 | 535)),
+                    "unexpected pipe connect error: {code:?}"
+                );
+            }
+            let server = std::mem::ManuallyDrop::new(self);
+            unsafe { std::fs::File::from_raw_handle(server.0) }
         }
     }
 
@@ -890,6 +1168,223 @@ mod tests {
         }
     }
 
+    fn read_test_frame(pipe: &mut std::fs::File) -> Vec<u8> {
+        let mut frame = Vec::new();
+        loop {
+            let mut byte = [0];
+            pipe.read_exact(&mut byte).unwrap();
+            frame.push(byte[0]);
+            if byte[0] == EOT { return frame; }
+        }
+    }
+
+    #[test]
+    fn direct_v2_write_times_out_and_discards_the_connection() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-stalled-write-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let _pipe = server.accept();
+            // The fallback close bounds this regression even against the old blocking writer.
+            let _ = release_rx.recv_timeout(Duration::from_secs(8));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        let mut spec = monitor();
+        spec.name = Some("stalled-test".repeat(8192));
+        let started = Instant::now();
+        let result = client.notify(&[spec]);
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(matches!(result, Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+        assert!(elapsed < Duration::from_secs(5), "write exceeded its deadline: {elapsed:?}");
+        assert!(client.protocol().is_none(), "a partial timed-out frame must not be reused");
+    }
+
+    #[test]
+    fn direct_v2_write_preserves_a_frame_larger_than_the_pipe_buffer() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-large-write-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let received = read_test_frame(&mut pipe);
+            pipe.write_all(&frame(r#"{"SnugUpdate":"Applied"}"#)).unwrap();
+            received
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut spec = monitor();
+        spec.name = Some("large-test".repeat(1024));
+        let expected = frame(&serialize_update(&[spec.clone()], false));
+        VddClient::new(name).notify(&[spec]).unwrap();
+        assert_eq!(server.join().unwrap(), expected);
+    }
+
+    #[test]
+    fn old_v2_driver_is_rejected_without_sending_a_destructive_notify() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-old-v2-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let request = read_test_frame(&mut pipe);
+            // Unextended V2 silently ignores unknown commands. Other-client events
+            // and State replies must not be mistaken for the missing update ACK.
+            pipe.write_all(&frame(r#"{"Changed":[]}"#)).unwrap();
+            pipe.write_all(&frame(r#"{"State":[]}"#)).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(8));
+            request
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        let result = client.notify(&[monitor()]);
+        release_tx.send(()).unwrap();
+        assert_eq!(server.join().unwrap(), frame(&serialize_update(&[monitor()], false)));
+        assert!(matches!(result, Err(VddError::OutcomeUnknown { source }) if source.kind() == std::io::ErrorKind::TimedOut));
+        assert!(client.protocol().is_none(), "a missing ACK must invalidate the connection");
+    }
+
+    #[test]
+    fn legacy_connection_rejects_mutations_without_writing_to_the_pipe() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-legacy-write-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create_with_access(&server_name, 1);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        assert!(matches!(client.notify(&[monitor()]), Err(VddError::Io(error))
+            if error.kind() == std::io::ErrorKind::Unsupported));
+        assert_eq!(client.protocol(), Some(VddProtocol::Legacy));
+        drop(client);
+        assert!(server.join().unwrap().is_empty(), "Legacy mutation wrote unguarded bytes");
+    }
+
+    #[test]
+    fn legacy_remove_is_rejected_without_writing_to_the_pipe() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-legacy-remove-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create_with_access(&server_name, 1);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut pipe, &mut bytes).unwrap();
+            bytes
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        let outcome = client.remove(&[0]);
+        assert!(matches!(outcome, Err(VddError::Io(error))
+            if error.kind() == std::io::ErrorKind::Unsupported));
+        drop(client);
+        assert!(server.join().unwrap().is_empty(), "Legacy Remove wrote unguarded bytes");
+    }
+
+    #[test]
+    fn direct_v2_incomplete_reply_times_out_and_discards_the_connection() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-stalled-reply-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            assert_eq!(read_test_frame(&mut pipe), frame("\"State\""));
+            pipe.write_all(b"{\"State\":[]}").unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(8));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        let started = Instant::now();
+        let result = client.state();
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(matches!(result, Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+        assert!(elapsed < Duration::from_secs(5));
+        assert!(client.protocol().is_none());
+    }
+
+    #[test]
+    fn direct_v2_tokenless_operations_write_no_bytes_to_a_real_pipe() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-tokenless-v2-{}", std::process::id());
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let mut byte = [0];
+            match pipe.read(&mut byte) {
+                Ok(0) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => (),
+                result => panic!("unguarded V2 operation wrote bytes: {result:?}, {byte:?}"),
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        let replacing = client.replace_legacy(&[0], &[monitor()]);
+        let removing = client.remove(&[0]);
+        drop(client);
+        server.join().unwrap();
+        for result in [replacing, removing.map(|_| ())] {
+            assert!(matches!(result, Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+                    && error.to_string().contains("归属令牌")));
+        }
+    }
+
+    #[test]
+    fn direct_v2_owned_release_waits_for_a_matching_driver_acknowledgement() {
+        use std::sync::mpsc;
+        let name = format!("snug-rs-test-owned-release-{}", std::process::id());
+        let server_name = name.clone();
+        let owner = "0123456789abcdef0123456789abcdef";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create(&server_name);
+            ready_tx.send(()).unwrap();
+            let mut pipe = server.accept();
+            let request = frame(&serde_json::json!({ "SnugRelease": {"owner": owner, "ids": [0]} }).to_string());
+            for result in ["ApplyFailed", "Applied"] {
+                assert_eq!(read_test_frame(&mut pipe), request);
+                pipe.write_all(&frame(&serde_json::json!({ "SnugRelease": {"owner": owner, "result": result} }).to_string())).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut client = VddClient::new(name);
+        assert!(matches!(client.remove_owned(&[0], owner), Err(VddError::Io(error))
+            if error.kind() == std::io::ErrorKind::Other));
+        assert_eq!(client.remove_owned(&[0], owner).unwrap(), RemoveDisposition::Confirmed);
+        server.join().unwrap();
+    }
+
     // ----- 连接缓存与重连（假管道，绝不碰真驱动） -----
 
     #[derive(Debug, Default)]
@@ -900,6 +1395,7 @@ mod tests {
         connects: usize,
         writes: Vec<Vec<u8>>,
         replies: std::collections::VecDeque<Vec<u8>>,
+        read_error: Option<std::io::ErrorKind>,
         /// 接下来多少次写要失败（模拟 `ERROR_BROKEN_PIPE`）。
         fail_writes: usize,
     }
@@ -909,6 +1405,9 @@ mod tests {
     impl Read for FakePipe {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let mut world = self.0.lock().unwrap();
+            if let Some(error) = world.read_error {
+                return Err(error.into());
+            }
             let Some(mut reply) = world.replies.pop_front() else { return Ok(0) };
             let length = reply.len().min(buf.len());
             buf[..length].copy_from_slice(&reply[..length]);
@@ -948,7 +1447,7 @@ mod tests {
     fn fake_world(protocol: VddProtocol) -> Arc<Mutex<FakeWorld>> {
         let mut world = FakeWorld { protocol: Some(protocol), alive: true, ..Default::default() };
         if protocol == VddProtocol::V2 {
-            world.replies.extend((0..2).map(|_| frame("{\"State\":[]}")));
+            world.replies.extend((0..2).map(|_| frame(r#"{"SnugUpdate":"Applied"}"#)));
         }
         Arc::new(Mutex::new(world))
     }
@@ -968,6 +1467,56 @@ mod tests {
     }
 
     #[test]
+    fn response_size_accepts_maximum_legal_disabled_state() {
+        let monitors = maximum_test_state();
+        let reply = frame(&serde_json::json!({"State": monitors}).to_string());
+        assert!(reply.len() > 128 * 1024);
+        assert!(reply.len() <= MAX_STATE_RESPONSE_BYTES);
+        println!("maximum legal State: {} bytes; response cap: {}", reply.len(), MAX_STATE_RESPONSE_BYTES);
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [reply].into();
+        assert_eq!(fake_client(&world).state().unwrap(), Some(monitors));
+    }
+
+    #[test]
+    fn response_size_accepts_exact_frame_limit_without_counting_eot() {
+        let mut reply = br#"{"State":[]}"#.to_vec();
+        reply.resize(MAX_STATE_RESPONSE_BYTES, b' ');
+        reply.push(EOT);
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [reply].into();
+        assert_eq!(fake_client(&world).state().unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn response_size_rejects_oversized_state_and_changed_frames() {
+        for key in ["State", "Changed"] {
+            let mut reply = serde_json::to_vec(&serde_json::json!({key: []})).unwrap();
+            reply.resize(MAX_STATE_RESPONSE_BYTES + 1, b' ');
+            reply.push(EOT);
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies = [reply, frame(r#"{"State":[]}"#)].into();
+            let mut client = fake_client(&world);
+            assert!(matches!(client.state(), Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidData));
+            assert!(client.protocol().is_none());
+        }
+    }
+
+    #[test]
+    fn response_size_counts_changed_notifications_per_frame() {
+        let monitors = maximum_test_state()[..4].to_vec();
+        let changed = frame(&serde_json::json!({"Changed": monitors}).to_string());
+        assert!(changed.len() < 128 * 1024);
+        assert!(changed.len() * 5 > 300_000);
+        let mut replies = vec![changed; 5];
+        replies.push(frame(&serde_json::json!({"State": monitors}).to_string()));
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = replies.into();
+        assert_eq!(fake_client(&world).state().unwrap(), Some(monitors));
+    }
+
+    #[test]
     fn write_failure_drops_the_connection_and_the_next_call_reconnects() {
         // Rust 特有 bug 的回归：旧实现只 `is_some()`，写失败也不重置，
         // 同进程内重试永远复用死连接。
@@ -983,23 +1532,304 @@ mod tests {
 
         client.notify(&[monitor()]).expect("下一次调用应重新连接并成功");
         assert_eq!(world.lock().unwrap().connects, 2);
-        assert_eq!(world.lock().unwrap().writes.len(), 4);
+        assert_eq!(world.lock().unwrap().writes.len(), 2);
     }
 
     #[test]
-    fn legacy_write_failure_reconnects_and_rewrites_once() {
-        // C# `SendLegacyOneShotAsync`：断线 → Dispose → 重连 → 重写一次。
+    fn legacy_notify_rejects_before_write_or_retry() {
         let world = fake_world(VddProtocol::Legacy);
         let mut client = fake_client(&world);
         world.lock().unwrap().fail_writes = 1;
 
-        client.notify(&[monitor()]).expect("legacy 要断线→重连→重写一次");
+        assert!(matches!(client.notify(&[monitor()]), Err(VddError::Io(error))
+            if error.kind() == std::io::ErrorKind::Unsupported));
         let state = world.lock().unwrap();
-        assert_eq!(state.connects, 2, "写失败必须重连");
-        assert_eq!(state.writes.len(), 1, "重试成功只留下一次成功写入");
-        let text = String::from_utf8_lossy(&state.writes[0]);
-        assert!(text.contains("\"Add\""), "legacy 应重写 Add 帧：{text}");
+        assert_eq!(state.connects, 1, "拒绝 Legacy 写入前不得重连");
+        assert!(state.writes.is_empty());
         assert_eq!(client.protocol(), Some(VddProtocol::Legacy));
+    }
+
+    #[test]
+    fn legacy_replacement_stops_before_any_mutation_when_remove_reconnects_as_v2() {
+        let world = fake_world(VddProtocol::Legacy);
+        let mut client = fake_client(&world);
+        assert_eq!(client.ensure().unwrap(), VddProtocol::Legacy);
+        {
+            let mut state = world.lock().unwrap();
+            state.protocol = Some(VddProtocol::V2);
+            state.fail_writes = 1;
+        }
+
+        assert!(client.replace_legacy(&[0], &[monitor()]).is_err());
+        assert_eq!(client.protocol(), Some(VddProtocol::Legacy));
+        let state = world.lock().unwrap();
+        assert_eq!(state.connects, 1, "unsupported Legacy mutation must not reconnect");
+        assert!(state.writes.is_empty(), "an unguarded Remove must not be replayed");
+    }
+
+    #[test]
+    fn owned_protocol_reserves_creates_replaces_and_releases_with_the_same_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = ["SnugReserve", "SnugCreate", "SnugReplace", "SnugRelease"]
+            .map(|command| frame(&serde_json::json!({command: {"owner": token, "result": "Applied"}}).to_string())).into();
+        let mut client = fake_client(&world);
+        assert!(client.reserve_owned(0, token).unwrap());
+        client.create_owned(&[monitor()], token).unwrap();
+        client.replace_owned(&[monitor()], token).unwrap();
+        assert_eq!(client.remove_owned(&[0], token).unwrap(), RemoveDisposition::Confirmed);
+        assert_eq!(world.lock().unwrap().writes, [
+            serde_json::json!({"SnugReserve": {"owner": token, "id": 0}}),
+            serde_json::json!({"SnugCreate": {"owner": token, "monitors": [monitor()]}}),
+            serde_json::json!({"SnugReplace": {"owner": token, "monitors": [monitor()]}}),
+            serde_json::json!({"SnugRelease": {"owner": token, "ids": [0]}}),
+        ].map(|request| frame(&request.to_string())));
+    }
+
+    #[test]
+    fn owned_release_distinguishes_a_foreign_id_from_a_detaching_owned_screen() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [frame(&serde_json::json!({"SnugRelease": {
+            "owner": token, "result": "NotFound",
+        }}).to_string())].into();
+        let mut client = fake_client(&world);
+        assert_eq!(client.remove_owned(&[0], token).unwrap(), RemoveDisposition::NotOwned);
+        assert_eq!(client.protocol(), Some(VddProtocol::V2));
+        let state = world.lock().unwrap();
+        assert_eq!(state.connects, 1);
+        assert_eq!(state.writes, [frame(&serde_json::json!({"SnugRelease": {
+            "owner": token, "ids": [0],
+        }}).to_string())]);
+    }
+
+    #[test]
+    fn only_a_matching_release_not_found_reply_can_confirm_absent_ownership() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for command in ["SnugReserve", "SnugCreate", "SnugReplace"] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies = [frame(&serde_json::json!({command: {
+                "owner": token, "result": "NotFound",
+            }}).to_string())].into();
+            let mut client = fake_client(&world);
+            let result = match command {
+                "SnugReserve" => client.reserve_owned(0, token).map(|_| ()),
+                "SnugCreate" => client.create_owned(&[monitor()], token),
+                _ => client.replace_owned(&[monitor()], token),
+            };
+            assert!(matches!(result, Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound));
+        }
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [frame(&serde_json::json!({"SnugRelease": {
+            "owner": "fedcba9876543210fedcba9876543210", "result": "NotFound",
+        }}).to_string())].into();
+        let mut client = fake_client(&world);
+        assert!(matches!(client.remove_owned(&[0], token),
+            Err(VddError::OutcomeUnknown { source }) if source.kind() == std::io::ErrorKind::InvalidData));
+        assert!(client.protocol().is_none());
+    }
+
+    #[test]
+    fn owned_protocol_never_downgrades_token_guarded_operations_to_legacy() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let world = fake_world(VddProtocol::Legacy);
+        let mut client = fake_client(&world);
+        assert!(!client.reserve_owned(0, token).unwrap());
+        for result in [client.create_owned(&[monitor()], token), client.replace_owned(&[monitor()], token),
+            client.remove_owned(&[0], token).map(|_| ())] {
+            assert!(matches!(result, Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported));
+        }
+        assert!(world.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn owner_verification_accepts_only_a_matching_read_only_driver_acknowledgement() {
+        use std::sync::mpsc;
+        let owner = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        let acknowledgement = |command: &str, token: &str, result: &str| {
+            frame(&serde_json::json!({command: {"owner": token, "result": result}}).to_string())
+        };
+        for (index, reply, expected) in [
+            (0, Some(acknowledgement("SnugCheck", owner, "Applied")), true),
+            // Both a missing display and a display held by another owner are NotFound.
+            (1, Some(acknowledgement("SnugCheck", owner, "NotFound")), false),
+            (2, Some(acknowledgement("SnugCheck", owner, "AlreadyExists")), false),
+            (3, Some(acknowledgement("SnugCheck", other, "Applied")), false),
+            (4, Some(acknowledgement("SnugReserve", owner, "Applied")), false),
+            (5, Some(acknowledgement("SnugCheck", owner, "Unknown")), false),
+            (6, None, false),
+        ] {
+            let name = format!("snug-rs-test-owner-check-{}-{index}", std::process::id());
+            let server_name = name.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let server = PipeServer::create(&server_name);
+                ready_tx.send(()).unwrap();
+                let mut pipe = server.accept();
+                let request = read_test_frame(&mut pipe);
+                if let Some(reply) = reply { pipe.write_all(&reply).unwrap(); }
+                // Keep the pipe open so an absent or unrelated ACK exercises the deadline.
+                let _ = release_rx.recv_timeout(Duration::from_secs(8));
+                assert_eq!(available_bytes(pipe.as_raw_handle()).unwrap_or(0), 0,
+                    "ownership verification must send exactly one read-only request");
+                request
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut client = VddClient::direct(name);
+            let started = Instant::now();
+            let result = client.verify_owner(0, Some(owner));
+            let elapsed = started.elapsed();
+            let _ = release_tx.send(());
+            assert_eq!(server.join().unwrap(), frame(&serde_json::json!({
+                "SnugCheck": {"owner": owner, "id": 0},
+            }).to_string()));
+            assert_eq!(result.is_ok(), expected, "case {index}: {result:?}");
+            assert!(elapsed < Duration::from_secs(5), "unbounded ownership check: {elapsed:?}");
+            if index >= 3 { assert!(client.protocol().is_none()); }
+        }
+    }
+
+    #[test]
+    fn owner_verification_is_protocol_guarded_without_legacy_writes() {
+        for (protocol, owner, expected) in [
+            (VddProtocol::Legacy, None, false),
+            (VddProtocol::Legacy, Some("0123456789abcdef0123456789abcdef"), false),
+            (VddProtocol::V2, None, false),
+        ] {
+            let world = fake_world(protocol);
+            let mut client = fake_client(&world);
+            let result = client.verify_owner(0, owner);
+            assert_eq!(result.is_ok(), expected);
+            if !expected {
+                assert!(matches!(result, Err(VddError::Io(error))
+                    if error.kind() == std::io::ErrorKind::Unsupported));
+            }
+            assert!(world.lock().unwrap().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn owner_verification_transport_errors_never_retry_the_request() {
+        let owner = "0123456789abcdef0123456789abcdef";
+        for write_failure in [false, true] {
+            let world = fake_world(VddProtocol::V2);
+            {
+                let mut state = world.lock().unwrap();
+                state.replies.clear();
+                state.read_error = Some(std::io::ErrorKind::BrokenPipe);
+                state.fail_writes = usize::from(write_failure);
+            }
+            let mut client = fake_client(&world);
+            assert!(matches!(client.verify_owner(0, Some(owner)), Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::Unsupported));
+            assert!(client.protocol().is_none());
+            let state = world.lock().unwrap();
+            assert_eq!(state.connects, 1);
+            assert_eq!(state.writes.len(), usize::from(!write_failure));
+            if !write_failure {
+                assert_eq!(state.writes[0], frame(&serde_json::json!({
+                    "SnugCheck": {"owner": owner, "id": 0},
+                }).to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn owner_verification_broker_execution_preserves_protocol_and_rejections() {
+        let owner = "0123456789abcdef0123456789abcdef";
+        for (protocol, token, result, expected) in [
+            (VddProtocol::V2, Some(owner), "Applied", true),
+            (VddProtocol::V2, Some(owner), "NotFound", false),
+            (VddProtocol::V2, None, "Applied", false),
+            (VddProtocol::Legacy, None, "Applied", false),
+            (VddProtocol::Legacy, Some(owner), "Applied", false),
+        ] {
+            let world = fake_world(protocol);
+            world.lock().unwrap().replies = [frame(&serde_json::json!({
+                "SnugCheck": {"owner": owner, "result": result},
+            }).to_string())].into();
+            let request = crate::vdd_broker::Request::VerifyOwner { id: 0, owner: token.map(str::to_owned) };
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let request = serde_json::from_slice(&encoded).unwrap();
+            let reply = serde_json::to_value(crate::vdd_broker::execute(request, &mut fake_client(&world))).unwrap();
+            assert_eq!(reply["error"].is_null(), expected);
+            if expected { assert_eq!(reply["legacy"], protocol == VddProtocol::Legacy); }
+            let state = world.lock().unwrap();
+            if protocol == VddProtocol::V2 && token.is_some() {
+                assert_eq!(state.writes, [frame(&serde_json::json!({
+                    "SnugCheck": {"owner": owner, "id": 0},
+                }).to_string())]);
+            } else {
+                assert!(state.writes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn owned_protocol_rejects_missing_or_mismatched_reservation_acknowledgements() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for reply in [None, Some(serde_json::json!({"SnugReserve": {"owner": "other-owner", "result": "Applied"}}))] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies = reply.into_iter().map(|value| frame(&value.to_string())).collect();
+            let mut client = fake_client(&world);
+            assert!(matches!(client.reserve_owned(0, token),
+                Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported));
+            assert!(client.protocol().is_none());
+            assert_eq!(world.lock().unwrap().writes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn owned_protocol_missing_mutation_acknowledgements_never_confirm_ownership() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for failure in [None, Some(std::io::ErrorKind::TimedOut)] {
+            for command in ["SnugCreate", "SnugReplace", "SnugRelease"] {
+                let world = fake_world(VddProtocol::V2);
+                {
+                    let mut state = world.lock().unwrap();
+                    state.replies.clear();
+                    state.read_error = failure;
+                }
+                let mut client = fake_client(&world);
+                let result = match command {
+                    "SnugCreate" => client.create_owned(&[monitor()], token),
+                    "SnugReplace" => client.replace_owned(&[monitor()], token),
+                    _ => client.remove_owned(&[0], token).map(|_| ()),
+                };
+                assert!(matches!(result, Err(VddError::OutcomeUnknown { source })
+                    if source.kind() == failure.unwrap_or(std::io::ErrorKind::BrokenPipe)));
+                assert!(client.protocol().is_none());
+                let state = world.lock().unwrap();
+                assert_eq!(state.connects, 1);
+                assert_eq!(state.writes.len(), 1, "must not replay an unknown mutation");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_protocol_only_accepts_a_mutation_acknowledgement_for_its_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for result in ["Applied", "AlreadyExists"] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies = [frame(&serde_json::json!({"SnugCreate": {
+                "owner": "fedcba9876543210fedcba9876543210", "result": result,
+            }}).to_string())].into();
+            let mut client = fake_client(&world);
+            assert!(matches!(client.create_owned(&[monitor()], token),
+                Err(VddError::OutcomeUnknown { source }) if source.kind() == std::io::ErrorKind::InvalidData));
+            assert!(client.protocol().is_none());
+        }
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [frame(&serde_json::json!({"SnugCreate": {
+            "owner": token, "result": "AlreadyExists",
+        }}).to_string())].into();
+        let mut client = fake_client(&world);
+        assert!(matches!(client.create_owned(&[monitor()], token),
+            Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(client.protocol(), Some(VddProtocol::V2));
     }
 
     #[test]
@@ -1016,37 +1846,322 @@ mod tests {
 
         let state = world.lock().unwrap();
         assert_eq!(state.connects, 2, "探测到断线必须重新 CreateFile");
-        assert_eq!(state.writes.len(), 4);
+        assert_eq!(state.writes.len(), 2);
     }
 
     #[test]
-    fn v2_update_preserves_other_monitors_and_waits_for_the_state_frame() {
+    fn v2_update_sends_only_target_ids_and_waits_for_its_acknowledgement() {
         let world = fake_world(VddProtocol::V2);
-        let other = VddMonitor { id: 9, ..monitor() };
         let changed = frame("{\"Changed\":[]}");
-        let reply = frame(&serde_json::json!({ "State": [other.clone()] }).to_string());
+        let reply = frame(r#"{"SnugUpdate":"Applied"}"#);
         world.lock().unwrap().replies = [changed, reply[..7].to_vec(), reply[7..].to_vec()].into();
         fake_client(&world).notify(&[monitor()]).unwrap();
-        let state = world.lock().unwrap();
-        assert_eq!(state.writes, vec![frame("\"State\""), frame(&serialize_notify(&[other, monitor()]))]);
+        assert_eq!(world.lock().unwrap().writes, vec![frame(&serialize_update(&[monitor()], false))]);
     }
 
     #[test]
-    fn v2_never_replaces_the_list_when_the_state_reply_is_incomplete() {
+    fn v2_never_reports_success_when_the_atomic_reply_is_incomplete() {
         let world = fake_world(VddProtocol::V2);
-        world.lock().unwrap().replies = [b"{\"State\":[]}".to_vec()].into();
-        assert!(fake_client(&world).notify(&[monitor()]).is_err());
-        assert_eq!(world.lock().unwrap().writes, vec![frame("\"State\"")]);
+        world.lock().unwrap().replies = [br#"{"SnugUpdate":"Applied"}"#.to_vec()].into();
+        let mut client = fake_client(&world);
+        assert!(client.notify(&[monitor()]).is_err());
+        assert!(client.protocol().is_none());
+        assert_eq!(world.lock().unwrap().writes, vec![frame(&serialize_update(&[monitor()], false))]);
     }
 
     #[test]
-    fn v2_creation_never_overwrites_a_disabled_monitor_with_the_same_id() {
+    fn v2_applied_update_with_lost_acknowledgement_has_an_unknown_outcome() {
+        struct AppliedPipe {
+            applied: Arc<Mutex<usize>>,
+            failure: std::io::ErrorKind,
+        }
+        impl Read for AppliedPipe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                if self.failure == std::io::ErrorKind::BrokenPipe {
+                    Ok(0)
+                } else {
+                    Err(self.failure.into())
+                }
+            }
+        }
+        impl Write for AppliedPipe {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(bytes.last(), Some(&EOT));
+                let request = serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1]).unwrap();
+                assert!(request.get("SnugUpdate").is_some() || request.get("SnugReplace").is_some());
+                *self.applied.lock().unwrap() += 1;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl PipeHandle for AppliedPipe {
+            fn probe(&mut self) -> Liveness { Liveness::Alive }
+        }
+
+        for failure in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::TimedOut] {
+            for replacing in [false, true] {
+                let applied = Arc::new(Mutex::new(0));
+                let mut client = VddClient::with_connector("fake-applied-update", Box::new(|_| {
+                    panic!("an unknown mutation must not reconnect or replay itself")
+                }));
+                client.connection = Some(Connection {
+                    protocol: VddProtocol::V2,
+                    pipe: Box::new(AppliedPipe { applied: applied.clone(), failure }),
+                });
+                let result = if replacing {
+                    client.replace_owned(&[monitor()], "0123456789abcdef0123456789abcdef")
+                } else {
+                    client.notify(&[monitor()])
+                };
+                assert!(matches!(result,
+                    Err(VddError::OutcomeUnknown { source }) if source.kind() == failure));
+                assert_eq!(*applied.lock().unwrap(), 1);
+                assert!(client.protocol().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_creation_propagates_an_atomic_id_conflict() {
         let world = fake_world(VddProtocol::V2);
-        let disabled = VddMonitor { enabled: false, ..monitor() };
-        let reply = frame(&serde_json::json!({ "State": [disabled] }).to_string());
-        world.lock().unwrap().replies = [reply].into();
+        world.lock().unwrap().replies = [frame(r#"{"SnugUpdate":"AlreadyExists"}"#)].into();
         assert!(matches!(fake_client(&world).notify(&[monitor()]),
             Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
-        assert_eq!(world.lock().unwrap().writes, vec![frame("\"State\"")]);
+        assert_eq!(world.lock().unwrap().writes, vec![frame(&serialize_update(&[monitor()], false))]);
     }
+
+    #[test]
+    fn v2_owned_replacement_requires_an_acknowledgement_for_its_token() {
+        let owner = "0123456789abcdef0123456789abcdef";
+        let world = fake_world(VddProtocol::V2);
+        let reply = |result| frame(&serde_json::json!({"SnugReplace": {"owner": owner, "result": result}}).to_string());
+        world.lock().unwrap().replies = [reply("Applied"), reply("NotFound")].into();
+        let mut client = fake_client(&world);
+        client.replace_owned(&[monitor()], owner).unwrap();
+        let request = frame(&serde_json::json!({"SnugReplace": {"owner": owner, "monitors": [monitor()]}}).to_string());
+        assert_eq!(world.lock().unwrap().writes, vec![request]);
+        assert!(matches!(client.replace_owned(&[monitor()], owner),
+            Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn v2_owned_replacement_reports_native_failure_without_replaying_or_disconnecting() {
+        let owner = "0123456789abcdef0123456789abcdef";
+        let world = fake_world(VddProtocol::V2);
+        world.lock().unwrap().replies = [frame(&serde_json::json!({"SnugReplace": {"owner": owner, "result": "ApplyFailed"}}).to_string())].into();
+        let mut client = fake_client(&world);
+        assert!(matches!(client.replace_owned(&[monitor()], owner),
+            Err(VddError::Io(error)) if error.kind() == std::io::ErrorKind::Other));
+        assert_eq!(client.protocol(), Some(VddProtocol::V2));
+        assert_eq!(world.lock().unwrap().writes, vec![frame(&serde_json::json!({"SnugReplace": {"owner": owner, "monitors": [monitor()]}}).to_string())]);
+    }
+
+    #[test]
+    fn v2_unknown_or_invalid_acknowledgements_never_mean_success() {
+        for ack in [r#""Unknown""#, "true", "null"] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies = [frame(&format!("{{\"SnugUpdate\":{ack}}}"))].into();
+            let mut client = fake_client(&world);
+            assert!(matches!(client.notify(&[monitor()]),
+                Err(VddError::OutcomeUnknown { source }) if source.kind() == std::io::ErrorKind::InvalidData));
+            assert!(client.protocol().is_none(), "an invalid ACK must invalidate the connection");
+        }
+    }
+
+    #[test]
+    fn concurrent_v2_clients_preserve_displays_created_after_a_stale_snapshot() {
+        use std::collections::VecDeque;
+        use std::sync::mpsc;
+
+        struct StatePipe {
+            state: Arc<Mutex<Vec<VddMonitor>>>,
+            reply: VecDeque<u8>,
+            pause_after_state: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        }
+        impl Read for StatePipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let length = buf.len().min(self.reply.len());
+                for byte in &mut buf[..length] {
+                    *byte = self.reply.pop_front().unwrap();
+                }
+                Ok(length)
+            }
+        }
+        impl Write for StatePipe {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(bytes.last(), Some(&EOT));
+                let command: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+                if command == "State" {
+                    let snapshot = self.state.lock().unwrap().clone();
+                    self.reply.extend(frame(&serde_json::json!({"State": snapshot}).to_string()));
+                    if let Some((ready, resume)) = self.pause_after_state.take() {
+                        ready.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                } else if let Some(update) = command.get("SnugUpdate") {
+                    if let Some((ready, resume)) = self.pause_after_state.take() {
+                        ready.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    let updates: Vec<VddMonitor> = serde_json::from_value(update["monitors"].clone()).unwrap();
+                    let mut state = self.state.lock().unwrap();
+                    assert!(!updates.iter().any(|u| state.iter().any(|m| m.id == u.id)));
+                    state.extend(updates);
+                    self.reply.extend(frame(r#"{"SnugUpdate":"Applied"}"#));
+                } else if let Some(notify) = command.get("Notify") {
+                    // Driver ipc.rs::notify removes every monitor absent from the full list.
+                    *self.state.lock().unwrap() = serde_json::from_value(notify.clone()).unwrap();
+                } else {
+                    panic!("unexpected command: {command}");
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl PipeHandle for StatePipe {
+            fn probe(&mut self) -> Liveness { Liveness::Alive }
+        }
+        fn client(pipe: StatePipe) -> VddClient {
+            VddClient {
+                name: "isolated-state-model".into(),
+                connection: Some(Connection { protocol: VddProtocol::V2, pipe: Box::new(pipe) }),
+                connector: Box::new(|_| panic!("unexpected reconnect")),
+                use_broker: false,
+                broker_protocol: None,
+            }
+        }
+
+        let state = Arc::new(Mutex::new(vec![monitor()]));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut a = client(StatePipe {
+            state: state.clone(), reply: VecDeque::new(),
+            pause_after_state: Some((ready_tx, resume_rx)),
+        });
+        let a_thread = std::thread::spawn(move || {
+            a.notify(&[VddMonitor { id: 2, ..monitor() }]).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut b = client(StatePipe {
+            state: state.clone(), reply: VecDeque::new(), pause_after_state: None,
+        });
+        b.notify(&[VddMonitor { id: 1, ..monitor() }]).unwrap();
+        assert_eq!(state.lock().unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), vec![0, 1]);
+        resume_tx.send(()).unwrap();
+        a_thread.join().unwrap();
+        let final_ids = state.lock().unwrap().iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(final_ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn direct_and_broker_removal_reject_legacy_without_reconnecting_or_writing() {
+        fn transitioning_client() -> (VddClient, Arc<Mutex<FakeWorld>>) {
+            let world = fake_world(VddProtocol::Legacy);
+            let mut client = fake_client(&world);
+            assert_eq!(client.ensure().unwrap(), VddProtocol::Legacy);
+            {
+                let mut state = world.lock().unwrap();
+                state.protocol = Some(VddProtocol::V2);
+                state.fail_writes = 1;
+            }
+            (client, world)
+        }
+
+        let (mut direct, direct_world) = transitioning_client();
+        assert!(matches!(direct.remove(&[0]), Err(VddError::Io(error))
+            if error.kind() == std::io::ErrorKind::Unsupported));
+        assert_eq!(direct.protocol(), Some(VddProtocol::Legacy));
+        assert_eq!(direct_world.lock().unwrap().connects, 1);
+        assert!(direct_world.lock().unwrap().writes.is_empty());
+
+        let (mut broker_driver, broker_world) = transitioning_client();
+        let reply = crate::vdd_broker::execute(
+            crate::vdd_broker::Request::Remove { ids: vec![0] },
+            &mut broker_driver,
+        );
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_eq!(reply["error_kind"], "Unsupported");
+        assert!(reply["removal"].is_null());
+        assert_eq!(broker_driver.protocol(), Some(VddProtocol::Legacy));
+        assert_eq!(broker_world.lock().unwrap().connects, 1);
+        assert!(broker_world.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn broker_reply_without_explicit_removal_never_confirms_deletion() {
+        let reply = serde_json::from_str(r#"{"legacy":false,"monitors":null,"error":null}"#).unwrap();
+        assert!(remove_disposition(reply).is_err());
+    }
+
+    #[test]
+    fn tokenless_v2_replace_and_remove_never_write_or_query_the_driver() {
+        for replacing in [false, true] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies.push_back(frame(r#"{"State":[]}"#));
+            let mut client = fake_client(&world);
+            let result = if replacing {
+                client.replace_legacy(&[0], &[monitor()])
+            } else {
+                client.remove(&[0]).map(|_| ())
+            };
+            assert!(matches!(result, Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::Unsupported));
+            assert_eq!(client.protocol(), Some(VddProtocol::V2));
+            assert!(world.lock().unwrap().writes.is_empty(), "State cannot prove ownership, and no unguarded mutation may be sent");
+        }
+    }
+
+    #[test]
+    fn tokenless_v2_broker_operations_preserve_the_unsupported_error_without_writes() {
+        for request in [
+            crate::vdd_broker::Request::ReplaceLegacy { remove_ids: vec![0], monitors: vec![monitor()] },
+            crate::vdd_broker::Request::Remove { ids: vec![0] },
+        ] {
+            let world = fake_world(VddProtocol::V2);
+            world.lock().unwrap().replies.push_back(frame(r#"{"State":[]}"#));
+            let mut client = fake_client(&world);
+            let reply = crate::vdd_broker::execute(request, &mut client);
+            let reply = serde_json::to_value(reply).unwrap();
+            assert_eq!(reply["error_kind"], "Unsupported");
+            assert_eq!(reply["unsupported"], true);
+            assert!(reply["removal"].is_null());
+            assert!(world.lock().unwrap().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_replace_and_remove_are_unsupported_without_owner_tokens() {
+        let world = fake_world(VddProtocol::Legacy);
+        let mut client = fake_client(&world);
+        for result in [
+            client.replace_legacy(&[0], &[monitor()]),
+            client.remove(&[0]).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(VddError::Io(error))
+                if error.kind() == std::io::ErrorKind::Unsupported));
+        }
+        assert!(world.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn legacy_broker_mutations_preserve_unsupported_without_writes() {
+        let world = fake_world(VddProtocol::Legacy);
+        let mut client = fake_client(&world);
+        for request in [
+            crate::vdd_broker::Request::ReplaceLegacy {
+                remove_ids: vec![0], monitors: vec![monitor()],
+            },
+            crate::vdd_broker::Request::Remove { ids: vec![0] },
+        ] {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded = serde_json::from_slice(&encoded).unwrap();
+            let reply = serde_json::to_value(crate::vdd_broker::execute(decoded, &mut client)).unwrap();
+            assert_eq!(reply["error_kind"], "Unsupported");
+            assert_eq!(reply["unsupported"], true);
+            assert!(reply["error"].is_string());
+            assert!(reply["removal"].is_null());
+        }
+        assert!(world.lock().unwrap().writes.is_empty());
+    }
+
 }
