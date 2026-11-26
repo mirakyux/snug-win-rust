@@ -2998,6 +2998,8 @@ mod tests {
         online_refresh_rate: Option<f64>,
         resolution_error: bool,
         ignore_resolution_changes: bool,
+        /// The driver accepted a new target mode, but Windows kept the active desktop source mode.
+        ignore_active_mode_changes: bool,
         ignore_mode_registration: bool,
         next_device_name: Option<String>,
         /// 非 `None` 时所有 `notify` 都失败（模拟驱动拒收/管道已断）。
@@ -3309,7 +3311,7 @@ mod tests {
                 .collect();
             self.notify(monitors)?;
             let mut world = self.0.lock().unwrap();
-            if !world.ignore_mode_registration && !world.ignore_resolution_changes {
+            if !world.ignore_resolution_changes && !world.ignore_active_mode_changes {
                 for requested in monitors {
                     if requested.modes.len() == 1 {
                         let mode = &requested.modes[0];
@@ -4100,7 +4102,8 @@ mod tests {
     #[test]
     fn inactive_retire_failure_keeps_mapping_and_ownership_for_retry() {
         let path = owned_path("inactive-retire-error");
-        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let world = world_with_phone(&[0]);
+        let (mut screen, shared) = screen_with_owned(world, &path);
         let id = screen.create(ScreenFit::standard()).unwrap();
         {
             let mut world = shared.lock().unwrap();
@@ -4964,6 +4967,125 @@ mod tests {
         screen.timings.reshape = Duration::ZERO;
         assert!(!screen.set_width(id, 600));
         let world = shared.lock().unwrap();
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(screen.owners.get(&id), Some(&owner));
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(id).unwrap(), Some(owner));
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_mode_driver_target_does_not_claim_desktop_convergence() {
+        let path = owned_path("owned-mode-target-without-desktop-switch");
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(ScreenFit::standard()).unwrap();
+        let owner = screen.owners[&id].clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.ignore_active_mode_changes = true;
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        screen.timings.reshape = Duration::ZERO;
+
+        assert!(!screen.set_width(id, 600));
+
+        let world = shared.lock().unwrap();
+        let requested = &world.guarded_mode_requests.last().unwrap()[0].modes[0];
+        let device = world.devices.get(&id).unwrap();
+        assert!(world.modes.contains(&(device.clone(), requested.width as i32, requested.height as i32)));
+        let active = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap();
+        assert_ne!((active.mode.width, active.mode.height), (requested.width as i32, requested.height as i32));
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(screen.owners.get(&id), Some(&owner));
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(id).unwrap(), Some(owner));
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_landscape_mode_uses_owner_guarded_replacement_without_native_writes() {
+        let path = owned_path("owned-landscape-mode-update");
+        let fit = ScreenFit::from_device(
+            &snug_core::PhoneSpec::new(2160.0, 3840.0, None),
+            snug_core::DeviceKind::Tablet,
+            snug_core::ScreenOrientation::Landscape,
+        );
+        let (mut screen, shared) = screen_with_owned(world_with_phone(&[0]), &path);
+        let id = screen.create(fit.clone()).unwrap();
+        let owner = screen.owners[&id].clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.monitors.iter_mut().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap()
+                .mode.dpi_scale_percent = 175;
+            world.guarded_replacements.clear();
+            world.guarded_mode_requests.clear();
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+
+        let width = fit.base_width() + 50;
+        let target = fit.pixel_size(width);
+        assert!(screen.set_width(id, width));
+
+        let world = shared.lock().unwrap();
+        let active = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap();
+        assert_eq!((active.mode.width, active.mode.height), target);
+        assert_eq!(active.mode.dpi_scale_percent, 175);
+        assert_eq!(world.guarded_replacements.len(), 1);
+        assert_eq!(world.guarded_mode_requests[0][0].modes[0].width, target.0 as u32);
+        assert_eq!(world.guarded_mode_requests[0][0].modes[0].height, target.1 as u32);
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(screen.owners.get(&id), Some(&owner));
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(id).unwrap(), Some(owner));
+        drop(world);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn owned_landscape_mode_without_desktop_convergence_never_falls_back_to_native_writes() {
+        let path = owned_path("owned-landscape-mode-no-convergence");
+        let fit = ScreenFit::from_device(
+            &snug_core::PhoneSpec::new(2160.0, 3840.0, None),
+            snug_core::DeviceKind::Tablet,
+            snug_core::ScreenOrientation::Landscape,
+        );
+        let mut world = world_with_phone(&[0]);
+        world.online_mode = Some(fit.pixel_size(fit.base_width()));
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(fit.clone()).unwrap();
+        let owner = screen.owners[&id].clone();
+        let previous = bound_monitor_of(&screen.api, &screen.maps, id).unwrap().mode;
+        {
+            let mut world = shared.lock().unwrap();
+            world.ignore_active_mode_changes = true;
+            world.guarded_replacements.clear();
+            world.guarded_mode_requests.clear();
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        screen.timings.reshape = Duration::ZERO;
+
+        let width = fit.base_width() + 50;
+        let target = fit.pixel_size(width);
+        assert!(!screen.set_width(id, width));
+
+        let world = shared.lock().unwrap();
+        let requested = &world.guarded_mode_requests[0][0].modes[0];
+        let device = world.devices.get(&id).unwrap();
+        assert_eq!((requested.width as i32, requested.height as i32), target);
+        assert!(world.modes.contains(&(device.clone(), target.0, target.1)));
+        let active = world.monitors.iter().find(|monitor| monitor.virtual_display_id == Some(id)).unwrap();
+        assert_eq!((active.mode.width, active.mode.height), (previous.width, previous.height));
         assert!(world.resolutions.is_empty());
         assert_eq!(world.temporary_attempts, 0);
         assert!(world.dpi_calls.is_empty());
