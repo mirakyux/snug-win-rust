@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/snug-core", "crates/snug-win", "crates/snug-app"]
+exclude = ["vendor/virtual-display-rs"]
+
+[workspace.package]
+# 唯一版本来源：crate 版本 = exe 资源里的 FileVersion/ProductVersion
+# = 自动更新跟 GitHub tag 比的版本。
+#
+# 独立的 Rust 版从 1.0.0 开始发布，与参考项目的版本分别维护。
+version = "1.0.7"
+edition = "2024"
+# 1.89 是硬下限：单实例锁用了 `File::try_lock`（1.89 稳定）。
+# edition 2024 本身只要 1.85，但声明低版本而实际用高版本 API 会让别人按 1.85 装不上。
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+# 驱动内嵌前的同一代码实测：3 = 6.68 MiB，s = 5.55 MiB，z = 5.07 MiB。
+# 先选 s：保留循环向量化，兼顾前台响应；z 留待真机性能复验。
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# 不开 panic = "abort"：eframe/egui 有个别地方依赖 unwind。

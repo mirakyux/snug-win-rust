@@ -1,0 +1,47 @@
+[package]
+name = "snug-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SnugWin 的 Windows 平台层：虚拟屏驱动 IPC、CCD 显示配置、DWM 窗口搬运、底层输入钩子、UIA、截图"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+snug-core = { path = "../snug-core" }
+
+# Win32 绑定。feature 按模块增量打开，避免把整个元数据都编译进来。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }

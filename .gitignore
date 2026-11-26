@@ -1,13 +1,25 @@
-bin/
-obj/
-publish/
-publish-*/
-.vs/
+/target
+/references
 *.user
-*.suo
-TestResults/
-driver/*.zip
-driver/**/*.msi
-driver/**/*.cer
-driver/**/*.bat
-dist/
+*.pdb
+*.log
+/dist
+
+# 拼音表/语料生成工具的临时产物
+.dotnet-home/
+tools/refdump/bin/
+tools/refdump/obj/
+
+# 几何对拍生成器的构建产物（TSV 真值要提交，bin/obj 不提交）
+tools/refdump/geometry/bin/
+tools/refdump/geometry/obj/
+
+# 提交用的临时消息文件（每笔提交前写这里，别进仓库）
+.commitmsg.txt
+
+# 驱动安装包（3 MB，打包时由 scripts/fetch-driver.ps1 下载并核对 SHA-256）
+driver/virtual-desktop-driver-installer-x64.zip
+driver/installer/
+
+# 驱动使用独立的固定 nightly 工作区；生成文件不进入源码。
+/vendor/virtual-display-rs/target/

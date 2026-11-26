@@ -1,0 +1,17 @@
+[package]
+name = "snug-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SnugWin 的托盘程序与手机屏界面（Rust 版）"
+
+[[bin]]
+name = "snug"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.32.3", default-features = false, features = ["accesskit", "glow", "wayland", "web_screen_reader", "x11"] }
+snug-core = { path = "../snug-core" }
+snug-win = { path = "../snug-win" }
+tray-icon = "0.24.2"

@@ -1,9 +1,0 @@
-<Project>
-  <PropertyGroup>
-    <Version>1.3.0</Version>
-    <Product>SnugWin</Product>
-    <Company>nicocat</Company>
-    <Copyright>MIT License · 2026 nicocat</Copyright>
-    <RepositoryUrl>https://github.com/nicocart/snug-win</RepositoryUrl>
-  </PropertyGroup>
-</Project>

@@ -1,200 +1,205 @@
 name: Release
 
+# **手动触发**：Actions → Release → Run workflow。
+# 参考项目（nicocart/snug-win）是「推 tag 自动发 + 手动兜底」两路，这里只留手动那一路：
+# 发版前要跑真机验收（docs/acceptance.md），验收没过就不该让一次 push 直接把包发出去。
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag（须已推送到远程，如 v1.1.1）'
-        required: true
-      draft:
-        description: '创建为草稿（不公开）'
-        type: boolean
-        default: false
+        description: '要发布的 tag（留空则用根 Cargo.toml 的版本，如 v1.0.0）'
+        required: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-manual
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: publish (${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }})
+  build:
+    name: build & verify
     runs-on: windows-latest
-    env:
-      VDD_ZIP_URL: https://github.com/MolotovCherry/virtual-display-rs/releases/download/v0.3.1/virtual-desktop-driver-installer-x64.zip
-      VDD_ZIP_SHA256: B3E3A5AB9B49BD56A7E753120CDDB1D913479BC5C0DFA781C3D43392DDE2FB75
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      exe_sha256: ${{ steps.digest.outputs.exe_sha256 }}
 
     steps:
-      - name: Resolve tag and version
-        id: meta
-        shell: pwsh
-        run: |
-          $tag = '${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}'
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = '${{ github.ref_name }}' }
-          $version = $tag.TrimStart('v')
-          if ($version -notmatch '^\d+\.\d+\.\d+') { throw "无法从 tag '$tag' 解析版本号" }
-          "tag=$tag"           >> $env:GITHUB_OUTPUT
-          "version=$version"   >> $env:GITHUB_OUTPUT
-          Write-Host "tag=$tag version=$version"
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Set up .NET 10 SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.404'
-          cache: true
-          cache-dependency-path: '**/*.csproj'
+      - name: Resolve tag and version
+        id: meta
+        shell: pwsh
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          # 版本号只有一个来源：根 Cargo.toml 的 [workspace.package] version。
+          $toml = Get-Content 'Cargo.toml' -Raw
+          $m = [regex]::Match($toml, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { throw "根 Cargo.toml 里找不到 [workspace.package] version" }
+          $version = $m.Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "版本号格式不对：$version" }
 
-      - name: Restore
-        run: dotnet restore SnugWin.sln
+          $tag = ([string]$env:RELEASE_TAG_INPUT).Trim()
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v$version" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "tag 必须形如 v1.2.3，收到：$tag" }
+          if ($tag -ne "v$version") {
+            throw "tag '$tag' 与 Cargo.toml 的版本 '$version' 不一致。资产名按 exe 版本生成，发出去会对不上。"
+          }
 
-      - name: Build (warnings are errors)
-        run: dotnet build SnugWin.sln -c Release --no-restore -warnaserror -p:Version=${{ steps.meta.outputs.version }}
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag"         >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version tag=$tag"
+
+      - name: Configure update source
+        shell: pwsh
+        env:
+          RELEASE_REPO_INPUT: ${{ vars.SNUG_RELEASES_REPO }}
+        run: |
+          $repo = ([string]$env:RELEASE_REPO_INPUT).Trim()
+          if (-not $repo) { $repo = $env:GITHUB_REPOSITORY }
+          if ($repo -notmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') { throw 'SNUG_RELEASES_REPO 必须为 owner/name' }
+          "SNUG_RELEASES_REPO=$repo" >> $env:GITHUB_ENV
+          Write-Host "更新源 = $repo"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch virtual display driver
+        # include_bytes! 在编译/测试时就需要原版安装包；先校验 SHA-256 再构建。
+        shell: pwsh
+        run: pwsh -File scripts\fetch-driver.ps1
 
       - name: Test
-        run: dotnet test SnugWin.sln -c Release --no-build
+        # 全仓单测是发版门禁的一部分：真机行为另照 docs/acceptance.md 手验。
+        # 新清单为 asInvoker；RunAsInvoker 仅兼容旧缓存的测试 harness，不会赋予管理员权限。
+        env:
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test --workspace
 
-      - name: Publish (self-contained)
-        run: dotnet publish src\SnugWin.App\SnugWin.App.csproj -c Release -r win-x64 --self-contained true -p:Version=${{ steps.meta.outputs.version }} -o dist\win-x64
+      - name: Check correctness lints
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious
 
-      - name: Publish (framework-dependent)
-        run: dotnet publish src\SnugWin.App\SnugWin.App.csproj -c Release -r win-x64 --self-contained false -p:Version=${{ steps.meta.outputs.version }} -o dist\win-x64-fdd
+      - name: Test release profile
+        env:
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test --workspace --release
 
-      - name: Fetch virtual-display-rs driver package
+      - name: Verify privileged staging ACLs
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path driver\installer | Out-Null
-          $zip = Join-Path 'driver' 'virtual-desktop-driver-installer-x64.zip'
-          Invoke-WebRequest $env:VDD_ZIP_URL -OutFile $zip -UseBasicParsing
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
-          if ($hash -ne $env:VDD_ZIP_SHA256) { throw "驱动包 SHA256 校验失败: $hash" }
-          Expand-Archive -Path $zip -DestinationPath 'driver\installer' -Force
-          Get-ChildItem 'driver\installer' | Select-Object Name, Length | Format-Table -AutoSize
-
-      - name: Assemble packages
-        shell: pwsh
-        run: |
-          $version = '${{ steps.meta.outputs.version }}'
-          $stage = 'dist\stage'
-          New-Item -ItemType Directory -Force -Path "$stage\self", "$stage\fdd", "$stage\driver" | Out-Null
-
-          Copy-Item 'dist\win-x64\*' "$stage\self\" -Recurse -Force
-          Copy-Item 'dist\win-x64-fdd\*' "$stage\fdd\" -Recurse -Force
-          Get-ChildItem $stage -Recurse -Filter *.pdb | Remove-Item -Force
-
-          & "$PWD\.github\quickstart.ps1" -Version $version -Target "$stage\self" -FrameworkDependent:$false
-          & "$PWD\.github\quickstart.ps1" -Version $version -Target "$stage\fdd"  -FrameworkDependent:$true
-
-          Copy-Item 'driver\install-driver.cmd'                        "$stage\driver\" -Force
-          Copy-Item 'driver\Install-SnugDriver.ps1'                    "$stage\driver\" -Force
-          Copy-Item 'driver\installer'                                 "$stage\driver\installer" -Recurse -Force
-
-          foreach ($portable in @("$stage\self", "$stage\fdd")) {
-            New-Item -ItemType Directory -Force -Path "$portable\driver" | Out-Null
-            Copy-Item "$stage\driver\*" "$portable\driver\" -Recurse -Force
+          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The protected System32 staging test requires an elevated Windows runner; do not silently skip it.'
           }
+          cargo test -p snug-win --lib system_paths::tests::elevated_atomic_staging_inherits_production_acl -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { throw 'Privileged staging ACL test failed' }
 
-      - name: Zip assets
+      - name: Build release
+        run: cargo build --release -p snug-app
+
+      - name: Package assets
         shell: pwsh
         run: |
-          $version = '${{ steps.meta.outputs.version }}'
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $map = [ordered]@{
-            "dist\SnugWin-v$version-win-x64-selfcontained.zip"      = 'dist\stage\self'
-            "dist\SnugWin-v$version-win-x64-frameworkdependent.zip" = 'dist\stage\fdd'
-            'dist\virtual-display-driver-0.3.1-x64.zip'             = 'dist\stage\driver'
-          }
-          foreach ($out in $map.Keys) {
-            if (Test-Path $out) { Remove-Item $out -Force }
-            [System.IO.Compression.ZipFile]::CreateFromDirectory($map[$out], $out, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-            Write-Host ("{0}  {1:N2} MB" -f (Split-Path $out -Leaf), ((Get-Item $out).Length / 1MB))
-          }
+          pwsh -File scripts\build-release.ps1 -Exe target\release\snug.exe -ReleasesRepo $env:SNUG_RELEASES_REPO
+          if ($LASTEXITCODE -ne 0) { throw "打包失败 ($LASTEXITCODE)" }
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
 
-      - name: Build Windows installer (Inno Setup)
+      - name: Preflight (version / size / manifest / deps / package)
+        # 放在打包之后：门禁里有一项是核对 dist 里那个 zip 的结构与校验和。
         shell: pwsh
         run: |
-          $version = '${{ steps.meta.outputs.version }}'
-          $iscc = @(
-            (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          pwsh -File scripts\preflight.ps1 -Exe target\release\snug.exe -ReleasesRepo $env:SNUG_RELEASES_REPO
+          if ($LASTEXITCODE -ne 0) { throw "preflight 未通过 ($LASTEXITCODE)" }
 
-          if (-not $iscc) {
-            choco install innosetup -y --no-progress
-            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          }
-          if (-not (Test-Path $iscc)) { throw "未找到 Inno Setup 编译器 ISCC.exe" }
-
-          & $iscc `
-            "/DAppVersion=$version" `
-            "/DRootDir=$PWD" `
-            "/DAppDir=$PWD\dist\stage\self" `
-            "/DDriverDir=$PWD\dist\stage\driver" `
-            "/DOutputDir=$PWD\dist" `
-            "installer\SnugWin.iss"
-          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译安装包失败 ($LASTEXITCODE)" }
-          $exe = Get-Item "dist\SnugWin-v$version-win-x64-setup.exe"
-          Write-Host ("{0}  {1:N2} MB" -f $exe.Name, ($exe.Length / 1MB))
-
-      - name: Generate checksums and release notes
+      - name: Generate release notes
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          $version = '${{ steps.meta.outputs.version }}'
-          $tag = '${{ steps.meta.outputs.tag }}'
+          $version = $env:RELEASE_VERSION
+          $tag = $env:RELEASE_TAG
 
-          # 自上一个 tag 以来的提交，作为「本版变化」的原始素材
-          $prev = git describe --tags --abbrev=0 --exclude "$tag" "$tag^" 2>$null
+          # 自上一个 tag 以来的提交，作为「本版变化」的原始素材。
+          $prev = git describe --tags --abbrev=0 --exclude "$tag" HEAD 2>$null
           if ($LASTEXITCODE -eq 0 -and $prev) {
-            $range = "$prev..$tag"
-            $commits = @(git log --pretty=format:'- %s (`%h`)' $range)
-            $commitsHeader = "自 ``$prev`` 以来的提交："
+            $commits = @(git log --pretty=format:'- %s (`%h`)' "$prev..HEAD")
+            $header = "自 ``$prev`` 以来的提交："
+            $compare = "https://github.com/${{ github.repository }}/compare/$prev...$tag"
           } else {
-            $prev = 'main'
-            $commits = @(git log --pretty=format:'- %s (`%h`)' -20 $tag)
-            $commitsHeader = "最近 20 条提交："
+            $prev = ''
+            $commits = @(git log --pretty=format:'- %s (`%h`)' -20 HEAD)
+            $header = "最近 20 条提交："
+            $compare = "https://github.com/${{ github.repository }}/commits/$tag"
           }
-          Write-Host "commits: $($commits.Count)"
 
-          $pkgs = Get-ChildItem 'dist' -File | Where-Object { $_.Extension -in '.zip', '.exe' } | Sort-Object Name
-          $lines = @(foreach ($z in $pkgs) { '{0}  {1}' -f (Get-FileHash $z.FullName -Algorithm SHA256).Hash, $z.Name })
-          $lines | Set-Content 'dist\checksums.txt' -Encoding UTF8
-          $lines | ForEach-Object { Write-Host $_ }
+          # 使用打包后已通过门禁的校验和，不在验证之后重写资产。
+          $lines = @(Get-Content -LiteralPath 'dist\checksums.txt')
 
           $fence = '```'
           $tail = @('', '### 校验和', '', ($fence + 'text')) + $lines + @($fence, '')
-          $changeLog = (@($commitsHeader, '') + $commits) -join "`r`n"
-
-          $template = Get-Content '.github\release-notes-template.md' -Raw -Encoding UTF8
-          $body = $template.Replace('{{VERSION}}', $version)
+          $body = (Get-Content '.github\release-notes-template.md' -Raw -Encoding utf8)
+          $body = $body.Replace('{{VERSION}}', $version)
+          $body = $body.Replace('{{TAG}}', $tag)
           $body = $body.Replace('{{PREVIOUS}}', $prev)
-          $body = $body.Replace('{{COMMITS}}', $changeLog)
+          $body = $body.Replace('{{COMPARE}}', $compare)
+          $body = $body.Replace('{{COMMITS}}', ((@($header, '') + $commits) -join "`r`n"))
           $body = $body + ($tail -join "`r`n")
-          Set-Content 'dist\release-notes.md' -Value $body -Encoding UTF8
+          Set-Content 'dist\release-notes.md' -Value $body -Encoding utf8
           Write-Host "release notes: $((Get-Item 'dist\release-notes.md').Length) bytes"
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Record exact acceptance artifact
+        id: digest
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath 'dist/snug.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "exe_sha256=$hash" >> $env:GITHUB_OUTPUT
+          "## Snug acceptance artifact`nSHA-256: $hash`n`nPublic publication requires this exact tested EXE hash." >> $env:GITHUB_STEP_SUMMARY
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: SnugWin v${{ steps.meta.outputs.version }}
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: Snug v${{ needs.build.outputs.version }}
+          target_commitish: ${{ github.sha }}
           body_path: dist/release-notes.md
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          # Public promotion uses publish.yml after exact-file Windows acceptance; never rebuild there.
+          draft: true
           prerelease: false
           fail_on_unmatched_files: true
           files: |
-            dist/SnugWin-v${{ steps.meta.outputs.version }}-win-x64-setup.exe
-            dist/SnugWin-v${{ steps.meta.outputs.version }}-win-x64-selfcontained.zip
-            dist/SnugWin-v${{ steps.meta.outputs.version }}-win-x64-frameworkdependent.zip
-            dist/virtual-display-driver-0.3.1-x64.zip
+            dist/snug.exe
+            dist/Snug-v${{ needs.build.outputs.version }}-win-x64-selfcontained.zip
             dist/checksums.txt

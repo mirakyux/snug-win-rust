@@ -1,0 +1,9 @@
+Noto Emoji font attribution
+
+Font name: Noto Emoji
+Copyright 2013 Google Inc. All Rights Reserved.
+Noto is a trademark of Google Inc.
+Designed by Monotype Design Team.
+
+This font is distributed under the SIL Open Font License, Version 1.1.
+See OFL.txt for the complete license text.

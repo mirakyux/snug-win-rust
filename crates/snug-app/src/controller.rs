@@ -1,0 +1,1514 @@
+//! 应用控制器：把 `snug-core` 的手机屏状态机接到 `snug-win` 的平台实现上。
+//!
+//! 对应 C# 版 `SnugWin.App.AppController`。区别在于本移植不引 async 运行时：
+//! `snug-core::desk::Desk` 的方法只入队，真正的动作在它自己的工作线程里串行执行（对应 C# `SerialLane`）。
+//! 控制线程处理界面动作和屏幕愿望；UU 探测在独立线程运行，只发布最新结果。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use snug_core::desk::{
+    AppControl, DeskSet, DeskSetEvents, DeskSetOptions, DeskState, PhoneDisplays, PhoneScreenPhase,
+};
+use snug_core::session::{ControllerTable, EpisodeChange, SessionEpisode, UUSignals};
+use snug_core::touch::{TouchOptions, TouchRegion};
+use snug_core::windows::{AppInfo, WindowInfo};
+use snug_core::{AppConfig, Paths, PhoneScreenMode, Rect};
+use snug_win::{WinPhoneDisplays, WinWindows};
+use snug_win::crossdesk::{CrossDeskActivity, CrossDeskSensor};
+
+/// `snug-win` 的 `WinApps` 已经实现了 core 的 [`AppControl`]
+/// （`apps.rs` 的 `impl<S: AppSystem> AppControl for Apps<S>`），控制器直接用真机实现。
+use snug_win::WinApps;
+
+/// 手势钩子抛给**界面**的事件（对应 C# `TouchHookService` 的选区两个事件）。
+///
+/// 关闭窗口那一路不在这里：它由后台线程直接 `desk.close_placed(handle)` 处理，
+/// 不经过界面（界面关掉也没关系）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchEvent {
+    /// 选区结束（物理像素坐标）→ 界面在选区上方弹"复制"气泡。
+    SelectionCompleted(snug_core::Point),
+    /// 选区被取消 → 收起气泡。
+    SelectionDismissed,
+}
+
+/// 钩子线程把事件塞进队列，应用侧每帧取走（对应 C# 里 `Dispatcher.BeginInvoke`）。
+#[derive(Default)]
+struct TouchEventQueue {
+    close: std::sync::Mutex<Vec<u64>>,
+    selection: std::sync::Mutex<Vec<TouchEvent>>,
+}
+
+impl TouchEventQueue {
+    fn push_close(&self, handle: u64) {
+        self.close.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+    }
+
+    fn push(&self, event: TouchEvent) {
+        self.selection.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+    }
+
+    fn take_close(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.close.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn take_selection(&self) -> Vec<TouchEvent> {
+        std::mem::take(&mut *self.selection.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// 给 `TouchHook` 用的事件接收端。
+struct HookEvents {
+    queue: Arc<TouchEventQueue>,
+}
+
+impl snug_win::touch::TouchEvents for HookEvents {
+    fn close_window_requested(&self, handle: u64) {
+        self.queue.push_close(handle);
+    }
+
+    fn selection_completed(&self, at: snug_core::Point) {
+        self.queue.push(TouchEvent::SelectionCompleted(at));
+    }
+
+    fn selection_dismissed(&self) {
+        self.queue.push(TouchEvent::SelectionDismissed);
+    }
+}
+
+/// 界面线程排给后台线程的 desk 操作。
+///
+/// 界面线程不直接 `lock()` 那个 `DeskSet`（后台可能正在里面建屏），
+/// 而是把要做的动作塞进队列，由后台线程在两次 `idle()` 之间执行。
+type DeskAction = Box<dyn FnOnce(&mut DeskSet) + Send>;
+
+const UU_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const UU_SAMPLE_MAX_AGE: f64 = 5.0;
+
+#[derive(Default)]
+struct CrossDeskSession {
+    episode: SessionEpisode,
+    last_active_at: Option<f64>,
+}
+
+impl CrossDeskSession {
+    fn update(&mut self, enabled: bool, activity: CrossDeskActivity, now: f64) -> bool {
+        if !enabled {
+            let ended = self.episode.is_active();
+            *self = Self::default();
+            return ended;
+        }
+        let ended = self.episode.advance(now) == Some(EpisodeChange::Ended);
+        match activity {
+            CrossDeskActivity::Active => {
+                self.last_active_at = Some(now);
+                self.episode.connected(now);
+            }
+            CrossDeskActivity::Inactive => {
+                self.last_active_at = None;
+                self.episode.disconnected(now);
+            }
+            CrossDeskActivity::Unknown => {
+                if self.last_active_at.is_some_and(|at| now - at > UU_SAMPLE_MAX_AGE) {
+                    self.last_active_at = None;
+                    self.episode.disconnected(now);
+                }
+            }
+        }
+        ended
+    }
+}
+
+struct UuSample {
+    sampled_at: f64,
+    signals: snug_win::UuSignalSet,
+}
+
+type LatestUuSample = Arc<std::sync::Mutex<Option<UuSample>>>;
+
+enum UuReading {
+    Fresh(snug_win::UuSignalSet),
+    Pending,
+    Stale,
+}
+
+fn read_uu_sample(
+    latest: &std::sync::Mutex<Option<UuSample>>,
+    now: f64,
+    last_sample_at: &mut f64,
+) -> UuReading {
+    let sample = latest.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match sample {
+        Some(mut sample) if now - sample.sampled_at <= UU_SAMPLE_MAX_AGE => {
+            *last_sample_at = sample.sampled_at;
+            if now - sample.sampled_at > 1.5 {
+                sample.signals.capture_evidence = Default::default();
+            }
+            UuReading::Fresh(sample.signals)
+        }
+        _ if now - *last_sample_at > UU_SAMPLE_MAX_AGE => UuReading::Stale,
+        _ => UuReading::Pending,
+    }
+}
+
+/// 控制器：持有状态机与后台线程，界面只读它。
+pub struct Controller {
+    /// 多屏管理器（对应 C# `DeskSet`）：一块屏一个 desk，共用一条串行队列。
+    ///
+    /// `DeskSet` 的写操作（`set_wishes`/`set_remote`/`shutdown`）要 `&mut self`，
+    /// 所以外面套了 `Mutex`。
+    ///
+    /// **锁的纪律**（很重要，别破坏）：
+    /// - 后台线程在 `idle()` 里会**执行队列里的慢操作**（建屏最长 8 秒 × 4 个候选），
+    ///   这段期间锁是被它占着的；
+    /// - 所以界面线程**绝不能**在锁上等：读走 [`Self::snapshots`]（后台每拍刷新），
+    ///   写走 [`Self::pending`] 队列由后台线程代劳。
+    ///   之前直接在界面线程 `lock()` 过一次，结果是建屏期间界面整块卡死。
+    desks: Arc<std::sync::Mutex<snug_core::desk::DeskSet>>,
+    /// 后台线程每拍刷新的状态快照（屏 id → 状态），界面读它就不必碰 `desks` 的锁。
+    snapshots: Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>>,
+    /// 界面线程排给后台线程的 desk 操作（`pull`/`open`/`set_wishes` …）。
+    pending: Arc<std::sync::Mutex<Vec<DeskAction>>>,
+    /// 最近一次屏配置（wishes 由它算，写屏列表时更新）。
+    config: Arc<std::sync::Mutex<AppConfig>>,
+    /// 屏配置或当前选择发生变化，唤醒下一次控制循环重新计算愿望。
+    screen_policy_changed: Arc<AtomicBool>,
+    /// 安装或授权任务结束后，控制线程才清理残留屏并应用配置。
+    driver_startup_pending: Arc<AtomicBool>,
+    /// 界面当前显示哪块屏（`None` = 主触控屏）。
+    ///
+    /// 多屏时**只有这块屏会真的建出来**：我们只有一个窗口，建成 N 块虚拟屏的话
+    /// 其余几块是纯黑屏，比"看不到"更糟。所以同一时刻只保留一块，
+    /// 切换就是换一台设备（旧屏撤、新屏建）。见 `docs/multi-screen.md`。
+    active_screen: Arc<std::sync::Mutex<Option<String>>>,
+    /// 手机屏（界面窗口要搬到它的位置上，所以留一份）。
+    displays: Arc<WinPhoneDisplays>,
+    /// 手势钩子（C# `TouchHookService`）。
+    touch: Arc<snug_win::TouchHook>,
+    /// UU 远程会话状态机（控制线程消费采样结果，界面读它判断"在不在会话里"）。
+    session: Arc<std::sync::Mutex<snug_core::session::RemoteSession>>,
+    crossdesk_in_episode: Arc<AtomicBool>,
+    /// 上一次真的装到钩子上的区域；`set_region` 会起线程，不能每帧重复装。
+    touch_region: Arc<std::sync::Mutex<Option<TouchRegion>>>,
+    /// 钩子抛出的事件队列（关闭窗口 / 选区结束 / 选区取消）。
+    touch_events: Arc<TouchEventQueue>,
+    /// "选后复制"真正按快捷键的那一层（C# `WindowService.PerformSelectionActionAsync`）。
+    selection_actions: Arc<snug_win::WinSelectionActions>,
+    #[allow(dead_code)] // 后续设置界面/诊断要用
+    paths: Paths,
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Controller {
+    /// 按配置建起状态机与平台实现，并启动后台线程。
+    ///
+    /// `on_change` 在状态机每次推送新状态时被调用（界面据此重绘）。
+    pub fn start(
+        config: &AppConfig,
+        paths: &Paths,
+        driver_startup_pending: bool,
+        on_change: impl Fn() + Send + Sync + 'static,
+        log: impl Fn(&str) + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
+        let displays = Arc::new(WinPhoneDisplays::with_paths(paths));
+        let windows = Arc::new(WinWindows::new());
+        let apps: Arc<dyn AppControl> = Arc::new(WinApps::new());
+
+        // 会话状态机与它用的时钟：`DeskSetEvents::topology_changing` 回调也要用到
+        // （C# `_desks.TopologyChanging += () => _session.NoteSelfInducedChange(now)`），
+        // 所以两边必须是同一个 `RemoteSession`、同一根时间轴。
+        let clock = std::time::Instant::now();
+        let session = Arc::new(std::sync::Mutex::new(snug_core::session::RemoteSession::new()));
+
+        let on_change = Arc::new(on_change);
+        let ui_changed = on_change.clone();
+        let events = DeskSetEvents {
+            state_changed: Some(Arc::new(move || ui_changed())),
+            gone: None,
+            topology_changing: Some(Arc::new({
+                let session = session.clone();
+                move || {
+                    if let Ok(mut session) = session.lock() {
+                        session.note_self_induced_change(clock.elapsed().as_secs_f64());
+                    }
+                }
+            })),
+            log: Some(Arc::new(log)),
+        };
+        let options = DeskSetOptions {
+            timeline: None,
+            default_zoom: config.zoom_steps,
+            events,
+        };
+
+        let desks = Arc::new(std::sync::Mutex::new(DeskSet::new(
+            displays.clone(),
+            windows,
+            apps,
+            paths,
+            options,
+        )));
+        let snapshots: Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<std::sync::Mutex<Vec<DeskAction>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let startup_displays = displays.clone();
+        let driver_startup_pending = Arc::new(AtomicBool::new(driver_startup_pending));
+        let driver_startup_worker = driver_startup_pending.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let desks_worker = desks.clone();
+        let latest_uu: LatestUuSample = Arc::new(std::sync::Mutex::new(None));
+        {
+            let latest = latest_uu.clone();
+            let stop = running.clone();
+            // UIA 调用可能被外部进程卡住：控制线程读最新结果，退出时也不等待探测线程。
+            std::thread::Builder::new()
+                .name("snug-uu-sampler".to_string())
+                .spawn(move || {
+                    let sensor = snug_win::UuSensor::new();
+                    while stop.load(Ordering::Relaxed) {
+                        let began = std::time::Instant::now();
+                        let sampled_at = began.duration_since(clock).as_secs_f64();
+                        let signals = sensor.sample(sampled_at);
+                        let elapsed = began.elapsed();
+                        if !stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        *latest.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(UuSample { sampled_at, signals });
+                        if elapsed > UU_SAMPLE_INTERVAL {
+                            crate::warn!("UU：一次探测耗时 {} ms", elapsed.as_millis());
+                        }
+                        std::thread::sleep(UU_SAMPLE_INTERVAL.saturating_sub(elapsed));
+                    }
+                })
+                .map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("无法启动 UU 探测线程：{error}"))
+                })?;
+        }
+        let session_worker = session.clone();
+        let initial_mode = config.phone_screen_mode();
+        let config = Arc::new(std::sync::Mutex::new(config.clone()));
+        let config_worker = config.clone();
+        let screen_policy_changed = Arc::new(AtomicBool::new(true));
+        let screen_policy_worker = screen_policy_changed.clone();
+        let crossdesk_in_episode = Arc::new(AtomicBool::new(false));
+        let crossdesk_episode_worker = crossdesk_in_episode.clone();
+        let latest_crossdesk = Arc::new(std::sync::Mutex::new(None));
+        {
+            let latest = latest_crossdesk.clone();
+            let config = config.clone();
+            let stop = running.clone();
+            let sampler = std::thread::Builder::new().name("snug-crossdesk-sampler".into()).spawn(move || {
+                let sensor = CrossDeskSensor::new();
+                while stop.load(Ordering::Relaxed) {
+                    let began = std::time::Instant::now();
+                    let enabled = config.lock().map(|cfg| cfg.crossdesk_enabled).unwrap_or(false);
+                    let value = enabled.then(|| (began.duration_since(clock).as_secs_f64(), sensor.sample()));
+                    *latest.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                    std::thread::sleep(UU_SAMPLE_INTERVAL.saturating_sub(began.elapsed()));
+                }
+            });
+            if let Err(error) = sampler {
+                crate::warn!("无法启动 CrossDesk 探测线程：{error}");
+            }
+        }
+        let active_screen: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let active_screen_worker = active_screen.clone();
+        let snapshots_worker = snapshots.clone();
+        let pending_worker = pending.clone();
+        // 钩子要在起后台线程之前建好：线程要 drain 它抛出的"关闭窗口"事件。
+        let touch_events = Arc::new(TouchEventQueue::default());
+        let touch = Arc::new(snug_win::TouchHook::with_parts(
+            Arc::new(snug_win::touch::WinInput),
+            Arc::new(HookEvents { queue: touch_events.clone() }),
+        ));
+        let touch_region = Arc::new(std::sync::Mutex::new(None));
+        let touch_region_worker = touch_region.clone();
+        let touch_worker = touch.clone();
+        let touch_events_worker = touch_events.clone();
+        let worker = match std::thread::Builder::new()
+            .name("snug-desk-idle".to_string())
+            .spawn(move || {
+                // 显示设置变化：C# 用 `SystemEvents.DisplaySettingsChanged`，
+                // 我们轮询显示器拓扑签名（更省事，也不需要消息窗）。
+                use snug_win::display::DisplayApi;
+                let display = snug_win::WinDisplay::new();
+                let mut last_topology: Option<Vec<(u32, i32, i32, i32, i32)>> = None;
+                // 与 `topology_changing` 回调共用同一根时间轴（会话状态机内部按秒比较）。
+                let started = clock;
+                let mut last_session_poll = -1.0_f64;
+                let mut last_uu_sample = 0.0_f64;
+                let mut uu_sample_stale = false;
+                let mut crossdesk_session = CrossDeskSession::default();
+                let mut last_crossdesk_activity = CrossDeskActivity::Unknown;
+                let mut was_uu_in_episode = false;
+                let mut in_episode = false;
+                let mut was_in_episode = false;
+                let mut last_mode = initial_mode;
+                let mut last_topology_check = -1.0_f64;
+                let mut last_check_returns = -1.0_f64;
+                let mut last_connected = false;
+                let mut last_signals = None;
+                let mut panel_handle = None;
+                let mut startup_recovered = false;
+                while stop.load(Ordering::Relaxed) {
+                    // 界面排过来的动作先做（只是入队，很快）：这样界面线程永远不用在
+                    // `DeskSet` 的锁上等——那把锁在 `idle()` 里可能被建屏占住好几秒。
+                    let actions: Vec<DeskAction> = pending_worker
+                        .lock()
+                        .map(|mut queue| std::mem::take(&mut *queue))
+                        .unwrap_or_default();
+                    if !actions.is_empty()
+                        && let Ok(mut desks) = desks_worker.lock()
+                    {
+                        for action in actions {
+                            action(&mut desks);
+                        }
+                    }
+                    // 状态快照：发一份给界面（后台线程是唯一的发布者）。
+                    publish_snapshots(&desks_worker, &snapshots_worker, on_change.as_ref());
+                    if clear_touch_region_if_offline(&snapshots_worker, &touch_region_worker, &|| {
+                        touch_worker.set_region(None);
+                        touch_worker.set_passthrough_regions(Vec::new(), None);
+                    }) {
+                        crate::info!("手势钩子：已停用（后台确认手机屏未就绪）");
+                    }
+                    // **不要在这里调 `DeskSet::idle()`**（砌复查的结论）：
+                    // 它不是"排空队列"，而是"等到所有 desk 都 quiet"——
+                    // 有 watch 在跑时要等到 watch 结束（打开窗口 30s、退出 10s、
+                    // 卡死跟随再 60s），而且期间是忙等、吃满一个核。
+                    // 更糟的是这期间 `set_wishes` 进不去，会话结束时撤屏会被推迟，
+                    // "退出远控后虚拟屏还挂着"那个 bug 会原样复现。
+                    // 重试与 watch 都是独立线程、自己会推进；`check_returns` 只是入队。
+                    // `check_returns` 在有 left-behind 条目时要枚举窗口、读标题，
+                    // 单次真机实测 **3 秒**。原先每拍（500ms）入队 → 生产 2 个/秒、
+                    // 消费 0.33 个/秒 → 共享队列无限积压（`[lane] 动作排队 219.8s`），
+                    // 用户点 App 要排几分钟才执行。现在 5 秒一次：被接管的窗口晚几秒
+                    // 回来用户无感，队列也不会被堵。
+                    let now = started.elapsed().as_secs_f64();
+                    if now - last_check_returns >= 5.0 {
+                        last_check_returns = now;
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.check_returns();
+                        }
+                    }
+                    publish_snapshots(&desks_worker, &snapshots_worker, on_change.as_ref());
+                    // 用户点了窗口自带的关闭按钮（C# `_desks.ClosePlaced(handle)`）。
+                    for handle in touch_events_worker.take_close() {
+                        crate::info!("手势：点了窗口关闭按钮，关掉 {handle:#x}");
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.close_placed(handle);
+                        }
+                    }
+                    let now = started.elapsed().as_secs_f64();
+                    let poll_session = now - last_session_poll >= 1.0;
+                    let mut replaced_episode = false;
+                    if poll_session {
+                        last_session_poll = now;
+                        let signals = match read_uu_sample(&latest_uu, now, &mut last_uu_sample) {
+                            UuReading::Fresh(sampled) => {
+                                if uu_sample_stale {
+                                    crate::info!("UU：探测已恢复");
+                                    uu_sample_stale = false;
+                                }
+                                let summary = (
+                                    sampled.client_running,
+                                    sampled.client_visible,
+                                    sampled.capture_active,
+                                    sampled.peer_active,
+                                    sampled.controllers.names.len(),
+                                    sampled.controllers.readable,
+                                    matches!(sampled.capture_evidence, snug_core::session::UuCaptureEvidence::HardwareEncoding),
+                                );
+                                if last_signals != Some(summary) {
+                                    crate::info!(
+                                        "UU 探测：客户端={} 服务端可见窗候选={} 推流={:?} 对端={} 控制端={}（{}）视频编码={}",
+                                        summary.0,
+                                        summary.1,
+                                        summary.2,
+                                        summary.3,
+                                        summary.4,
+                                        if summary.5 { "可读" } else { "读不到" },
+                                        summary.6,
+                                    );
+                                    last_signals = Some(summary);
+                                }
+                                Some(sampled.to_signals())
+                            }
+                            UuReading::Pending => None,
+                            UuReading::Stale => {
+                                if !uu_sample_stale {
+                                    crate::warn!(
+                                        "UU：超过 {UU_SAMPLE_MAX_AGE} 秒没有新鲜探测结果，按无新证据推进会话"
+                                    );
+                                    uu_sample_stale = true;
+                                }
+                                Some(UUSignals {
+                                    overlay_visible: false,
+                                    controllers: ControllerTable::unreadable(),
+                                    capture_active: None,
+                                    capture_evidence: Default::default(),
+                                })
+                            }
+                        };
+                        // 会话判定用 `RemoteSession`（不只是 ConnectionTracker）：C# 的
+                        // `_session.InEpisode` 决定"该不该有屏"，中断后还有一段重连窗口，
+                        // 单用 `ConnectionTracker` 会把这段丢掉。
+                        let (connected, uu_in_episode, controllers_len, ended) = {
+                            let mut session =
+                                session_worker.lock().unwrap_or_else(|e| e.into_inner());
+                            let ended = signals.is_some_and(|signals| {
+                                session.update(&signals, now).iter().any(|t| {
+                                    matches!(t, snug_core::session::SessionTransition::Ended)
+                                })
+                            });
+                            (
+                                session.is_connected(),
+                                session.in_episode(),
+                                session.controllers().len(),
+                                ended,
+                            )
+                        };
+                        if connected != last_connected {
+                            last_connected = connected;
+                            crate::info!(
+                                "远程会话：{}（控制端 {} 个）",
+                                if connected { "已连入" } else { "已断开" },
+                                controllers_len
+                            );
+                        }
+                        if ended {
+                            crate::info!("UU：本次远程会话结束");
+                        }
+                        let crossdesk_enabled = config_worker.lock().map(|cfg| cfg.crossdesk_enabled).unwrap_or(false);
+                        let crossdesk_activity = if crossdesk_enabled {
+                            latest_crossdesk.lock().ok().and_then(|mut sample| sample.take())
+                                .filter(|(at, _)| now - *at <= UU_SAMPLE_MAX_AGE)
+                                .map(|(_, activity)| activity)
+                                .unwrap_or(CrossDeskActivity::Unknown)
+                        } else {
+                            CrossDeskActivity::Unknown
+                        };
+                        // Missing one sample is routine. Log only explicit results or a sustained loss
+                        // of the episode so the diagnostic log does not oscillate every poll.
+                        let crossdesk_ended = crossdesk_session.update(crossdesk_enabled, crossdesk_activity, now);
+                        let crossdesk_active = crossdesk_session.episode.is_active();
+                        crossdesk_episode_worker.store(crossdesk_active, Ordering::Relaxed);
+                        if (crossdesk_activity != CrossDeskActivity::Unknown || crossdesk_ended)
+                            && crossdesk_activity != last_crossdesk_activity
+                        {
+                            crate::info!("CrossDesk：会话观测={crossdesk_activity:?}");
+                            last_crossdesk_activity = crossdesk_activity;
+                        }
+                        touch_worker.set_crossdesk_enabled(crossdesk_active && !uu_in_episode);
+                        replaced_episode = ended && (uu_in_episode || was_uu_in_episode && crossdesk_active)
+                            || crossdesk_ended && crossdesk_active && !uu_in_episode;
+                        was_uu_in_episode = uu_in_episode;
+                        in_episode = uu_in_episode || crossdesk_active;
+                    }
+                    // 授权由独立任务处理。期间继续探测会话，等授权任务完成后先清残留屏，
+                    // 再按最新的会话和设置建立屏幕。
+                    let changed = screen_policy_worker.swap(false, Ordering::AcqRel);
+                    let authorization_pending = driver_startup_worker.load(Ordering::Acquire);
+                    if should_apply_screen_policy(
+                        authorization_pending,
+                        startup_recovered,
+                        poll_session || changed,
+                    ) {
+                        if !startup_recovered {
+                            startup_displays.cleanup_orphans();
+                            if let Ok(desks) = desks_worker.lock() {
+                                desks.recover();
+                            }
+                            startup_recovered = true;
+                            if !stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        let active = active_screen_worker
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
+                        let (mode, wishes) = {
+                            let config =
+                                config_worker.lock().unwrap_or_else(|e| e.into_inner());
+                            let mode = config.phone_screen_mode();
+                            (mode, active_wishes(&config, in_episode, active.as_deref()))
+                        };
+                        if let Ok(mut desks) = desks_worker.lock() {
+                            if replaced_episode && mode != PhoneScreenMode::Always {
+                                desks.set_remote(false);
+                                desks.set_wishes(Vec::new());
+                            }
+                            desks.set_remote(in_episode);
+                            desks.set_wishes(wishes);
+                            if mode == PhoneScreenMode::Always {
+                                let episode_ended = replaced_episode || was_in_episode && !in_episode;
+                                if episode_ended || was_in_episode != in_episode || last_mode != mode {
+                                    desks.reset_retained_screen_session(episode_ended);
+                                }
+                            }
+                        }
+                        was_in_episode = in_episode;
+                        last_mode = mode;
+                    }
+                    if now - last_topology_check >= 2.0 {
+                        last_topology_check = now;
+                        // 删除请求失败时拓扑不会变化，善后仍需定时推进。
+                        if let Ok(desks) = desks_worker.lock() {
+                            desks.settle_displays();
+                        }
+                        let monitors = display.active_monitors();
+                        let topology: Vec<(u32, i32, i32, i32, i32)> = monitors
+                            .iter()
+                            .map(|monitor| {
+                                (
+                                    monitor.stable_id,
+                                    monitor.bounds.x as i32,
+                                    monitor.bounds.y as i32,
+                                    monitor.bounds.width as i32,
+                                    monitor.bounds.height as i32,
+                                )
+                            })
+                            .collect();
+                        if let Some(previous) = &last_topology
+                            && *previous != topology
+                        {
+                            crate::info!(
+                                "显示器拓扑变化（{} → {} 块屏），通知状态机重新核对",
+                                previous.len(),
+                                topology.len()
+                            );
+                            if let Ok(desks) = desks_worker.lock() {
+                                desks.displays_changed();
+                            }
+                        }
+                        last_topology = Some(topology);
+
+                        // 不依赖 egui 出帧：屏幕已就绪但窗口仍在屏外时由后台搬回。
+                        // 只恢复本进程的面板；已在屏内的底栏/设置不被改成整屏。
+                        let ready = snapshots_worker.lock().ok().and_then(|states| {
+                            states.values().find(|state| state.screen_phase == PhoneScreenPhase::Ready)
+                                .cloned()
+                        });
+                        if let Some(state) = ready
+                            && let Some(screen) = monitors.iter().find(|monitor| {
+                                monitor.virtual_display_id == state.display_id
+                                    && state.display_id.is_some()
+                            })
+                        {
+                            if panel_handle.is_none() {
+                                panel_handle = snug_win::find_own_window(crate::ui::WINDOW_TITLE);
+                            }
+                            if let Some(hwnd) = panel_handle {
+                                match snug_win::frame_of(hwnd) {
+                                    Some(frame) => {
+                                        if let Some(bounds) = panel_recovery_bounds(&state, frame, screen.bounds) {
+                                            let mut request = snug_win::PlacementRequest::new(bounds);
+                                            request.no_activate = true;
+                                            if snug_win::apply_placement(hwnd, &request) {
+                                                crate::info!("面板恢复：手机屏已就绪，将屏外窗口搬回 {}", bounds.short());
+                                                on_change();
+                                            }
+                                        }
+                                    }
+                                    None => panel_handle = None,
+                                }
+                            }
+                        }
+                    }
+                    // UI 动作和状态快照不应各等半秒；较重探测仍由各自的秒级门限控制。
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                // The sampler may be blocked inside an external UIA provider; signal it
+                // to stop, but do not block startup cleanup waiting for an uncancellable COM call.
+                running.store(false, Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("无法启动手机屏控制线程：{error}"),
+                ));
+            }
+        };
+
+
+        Ok(Self {
+            desks,
+            snapshots,
+            pending,
+            config,
+            screen_policy_changed,
+            driver_startup_pending,
+            active_screen,
+            displays,
+            touch,
+            session,
+            crossdesk_in_episode,
+            touch_region,
+            touch_events,
+            selection_actions: Arc::new(snug_win::WinSelectionActions::new()),
+            paths: paths.clone(),
+            running,
+            worker: Some(worker),
+        })
+    }
+
+    /// 主触控屏的 id（单屏界面默认操作的那块）。
+    fn primary_screen_id(&self) -> Option<String> {
+        let config = self.config.lock().ok()?;
+        selected_screen_id(&config, None)
+    }
+
+    /// 所有已启用屏幕的 `(id, 名字)`，按配置顺序。
+    pub fn enabled_screens(&self) -> Vec<(String, String)> {
+        let Ok(config) = self.config.lock() else {
+            return Vec::new();
+        };
+        config
+            .effective_screens()
+            .into_iter()
+            .filter(|screen| screen.enabled)
+            .map(|screen| (screen.id, screen.name))
+            .collect()
+    }
+
+    /// 指定屏的状态快照；`None` 表示"主触控屏"。
+    ///
+    /// **只读后台线程发布的快照**，绝不在 `DeskSet` 的锁上等：那把锁属于后台线程，
+    /// 而它可能在等一条慢动作（建屏/等窗口），界面每帧都要读状态（见字段上的锁纪律）。
+    ///
+    /// 指定了 id 却查不到时返回默认值，**不要**退到"随便拿一块屏"：
+    /// `HashMap` 的迭代顺序是随机的，多块 desk 时会静默显示错的那块。
+    pub fn state_of(&self, screen_id: Option<&str>) -> DeskState {
+        let id = screen_id.map(str::to_string).or_else(|| self.primary_screen_id());
+        let Ok(snap) = self.snapshots.lock() else {
+            return DeskState::default();
+        };
+        match id {
+            Some(id) => snap.get(&id).cloned().unwrap_or_default(),
+            // 一张屏配置都没有（异常配置）：只能拿任意一块，总比空白好。
+            None => snap.values().next().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// 屏列表变了（设置里增删改屏，对应 C# `_desks.SetWishes(ScreenPlan.Wishes(...))`）。
+    ///
+    /// 配置当场存下，后台线程结合当时的会话和屏幕选择执行 `set_wishes`。
+    pub fn apply_screens(&self, config: &AppConfig) {
+        if let Ok(mut stored) = self.config.lock() {
+            *stored = config.clone();
+            self.screen_policy_changed.store(true, Ordering::Release);
+        }
+        self.set_default_zoom(config.zoom_steps);
+    }
+
+    /// 切换界面当前显示哪块屏（`None` = 主触控屏）。
+    ///
+    /// 只保留这块屏的愿望：旧屏会被撤掉、新屏建出来，等于换一台设备。
+    pub fn set_active_screen(&self, screen_id: Option<String>) {
+        if let Ok(mut active) = self.active_screen.lock() {
+            if *active == screen_id {
+                return;
+            }
+            *active = screen_id.clone();
+        }
+        crate::info!(
+            "切换屏幕：{}",
+            screen_id.as_deref().unwrap_or("主触控屏")
+        );
+        self.screen_policy_changed.store(true, Ordering::Release);
+    }
+
+    /// 重新进入手机屏：撤销用户按下的"收起"（C# `ReenterAllDismissedTouch`）。
+    pub fn reenter(&self) {
+        if !self.wants_phone_display() {
+            return;
+        }
+        crate::info!("重新进入手机屏");
+        self.enqueue(|desks| desks.reenter_screen(None));
+    }
+
+    /// 当前这一段远程会话还在不在（对应 C# `_session.InEpisode`）。
+    pub fn in_session(&self) -> bool {
+        self.crossdesk_in_episode.load(Ordering::Relaxed)
+            || self.session.lock().map(|session| session.in_episode()).unwrap_or(false)
+    }
+
+    /// 当前模式需要创建手机屏，且有触控屏被用户临时收起过。
+    ///
+    /// 读快照（`dismissed` 是屏状态的一部分），不碰 `DeskSet` 的锁。
+    pub fn can_reenter(&self) -> bool {
+        let dismissed = self
+            .snapshots
+            .lock()
+            .map(|snap| snap.values().any(|state| state.dismissed))
+            .unwrap_or(false);
+        dismissed && self.wants_phone_display()
+    }
+
+    pub fn set_phone_screen_mode(&self, mode: PhoneScreenMode) {
+        if let Ok(mut config) = self.config.lock()
+            && config.phone_screen_mode() != mode
+        {
+            config.set_phone_screen_mode(mode);
+            self.screen_policy_changed.store(true, Ordering::Release);
+            crate::info!("手机屏显示模式 = {mode:?}");
+        }
+    }
+
+    pub fn complete_driver_startup(&self) {
+        self.driver_startup_pending.store(false, Ordering::Release);
+    }
+
+    fn wants_phone_display(&self) -> bool {
+        let mode = self.config.lock().map(|config| config.phone_screen_mode());
+        mode.is_ok_and(|mode| wants_phone_display(mode, self.in_session()))
+    }
+
+    /// 默认字号档位（设置窗的 zoom 滑杆）。
+    pub fn set_default_zoom(&self, steps: i32) {
+        self.enqueue(move |desks| desks.set_default_zoom(steps));
+    }
+
+    pub fn restore_placed(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.put_back(Some(&id)));
+    }
+
+    pub fn retry_failed_screen(&self, screen_id: Option<&str>) {
+        if let Some(id) = self.resolve_screen(screen_id) {
+            self.enqueue(move |desks| {
+                if let Some(desk) = desks.desk_for_screen(Some(&id)) {
+                    desk.retry_failed_screen();
+                }
+            });
+        }
+    }
+
+    pub fn retry_resolution(&self, screen_id: String) {
+        self.enqueue(move |desks| {
+            if let Some(desk) = desks.desk_for_screen(Some(&screen_id)) {
+                desk.retry_resolution();
+            }
+        });
+    }
+
+    pub fn adjust_zoom(&self, screen_id: Option<&str>, delta: i32) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.zoom(&id, delta));
+    }
+
+    pub fn force_quit(&self, screen_id: Option<&str>, pid: i32, app: String) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.force_quit(&id, pid, &app));
+    }
+
+    pub fn dismiss_notice(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.dismiss_notice(&id));
+    }
+
+    pub fn confirm_manual_zoom_reset(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| {
+            if let Some(desk) = desks.desk_for_screen(Some(&id)) {
+                desk.confirm_manual_zoom_reset();
+            }
+        });
+    }
+
+    /// 把一个 desk 操作排给后台线程（界面线程不在这把锁上等）。
+    fn enqueue(&self, action: impl FnOnce(&mut DeskSet) + Send + 'static) {
+        match self.pending.lock() {
+            Ok(mut queue) => queue.push(Box::new(action)),
+            Err(poisoned) => poisoned.into_inner().push(Box::new(action)),
+        }
+    }
+
+    /// 一次快照返回手机屏完整矩形与底栏矩形（物理像素），供一帧内复用。
+    pub fn phone_layout_of(&self, screen_id: Option<&str>) -> Option<(Rect, Rect)> {
+        let id = self.state_of(screen_id).display_id?;
+        self.displays.phone_layout_of(id)
+    }
+
+    pub(crate) fn display_service(&self) -> Arc<WinPhoneDisplays> {
+        Arc::clone(&self.displays)
+    }
+
+    /// 主屏（非手机屏）的可用区域（物理像素），桌面预览要按它摆放。
+    pub fn main_area(&self) -> Option<Rect> {
+        self.displays.main_area()
+    }
+
+    /// 把 `Option<&str>` 屏 id 解析成具体 id（`None` = 主触控屏）。
+    fn resolve_screen(&self, screen_id: Option<&str>) -> Option<String> {
+        screen_id.map(str::to_string).or_else(|| self.primary_screen_id())
+    }
+
+    /// 回到资源库（C# `ShowList`）：界面切回列表，但铺着的窗口**仍留在手机屏上**
+    /// （`state.placed` 不清），所以列表里要留一个"回到它"的入口，见 [`Self::return_to_placed`]。
+    pub fn show_list_of(&self, screen_id: Option<&str>) {
+        if let Some(id) = self.resolve_screen(screen_id) {
+            crate::info!("应用列表：请求显示（屏 {id}）");
+            self.enqueue(move |desks| desks.show_list(Some(&id)));
+        } else {
+            crate::warn!("应用列表：当前没有可用屏幕");
+        }
+    }
+
+    /// 回到手机屏上铺着的那个窗口（C# `ReturnToPlaced`）。
+    pub fn return_to_placed_of(&self, screen_id: Option<&str>) {
+        if let Some(id) = self.resolve_screen(screen_id) {
+            crate::info!("应用列表：返回当前窗口（屏 {id}）");
+            self.enqueue(move |desks| desks.return_to_placed(Some(&id)));
+        }
+    }
+
+    /// 收起手机屏（C# `DismissScreen`）：把铺着的窗口还回去、撤屏，并且**这次远程
+    /// 不再自动弹屏**（`dismissed`），要重进得点重入胶囊或托盘菜单。
+    pub fn dismiss_screen_of(&self, screen_id: Option<&str>) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        crate::info!("收起手机屏：{id}");
+        self.enqueue(move |desks| desks.dismiss_screen(&id));
+    }
+
+    /// 取走钩子抛出的选区事件（界面每帧调一次）。
+    pub fn take_selection_events(&self) -> Vec<TouchEvent> {
+        self.touch_events.take_selection()
+    }
+
+    /// 在选区处按一次"复制"（C# `CopySelectionAtAsync`）。
+    ///
+    /// 走平台层的 `perform_selection_action`：它会先确认前台已经是目标窗口，
+    /// 不是就拒发——选区在别人窗口里，乱按 Ctrl+C 是有副作用的。
+    pub fn copy_selection_at(&self, point: snug_core::Point) -> bool {
+        self.selection_actions
+            .perform_selection_action(point, snug_core::selection::SelectionBubbleAction::Copy)
+    }
+
+    /// 把某个窗口铺到手机屏上（资源库里点已有窗口）。
+    pub fn pull(&self, screen_id: Option<&str>, window: WindowInfo) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            crate::warn!("资源库：当前没有屏幕，忽略铺窗");
+            return;
+        };
+        self.enqueue(move |desks| desks.pull(&id, window));
+    }
+
+    pub fn focus_window(&self, key: snug_core::windows::WindowKey, screen: Rect) {
+        use snug_core::desk::services::WindowControl;
+        self.enqueue(move |_| {
+            let windows = snug_win::WinWindows::new();
+            if windows.look(key).is_some_and(|window| !window.minimized && screen.contains(window.frame.center())) {
+                windows.focus(key);
+            }
+        });
+    }
+
+    /// 启动一个 App（资源库里点没在跑的 App）。
+    pub fn open(&self, screen_id: Option<&str>, app: AppInfo) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.open(&id, app));
+    }
+
+    /// 给一个已经在跑的 App 再开一个窗口（资源库行右侧的「+」）。
+    pub fn new_window(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.new_window(&id, app));
+    }
+
+    /// 关掉这个 App 的全部窗口（资源库行右侧的「×」）。
+    pub fn quit(&self, screen_id: Option<&str>, app: snug_core::windows::RunningApp) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.quit(&id, app));
+    }
+
+    /// 关掉某一个窗口（展开的窗口行右侧的「×」）。
+    pub fn close_window(&self, screen_id: Option<&str>, window: WindowInfo) {
+        let Some(id) = self.resolve_screen(screen_id) else {
+            return;
+        };
+        self.enqueue(move |desks| desks.close(&id, window));
+    }
+
+    /// 手势配置变了，钩子要按新配置重建（C# `SetGesturesEnabled` 等四个 setter + `TouchHook.Options`）。
+    pub fn apply_gesture_settings(&self, config: &AppConfig) {
+        crate::info!(
+            "设置：手势配置更新（总开关={} 滚动={} 长按右键={} 选后复制={} 仅注入={}）",
+            config.gestures,
+            config.gesture_scroll,
+            config.gesture_long_press_right_click,
+            config.copy_after_selection,
+            config.gestures_injected_only
+        );
+        // 立刻按新配置重算一次：关掉总开关会当场把钩子摘下来。
+        let bounds = self.phone_layout_of(None).map(|(full, _)| full);
+        self.sync_touch(config, None, bounds, None, None);
+    }
+
+    /// 让手势钩子跟手机屏与配置保持一致（C# `UpdateTouchHook`）。
+    ///
+    /// 每帧调用是安全的：区域/选项没变时什么都不做，所以不会反复装钩子。
+    pub fn sync_touch(
+        &self,
+        config: &AppConfig,
+        screen_id: Option<&str>,
+        bounds: Option<Rect>,
+        ui_bounds: Option<Rect>,
+        copy_bubble: Option<Rect>,
+    ) {
+        let state = self.state_of(screen_id);
+        let region = if config.gestures && state.screen_phase == PhoneScreenPhase::Ready {
+            bounds.map(|bounds| TouchRegion::for_phone_screen(bounds, state.close_button))
+        } else {
+            None
+        };
+
+        // 输入钩子只读这些已知几何，不在鼠标回调中查询窗口、进程或文件。
+        let mut passthrough: Vec<Rect> = ui_bounds.into_iter().collect();
+        if let Some(region) = region
+            && !state.list_visible
+            && state.placed.as_ref().and_then(|placed| placed.window.app_id.as_deref())
+                .is_some_and(snug_win::touch::is_browser_exe)
+        {
+            passthrough.push(Rect::new(
+                region.frame.x,
+                region.frame.y,
+                region.frame.width,
+                snug_win::touch::BROWSER_CHROME_POINTS * region.scale.max(1.0),
+            ));
+        }
+        self.touch.set_passthrough_regions(passthrough, copy_bubble);
+
+        let mut applied = match self.touch_region.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *applied != region {
+            let running = self.touch.set_region(region);
+            crate::info!(
+                "手势钩子：{}（{}）",
+                if running { "已接管手机屏" } else { "已停用" },
+                match &region {
+                    Some(region) => format!("区域 {}×{}", region.frame.width, region.frame.height),
+                    None => "手机屏未就绪或手势已关".to_string(),
+                }
+            );
+            *applied = region;
+        }
+        drop(applied);
+
+        // C#：`AllowScroll = GestureScroll`、`AllowRightClick = GestureLongPressRightClick`、
+        // `NotifySelectionEnded = CopyAfterSelection && !ListVisible`。
+        self.touch.set_options(TouchOptions {
+            allow_scroll: config.gestures && config.gesture_scroll,
+            allow_right_click: config.gestures && config.gesture_long_press_right_click,
+            notify_selection_ended: config.copy_after_selection && !state.list_visible,
+        });
+        self.touch.set_require_injected_flag(config.gestures_injected_only);
+    }
+
+    /// 撤屏并停掉后台线程；返回前会把状态机收干净。
+    pub fn shutdown(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+        if let Ok(mut desks) = self.desks.lock() {
+            desks.shutdown();
+        }
+    }
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+fn panel_recovery_bounds(state: &DeskState, frame: Rect, screen: Rect) -> Option<Rect> {
+    (state.screen_phase == PhoneScreenPhase::Ready && !screen.contains(frame.center()))
+        .then_some(screen)
+}
+
+fn should_apply_screen_policy(
+    authorization_pending: bool,
+    startup_recovered: bool,
+    policy_changed: bool,
+) -> bool {
+    !authorization_pending && (!startup_recovered || policy_changed)
+}
+
+/// 把当前所有屏的状态拷一份给界面线程。
+///
+/// 后台线程调用；锁只持有到拷完就放掉，界面那边读的是自己的快照，不会等它。
+fn publish_snapshots(
+    desks: &Arc<std::sync::Mutex<DeskSet>>,
+    snapshots: &Arc<std::sync::Mutex<std::collections::HashMap<String, DeskState>>>,
+    on_change: &dyn Fn(),
+) {
+    let states = match desks.lock() {
+        Ok(desks) => desks.all_states(),
+        Err(_) => return,
+    };
+    replace_snapshots(snapshots, states, on_change);
+}
+
+fn replace_snapshots(
+    snapshots: &std::sync::Mutex<std::collections::HashMap<String, DeskState>>,
+    states: std::collections::HashMap<String, DeskState>,
+    on_change: &dyn Fn(),
+) {
+    let Ok(mut snap) = snapshots.lock() else {
+        return;
+    };
+    if *snap == states {
+        return;
+    }
+    *snap = states;
+    // 界面只读这份快照；写入后再通知，并先释放锁，让观察者立刻读到新状态。
+    drop(snap);
+    on_change();
+}
+
+fn clear_touch_region_if_offline(
+    snapshots: &std::sync::Mutex<std::collections::HashMap<String, DeskState>>,
+    touch_region: &std::sync::Mutex<Option<TouchRegion>>,
+    stop: &dyn Fn(),
+) -> bool {
+    let ready = snapshots
+        .lock()
+        .map(|states| {
+            states
+                .values()
+                .any(|state| state.screen_phase == PhoneScreenPhase::Ready)
+        })
+        .unwrap_or(false);
+    if ready {
+        return false;
+    }
+    // 与 sync_touch 相同的锁次序；同时清缓存，保证重连到同一矩形时会重新装钩子。
+    let mut applied = touch_region.lock().unwrap_or_else(|e| e.into_inner());
+    if applied.is_none() {
+        return false;
+    }
+    stop();
+    *applied = None;
+    true
+}
+
+/// 当前该有哪些屏——对应 C# v1.3.0 `AppController.OnTick` 的两行：///
+/// ```csharp
+/// bool remote = _session.InEpisode || _sensor.ManualOverride;
+/// _desks.SetWishes(ScreenPlan.Wishes(_config, remote));
+/// ```
+///
+/// 与 1.2 的**关键区别**：不再按控制端类型（手机/平板/电脑）判断要不要开屏。
+fn wants_phone_display(mode: PhoneScreenMode, in_episode: bool) -> bool {
+    match mode {
+        PhoneScreenMode::Off => false,
+        PhoneScreenMode::WhileConnected => in_episode,
+        PhoneScreenMode::Always => true,
+    }
+}
+
+/// Share the exact screen identity between state lookup, display wishes and settings notices.
+pub(crate) fn selected_screen_id(config: &AppConfig, active_screen: Option<&str>) -> Option<String> {
+    active_screen.map(str::to_string).or_else(|| {
+        config
+            .primary_touch_screen()
+            .filter(|screen| screen.enabled)
+            .or_else(|| config.effective_screens().into_iter().find(|screen| screen.enabled))
+            .map(|screen| screen.id)
+    })
+}
+
+/// 把显示模式、真实远程会话和当前屏幕选择合成为一个建屏愿望。
+fn active_wishes(
+    config: &AppConfig,
+    in_episode: bool,
+    active_screen: Option<&str>,
+) -> Vec<snug_core::screen_plan::ScreenWish> {
+    if !wants_phone_display(config.phone_screen_mode(), in_episode) {
+        return Vec::new();
+    }
+    let mut wishes = snug_core::screen_plan::ScreenPlan::wishes(config, true, false);
+    // 只留当前显示的那块：我们只有一个窗口，多建几块只会得到几块黑屏。
+    //
+    // `None` 必须和 `Controller::state_of(None)` 选同一块：优先启用的主触屏，
+    // 否则按配置顺序取第一块启用屏。
+    let wanted_id = selected_screen_id(config, active_screen);
+    wishes.retain(|wish| wanted_id.as_deref() == Some(wish.id.as_str()));
+    wishes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CrossDeskActivity, CrossDeskSession, UuReading, active_wishes, read_uu_sample, panel_recovery_bounds};
+
+    #[test]
+    fn screen_policy_waits_for_driver_startup_then_runs_without_a_new_session_sample() {
+        assert!(!super::should_apply_screen_policy(true, false, true));
+        assert!(super::should_apply_screen_policy(false, false, false));
+        assert!(!super::should_apply_screen_policy(false, true, false));
+        assert!(super::should_apply_screen_policy(false, true, true));
+    }
+
+    #[test]
+    fn confirmed_uu_encoding_requests_a_screen_without_a_readable_controller_list() {
+        use snug_core::config::{AppConfig, PhoneScreenMode};
+        use snug_core::session::{ControllerTable, RemoteSession, UUSignals, UuCaptureEvidence};
+
+        let mut config = AppConfig::default();
+        config.set_phone_screen_mode(PhoneScreenMode::WhileConnected);
+        let mut session = RemoteSession::new();
+        let mut sample = UUSignals {
+            overlay_visible: false,
+            controllers: ControllerTable::unreadable(),
+            capture_active: Some(true),
+            capture_evidence: UuCaptureEvidence::Unknown,
+        };
+        session.update(&sample, 0.0);
+        assert!(active_wishes(&config, session.in_episode(), None).is_empty());
+
+        sample.capture_evidence = UuCaptureEvidence::HardwareEncoding;
+        session.update(&sample, 1.0);
+        assert!(session.is_connected());
+        assert_eq!(active_wishes(&config, session.in_episode(), None).len(), 1);
+    }
+
+    #[test]
+    fn crossdesk_unknown_sample_keeps_the_reconnect_window() {
+        let mut session = CrossDeskSession::default();
+        assert!(!session.update(false, CrossDeskActivity::Active, 0.0));
+        assert!(!session.episode.is_active());
+        assert!(!session.update(true, CrossDeskActivity::Active, 1.0));
+        assert!(!session.update(true, CrossDeskActivity::Unknown, 7.0));
+        assert!(session.episode.is_active());
+        assert!(!session.update(true, CrossDeskActivity::Active, 8.0));
+        assert!(!session.update(true, CrossDeskActivity::Inactive, 9.0));
+        assert!(!session.update(true, CrossDeskActivity::Inactive, 24.0));
+        assert!(session.update(true, CrossDeskActivity::Inactive, 24.1));
+        assert!(!session.episode.is_active());
+    }
+
+    #[test]
+    fn snapshot_removal_notifies_after_offline_state_is_published() {
+        use snug_core::desk::{DeskState, PhoneScreenPhase};
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let ready = DeskState::default()
+            .with_screen_phase(PhoneScreenPhase::Ready)
+            .with_display(Some(0));
+        let snapshots = Mutex::new(HashMap::from([("phone".to_string(), ready)]));
+        let notified = Cell::new(false);
+        super::replace_snapshots(&snapshots, HashMap::new(), &|| {
+            let published = snapshots
+                .try_lock()
+                .expect("notification must release the snapshot lock");
+            let state = published.get("phone").cloned().unwrap_or_default();
+            assert_eq!(state.screen_phase, PhoneScreenPhase::Off);
+            assert_eq!(state.display_id, None);
+            notified.set(true);
+        });
+        assert!(
+            notified.get(),
+            "removing the last ready screen must wake the observer"
+        );
+    }
+
+    #[test]
+    fn snapshot_publication_only_notifies_for_changed_states() {
+        use snug_core::desk::{DeskState, PhoneScreenPhase};
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let snapshots = Mutex::new(HashMap::new());
+        let calls = Cell::new(0);
+        let on_change = || calls.set(calls.get() + 1);
+        super::replace_snapshots(&snapshots, HashMap::new(), &on_change);
+        assert_eq!(calls.get(), 0);
+        let states = HashMap::from([(
+            "phone".to_string(),
+            DeskState::default()
+                .with_screen_phase(PhoneScreenPhase::Ready)
+                .with_display(Some(0)),
+        )]);
+        super::replace_snapshots(&snapshots, states.clone(), &on_change);
+        assert_eq!(calls.get(), 1);
+        super::replace_snapshots(&snapshots, states, &on_change);
+        assert_eq!(
+            calls.get(),
+            1,
+            "unchanged snapshots must not repeatedly wake the observer"
+        );
+    }
+
+    #[test]
+    fn offline_screen_stops_touch_without_a_ui_frame_and_clears_reinstall_cache() {
+        use snug_core::Rect;
+        use snug_core::desk::{DeskState, PhoneScreenPhase};
+        use snug_core::touch::TouchRegion;
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let snapshots = Mutex::new(HashMap::new());
+        let region = TouchRegion::for_phone_screen(Rect::new(3840.0, 0.0, 1080.0, 1900.0), None);
+        let applied = Mutex::new(Some(region));
+        let stops = Cell::new(0);
+        let stop = || {
+            assert!(
+                snapshots.try_lock().is_ok(),
+                "stop must not hold the snapshot lock"
+            );
+            stops.set(stops.get() + 1);
+        };
+
+        assert!(super::clear_touch_region_if_offline(
+            &snapshots, &applied, &stop
+        ));
+        assert_eq!(stops.get(), 1);
+        assert_eq!(
+            *applied.lock().unwrap(),
+            None,
+            "the UI must reinstall the hook when the same screen bounds return"
+        );
+        assert!(!super::clear_touch_region_if_offline(
+            &snapshots, &applied, &stop
+        ));
+        assert_eq!(
+            stops.get(),
+            1,
+            "an already stopped hook must not be stopped every tick"
+        );
+
+        snapshots.lock().unwrap().insert(
+            "phone".into(),
+            DeskState::default()
+                .with_screen_phase(PhoneScreenPhase::Ready)
+                .with_display(Some(0)),
+        );
+        *applied.lock().unwrap() = Some(region);
+        assert!(!super::clear_touch_region_if_offline(
+            &snapshots, &applied, &stop
+        ));
+        assert_eq!(
+            *applied.lock().unwrap(),
+            Some(region),
+            "a ready screen keeps its hook"
+        );
+        snapshots.lock().unwrap().clear();
+        assert!(super::clear_touch_region_if_offline(
+            &snapshots, &applied, &stop
+        ));
+        assert_eq!(stops.get(), 2);
+        assert_eq!(*applied.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn ready_display_can_restore_an_offscreen_panel_without_a_ui_frame() {
+        use snug_core::desk::{DeskState, PhoneScreenPhase};
+        use snug_core::Rect;
+
+        let screen = Rect::new(3840.0, 0.0, 1080.0, 1900.0);
+        let waiting = Rect::new(-30_000.0, -30_000.0, 540.0, 800.0);
+        let off = DeskState::default();
+        assert_eq!(panel_recovery_bounds(&off, waiting, screen), None);
+        let ready = off.with_screen_phase(PhoneScreenPhase::Ready).with_display(Some(0));
+        assert_eq!(panel_recovery_bounds(&ready, waiting, screen), Some(screen));
+        assert_eq!(panel_recovery_bounds(&ready, screen, screen), None);
+        let bar = Rect::new(3840.0, 1738.0, 1080.0, 162.0);
+        assert_eq!(panel_recovery_bounds(&ready, bar, screen), None,
+            "后台恢复不能把已正常显示的底栏反复撑成整屏");
+    }
+    use snug_core::AppConfig;
+
+    fn config_with_one_screen() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.screens = Some(config.effective_screens());
+        config
+    }
+
+    fn config_with_two_screens() -> AppConfig {
+        use snug_core::{DeviceKind, ScreenOrientation};
+
+        let mut config = config_with_one_screen();
+        let mut screens = config.effective_screens();
+        let mut tablet = screens[0].clone();
+        tablet.id = "tablet-1".to_string();
+        tablet.name = "iPad".to_string();
+        tablet.device.kind = DeviceKind::Tablet;
+        tablet.orientation = ScreenOrientation::Landscape;
+        screens.push(tablet.sanitize());
+        config.screens = Some(screens);
+        config
+    }
+
+    #[test]
+    fn uu_sample_reader_uses_latest_fresh_result_and_expires_old_data() {
+        let latest = std::sync::Mutex::new(Some(super::UuSample {
+            sampled_at: 4.0,
+            signals: snug_win::UuSignalSet::empty(),
+        }));
+        let mut last = 0.0;
+        assert!(matches!(read_uu_sample(&latest, 5.0, &mut last), UuReading::Fresh(_)));
+        assert_eq!(last, 4.0);
+        assert!(matches!(read_uu_sample(&latest, 6.0, &mut last), UuReading::Pending));
+        assert!(matches!(read_uu_sample(&latest, 10.0, &mut last), UuReading::Stale));
+    }
+
+    #[test]
+    fn uu_sample_reader_does_not_accept_a_result_that_arrived_too_late() {
+        let latest = std::sync::Mutex::new(Some(super::UuSample {
+            sampled_at: 1.0,
+            signals: snug_win::UuSignalSet::empty(),
+        }));
+        let mut last = 0.0;
+        assert!(matches!(read_uu_sample(&latest, 7.0, &mut last), UuReading::Stale));
+        assert_eq!(last, 0.0, "stale observation must not reset the expiry clock");
+    }
+
+    /// 真机 bug：退出远控后虚拟屏还挂着。根因就是少了 `remote` 这一段。
+    #[test]
+    fn no_screen_outside_a_session() {
+        let config = config_with_one_screen();
+        assert!(active_wishes(&config, false, None).is_empty());
+    }
+
+    #[test]
+    fn one_screen_during_a_session() {
+        let config = config_with_one_screen();
+        assert_eq!(active_wishes(&config, true, None).len(), 1);
+    }
+
+    #[test]
+    fn master_switch_off_wins() {
+        let mut config = config_with_one_screen();
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Off);
+        assert!(active_wishes(&config, true, None).is_empty());
+        assert!(active_wishes(&config, false, None).is_empty());
+    }
+
+    #[test]
+    fn always_mode_keeps_the_selected_screen_wish_across_a_session() {
+        let mut config = config_with_two_screens();
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Always);
+        let startup = active_wishes(&config, false, Some("tablet-1"));
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0].id, "tablet-1");
+        assert_eq!(active_wishes(&config, true, Some("tablet-1")), startup);
+        assert_eq!(active_wishes(&config, false, Some("tablet-1")), startup);
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::WhileConnected);
+        assert!(active_wishes(&config, false, Some("tablet-1")).is_empty());
+    }
+
+    /// 关掉某块屏就不该再有这个愿望。
+    #[test]
+    fn disabled_screen_drops_its_wish() {
+        let mut config = config_with_one_screen();
+        let mut screens = config.effective_screens();
+        screens[0].enabled = false;
+        config.screens = Some(screens);
+        config.set_phone_screen_mode(snug_core::PhoneScreenMode::Always);
+        assert!(active_wishes(&config, true, None).is_empty());
+    }
+
+    #[test]
+    fn disabled_primary_uses_the_same_enabled_fallback_for_state_and_wishes() {
+        let mut config = config_with_two_screens();
+        config.screens.as_mut().unwrap()[0].enabled = false;
+        assert_eq!(
+            super::selected_screen_id(&config, None).as_deref(),
+            Some("tablet-1")
+        );
+        let wishes = active_wishes(&config, true, None);
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, "tablet-1");
+        let disabled = config.effective_screens()[0].id.clone();
+        assert_eq!(
+            super::selected_screen_id(&config, Some(&disabled)),
+            Some(disabled.clone())
+        );
+        assert!(active_wishes(&config, true, Some(&disabled)).is_empty());
+    }
+
+    /// 配了两块屏，但同一时刻只建一块（只画一块屏，多建就是黑屏）：
+    /// 不指定时取配置里的第一块。
+    #[test]
+    fn only_one_screen_is_built_at_a_time() {
+        use snug_core::ScreenConfig;
+
+        let config = config_with_two_screens();
+        let wishes = active_wishes(&config, true, None);
+        assert_eq!(wishes.len(), 1, "同一时刻只该建一块屏");
+        assert_eq!(wishes[0].id, ScreenConfig::LEGACY_PHONE_ID);
+    }
+
+    /// 切到第二块屏：愿望只剩它（旧屏会被撤掉）。
+    #[test]
+    fn selecting_a_screen_drops_the_other() {
+        let config = config_with_two_screens();
+        let wishes = active_wishes(&config, true, Some("tablet-1"));
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, "tablet-1");
+        assert_eq!(wishes[0].fit.kind(), snug_core::DeviceKind::Tablet);
+    }
+
+    /// 配置里第一块是电脑屏、第二块才是手机时，默认（没选屏）要建手机屏——
+    /// 和 `Controller::state_of(None)` 用的 `primary_touch_screen()` 保持同一块。
+    #[test]
+    fn default_screen_matches_primary_touch_screen() {
+        use snug_core::{DeviceKind, ScreenOrientation};
+
+        let mut config = config_with_one_screen();
+        let mut base = config.effective_screens().remove(0);
+
+        let mut computer = base.clone();
+        computer.id = "pc-1".to_string();
+        computer.name = "PC".to_string();
+        computer.device.kind = DeviceKind::Computer;
+        computer.orientation = ScreenOrientation::Landscape;
+
+        base.id = "phone-2".to_string();
+        base.name = "Phone".to_string();
+
+        config.screens = Some(vec![computer.sanitize(), base.sanitize()]);
+        let primary = config.primary_touch_screen().expect("配置里有手机屏");
+
+        let wishes = active_wishes(&config, true, None);
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].id, primary.id, "默认建屏要和 primary_touch_screen 是同一块");
+        assert_eq!(wishes[0].fit.kind(), DeviceKind::Phone);
+    }
+}
