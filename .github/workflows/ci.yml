@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build & test (win-x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch virtual display driver
+        run: pwsh -File scripts/fetch-driver.ps1
+
+      - name: Test debug profile
+        shell: pwsh
+        env:
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test --workspace --locked
+
+      - name: Check correctness lints
+        run: cargo clippy --workspace --all-targets --locked -- -D clippy::correctness -D clippy::suspicious
+
+      - name: Test release profile
+        shell: pwsh
+        env:
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test --workspace --release --locked
+
+      - name: Build release
+        run: cargo build --release -p snug-app --locked
