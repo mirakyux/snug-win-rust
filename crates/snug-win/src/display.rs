@@ -5051,6 +5051,79 @@ mod tests {
     }
 
     #[test]
+    fn owned_reshape_to_landscape_keeps_the_portrait_fit_when_desktop_does_not_converge() {
+        let path = owned_path("owned-reshape-landscape-no-convergence");
+        let phone = snug_core::PhoneSpec::new(2160.0, 3840.0, None);
+        let portrait = ScreenFit::from_device(
+            &phone,
+            snug_core::DeviceKind::Tablet,
+            snug_core::ScreenOrientation::Portrait,
+        );
+        let landscape = ScreenFit::from_device(
+            &phone,
+            snug_core::DeviceKind::Tablet,
+            snug_core::ScreenOrientation::Landscape,
+        );
+        let mut world = world_with_phone(&[0]);
+        world.online_mode = Some(portrait.pixel_size(portrait.base_width()));
+        let (mut screen, shared) = screen_with_owned(world, &path);
+        let id = screen.create(portrait.clone()).unwrap();
+        let owner = screen.owners[&id].clone();
+        {
+            let mut world = shared.lock().unwrap();
+            world.ignore_active_mode_changes = true;
+            world.guarded_replacements.clear();
+            world.guarded_mode_requests.clear();
+            world.resolutions.clear();
+            world.temporary_attempts = 0;
+            world.dpi_calls.clear();
+        }
+        screen.timings.reshape = Duration::ZERO;
+
+        assert!(!screen.reshape(id, landscape.clone()));
+
+        let world = shared.lock().unwrap();
+        let landscape_target = landscape.pixel_size(landscape.base_width());
+        let requested_modes: Vec<_> = world
+            .guarded_mode_requests
+            .iter()
+            .filter_map(|monitors| monitors.first()?.modes.first())
+            .map(|mode| (mode.width as i32, mode.height as i32))
+            .collect();
+        assert!(
+            requested_modes.contains(&landscape_target),
+            "missing owner-guarded landscape request: {requested_modes:?}"
+        );
+        assert!(
+            requested_modes.contains(&portrait.pixel_size(portrait.base_width())),
+            "missing owner-guarded portrait rollback: {requested_modes:?}"
+        );
+        assert!(
+            world
+                .guarded_replacements
+                .iter()
+                .all(|(ids, token)| ids == &[id] && token == &owner)
+        );
+        let active = world
+            .monitors
+            .iter()
+            .find(|monitor| monitor.virtual_display_id == Some(id))
+            .unwrap();
+        assert_eq!(
+            (active.mode.width, active.mode.height),
+            portrait.pixel_size(portrait.base_width())
+        );
+        assert!(world.resolutions.is_empty());
+        assert_eq!(world.temporary_attempts, 0);
+        assert!(world.dpi_calls.is_empty());
+        assert_eq!(screen.owners.get(&id), Some(&owner));
+        assert_eq!(OwnedDisplayStore::new(&path).try_owner(id).unwrap(), Some(owner));
+        drop(world);
+        assert_eq!(lock_maps(&screen.maps).fits.get(&id), Some(&portrait));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn owned_landscape_mode_without_desktop_convergence_never_falls_back_to_native_writes() {
         let path = owned_path("owned-landscape-mode-no-convergence");
         let fit = ScreenFit::from_device(

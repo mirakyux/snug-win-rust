@@ -17,18 +17,18 @@ Rust 与候选中的 `settings.rs`、`desktop.rs`、`desktop/screens.rs` 文件�
 ## 已验证
 
 - `cargo metadata --offline --no-deps --format-version 1`：三个 crate 均为 `1.4.0`。
-- `cargo test --offline --workspace --locked`：通过，908 项测试通过，1 项忽略。
-- `cargo test --offline --workspace --release --locked`：通过，Debug 与 Release 配置均为 908 项通过、1 项忽略。
-- 提交既有 Clippy 门槛 `-D clippy::correctness -D clippy::suspicious`：通过。
+- `cargo test --offline --workspace --locked` 与 `cargo test --offline --workspace --release --locked`：本轮对最终候选各通过 909 项测试、1 项忽略；新增的竖屏切横屏失败关闭回归在 Debug/Release 均通过。
+- `cargo clippy --offline --workspace --all-targets --locked -- -D clippy::correctness -D clippy::suspicious`：通过；仍有非阻断风格告警。
 - `cargo build --offline --release -p snug-app --locked`：通过；EXE 的 FileVersion 与 ProductVersion 均为 `1.4.0`。
-- `.github/workflows/ci.yml` 已恢复 PR、`main` 推送及手动触发的 Windows CI，运行锁定依赖的 Debug/Release 测试、现行 Clippy 门槛和 release build；候选 `1b40a00` 已推送到 `origin/codex/snug-rust-main-integration`，但该提交的 combined status 和 PR workflow runs 为空，尚无远端 runner 结果。
-- Rust 代码中的 owner 保护、无原生写入回退和横屏失败安全行为已有离线回归。
+- 本机候选工作树外的 ignored 资源采样记录包含 31 个约每分钟样本，覆盖 30.05 分钟；候选进程一直响应，Private Bytes 约 641.85→641.66 MiB、Working Set 约 272.50→272.48 MiB。这只是资源采样，不包含手机画面、点击或滚动验收。
+- `.github/workflows/ci.yml` 配置了 PR、`main` 推送及手动触发的 Windows CI；当前候选尚无 PR，也没有对应的远端 runner 结果。分支推送本身不触发该 workflow。
+- Rust 代码中的 owner 隔离、无原生写入回退及失败后保留原 owner/账本已有离线回归；另有 portrait→landscape 模式不收敛时的专项回归。
 - 设置持久化回归：5 项通过；驱动包一致性离线回归：8 项通过。
 
 ## 当前阻断
 
-1. **横屏 owner 隔离尚未完成实机通过。** `docs/acceptance.md` 的历史失败记录称驱动目标为 `1920×1080`，但桌面仍为 `1080×1920`；CCD hold 为 0，应用没有启动。runner 原始产物现已缺失，故本轮无法复核这些读数。当前实现保持 owner 范围更新并在实际模式未收敛时失败，不应插回无 owner 的 GDI/CCD 写入。
-2. **手机稳定性和异常恢复没有足够证据。** 同一进程 UU 导航、面板跳页/虚拟屏意外消失现场、受控故障恢复、正常退出和重启、强杀残留恢复，以及至少 30 分钟手机画面/点击/滚动长稳仍未完成。已有约 903 秒 soak 不能替代这些门槛。
+1. **横屏 owner 隔离尚未完成实机通过。** `docs/acceptance.md` 记录的失败是驱动目标为 `1920×1080`、桌面仍显示 `1080×1920`，且 CCD hold 为 0、应用未启动；对应 runner 原始产物当前缺失，不能重新核查。代码离线测试证明失败会保留原 owner/账本且不做 GDI、临时分辨率或 DPI 写入，但不能证明真实 CCD/驱动会收敛。
+2. **手机稳定性和异常恢复没有足够证据。** 30.05 分钟资源采样虽通过，但没有手机画面和每 5 分钟点击/滚动观察。UU 同进程导航、面板跳页/虚拟屏意外消失现场、受控故障恢复、正常退出和重启、强杀残留恢复，以及手机交互长稳均未完成。
 3. **正式驱动包不一致。** `driver/source.lock.json` 要求源码驱动 `0.4.0.12` 和五项 owner 协议能力，但 releasePackage 和应用内嵌仍为 `0.3.1`。当前仓库没有匹配的已签名 `0.4.0.12` 包；本机虽有 Windows SDK 和 Rust nightly，但缺少构建脚本要求的 UMDF/IddCx headers、Stampinf 与 Inf2Cat，且未发现可验证的正式签名产物。不能伪造哈希、清单或签名。
 
 严格 `cargo fmt --all -- --check` 仍报告仓库既有的整体格式基线差异；未自动重排，以免改动 vendored 驱动源码哈希和扩大迁移噪声。严格 `clippy -D warnings` 也有既有非正确性 lint；正确性/可疑性门槛已通过。
